@@ -6,7 +6,7 @@
 
 **Architecture:** 使用单一 Python 3.11 代码库实现 PySide6 桌面向导、版本化项目模型和可恢复的阶段管线。高变动的分割、相机求解和 Gaussian 渲染通过窄接口隔离；GPU 阶段串行运行，并允许在独立 Python 进程中加载模型以可靠释放显存。MVP 相机求解先使用 OpenCV 的受控视频基线，后续可通过同一契约接入 ViPE 或 VGGT。
 
-**Tech Stack:** Python 3.11、PySide6 6、Pydantic 2、NumPy 2、OpenCV 4.13、Pillow、FFmpeg/ffprobe、PyTorch、SAM 2.1 Hiera Tiny、gsplat 1.x、plyfile、pytest、pytest-qt、ruff、mypy。
+**Tech Stack:** Python 3.11、PySide6 6、Pydantic 2、NumPy 2、OpenCV 4.13、Pillow、FFmpeg/ffprobe、PyTorch、EdgeTAM、SAM 2.1 Hiera Tiny 对照后端、gsplat 1.x、plyfile、pytest、pytest-qt、ruff、mypy。
 
 ## Global Constraints
 
@@ -17,6 +17,7 @@
 - 正常案例只要求选择人物、确认初始机位、指定落脚点三次关键交互。
 - MVP 只做 RGB Gaussian 背景与人物 Alpha 合成，不做人物深度、遮挡、阴影或重光照。
 - 所有原始素材只读；所有产物写入项目目录；运行过程不发起素材上传。
+- 真实测试素材通过开发脚本从已审查的官方 URL 下载到 Git 忽略的缓存目录；素材清单、许可证记录和 SHA-256 锁文件必须提交。
 - `project.json` 是版本化状态源；大体积逐帧数据只保存文件引用和内容摘要。
 - 每个昂贵阶段必须支持进度、取消、缓存、失败分类和从最近成功阶段重试。
 - 代码先写失败测试，再写最小实现；每个任务完成后单独提交。
@@ -26,7 +27,8 @@
 - PySide6 使用 Qt 官方的主线程 UI + worker signal 模式；后台线程不得直接修改 Qt model 或 widget。
 - Pydantic 2 使用 `model_validate_json()` 读取、`model_dump_json()` 写入，并在进入当前模型验证前运行显式字典迁移。
 - gsplat 使用 `rasterization(means, quats, scales, opacities, colors, viewmats, Ks, width, height)`；MVP 每次只渲染一个视角以控制显存。
-- SAM 2 官方在 Windows 上推荐 WSL，因此分割器通过可配置的外部 worker 命令运行；默认检查 SAM 2.1 Hiera Tiny 以降低显存占用。
+- EdgeTAM 作为 MVP 默认分割后端，SAM 2.1 Hiera Tiny 作为质量对照后端。两者使用同一外部 worker 协议和相近的视频 predictor API，不在桌面进程内驻留模型。
+- SAM 2 官方在 Windows 上推荐 WSL；EdgeTAM 也依赖 PyTorch/CUDA 和可选自定义 CUDA 扩展。因此 worker 命令必须可配置为原生 Python 或 WSL Python。
 - ViPE 能直接输出相机内参、运动和近度量深度，但其 GPU/第三方模型组合尚未在 8 GB Windows 基准机验证，因此不作为首个必须通过的 MVP 后端。`CameraSolver` 契约必须允许后续无 UI 改动地接入 ViPE。
 - OpenCV 基线只服务受控输入：固定、纯旋转和轻中度手持。平移由本质矩阵恢复，尺度由目标落脚点和“运动幅度”参数决定。
 
@@ -37,8 +39,11 @@
 - [OpenCV 4.13 documentation](https://docs.opencv.org/4.13.0/)
 - [FFmpeg documentation](https://ffmpeg.org/documentation.html)
 - [SAM 2 official repository](https://github.com/facebookresearch/sam2)
+- [EdgeTAM official repository](https://github.com/facebookresearch/EdgeTAM)
 - [gsplat official repository](https://github.com/nerfstudio-project/gsplat)
 - [ViPE official repository](https://github.com/nv-tlabs/vipe)
+- [DAVIS 2017 official downloads](https://davischallenge.org/davis2017/code.html)
+- [Graphdeco-Inria 3DGS official pre-trained models](https://github.com/graphdeco-inria/gaussian-splatting)
 
 ## 目标文件结构
 
@@ -70,8 +75,8 @@ GS-Video/
 │  │  ├─ ingest.py                        # 素材校验、代理帧和音轨提取
 │  │  └─ export.py                        # 帧序列、音频和 MP4 导出
 │  ├─ segmentation/
-│  │  ├─ sam2.py                          # 外部 SAM 2 worker 客户端
-│  │  └─ worker.py                        # SAM 2.1 视频传播进程入口
+│  │  ├─ client.py                        # 外部分割 worker 客户端与 JSONL 协议
+│  │  └─ worker.py                        # EdgeTAM/SAM 2.1 视频传播进程入口
 │  ├─ camera/
 │  │  ├─ opencv_solver.py                 # 受控视频相机求解
 │  │  ├─ classify.py                      # fixed/rotation/6DoF 分类与可信度
@@ -92,8 +97,13 @@ GS-Video/
 │        ├─ camera_page.py
 │        ├─ preview_page.py
 │        └─ export_page.py
+├─ tools/
+│  └─ fetch_test_assets.py                 # 官方素材下载、续传、解压、裁剪与哈希校验
 └─ tests/
-   ├─ fixtures/                            # 小型视频、PLY、相机与 Alpha 固定资产
+   ├─ assets/
+   │  ├─ manifest.json                     # 来源、用途、许可证、选择规则
+   │  └─ lock.json                         # 下载归档与选定文件 SHA-256
+   ├─ fixtures/                            # 可提交的小型合成视频、PLY、相机与 Alpha 资产
    ├─ unit/
    ├─ integration/
    └─ e2e/
@@ -608,7 +618,161 @@ git add src/gs_video/domain src/gs_video/project/cache.py src/gs_video/pipeline 
 git commit -m "feat: add resumable cached pipeline runner"
 ```
 
-### Task 4: 实现视频探测、输入限制与代理帧生成
+### Task 4: 建立联网测试素材清单、锁文件和可恢复下载器
+
+**Files:**
+- Create: `.gitignore`
+- Create: `tools/__init__.py`
+- Create: `tools/fetch_test_assets.py`
+- Create: `tests/assets/manifest.json`
+- Create: `tests/assets/lock.json`
+- Create: `tests/assets/NOTICE.md`
+- Create: `tests/unit/tools/test_fetch_test_assets.py`
+
+**Interfaces:**
+- Produces: `python -m tools.fetch_test_assets fetch --group smoke|acceptance`
+- Produces: `python -m tools.fetch_test_assets lock --acknowledge-source-review`
+- Produces: `AssetManifest`, `AssetLock`, `fetch_asset(entry, lock, cache_root) -> list[Path]`
+- Produces: `GS_VIDEO_TEST_ASSETS` 环境变量覆盖默认缓存目录
+
+- [ ] **Step 1: 写路径安全、哈希失败和缓存命中测试**
+
+```python
+def test_rejects_zip_member_outside_destination(tmp_path: Path) -> None:
+    archive = make_zip(tmp_path / "bad.zip", {"../../escape.txt": b"bad"})
+    with pytest.raises(AssetSecurityError, match="越界路径"):
+        extract_selected(archive, tmp_path / "output", ["**/*"])
+
+
+def test_hash_mismatch_removes_partial_download(tmp_path: Path) -> None:
+    target = tmp_path / "asset.zip"
+    target.write_bytes(b"changed")
+    with pytest.raises(AssetIntegrityError):
+        verify_or_remove(target, "0" * 64)
+    assert target.exists() is False
+
+
+def test_valid_cached_file_does_not_open_network(tmp_path: Path) -> None:
+    target = tmp_path / "asset.zip"
+    target.write_bytes(b"locked")
+    lock = locked_asset("demo", sha256_bytes(b"locked"))
+    fetcher = AssetFetcher(opener=FailIfCalledOpener())
+    assert fetcher.fetch(lock, target) == target
+```
+
+- [ ] **Step 2: 运行测试并确认工具尚不存在**
+
+Run: `python -m pytest tests/unit/tools/test_fetch_test_assets.py -v`
+
+Expected: FAIL，包含 `ModuleNotFoundError: No module named 'tools.fetch_test_assets'`。
+
+- [ ] **Step 3: 定义官方来源清单与使用约束**
+
+```json
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "id": "davis-2017-trainval-480p",
+      "group": "acceptance",
+      "url": "https://data.vision.ee.ethz.ch/csergi/share/davis/DAVIS-2017-trainval-480p.zip",
+      "source_page": "https://davischallenge.org/davis2017/code.html",
+      "usage": "internal-research-evaluation",
+      "citation": "Pont-Tuset et al., The 2017 DAVIS Challenge on Video Object Segmentation",
+      "include": [
+        "DAVIS/JPEGImages/480p/breakdance/**",
+        "DAVIS/JPEGImages/480p/dance-jump/**",
+        "DAVIS/JPEGImages/480p/dance-twirl/**",
+        "DAVIS/JPEGImages/480p/parkour/**",
+        "DAVIS/Annotations/480p/breakdance/**",
+        "DAVIS/Annotations/480p/dance-jump/**",
+        "DAVIS/Annotations/480p/dance-twirl/**",
+        "DAVIS/Annotations/480p/parkour/**"
+      ]
+    },
+    {
+      "id": "graphdeco-3dgs-pretrained-models",
+      "group": "acceptance",
+      "url": "https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/pretrained/models.zip",
+      "source_page": "https://github.com/graphdeco-inria/gaussian-splatting",
+      "license_url": "https://github.com/graphdeco-inria/gaussian-splatting/blob/main/LICENSE.md",
+      "usage": "internal-noncommercial-research-evaluation-only",
+      "include": [
+        "train/point_cloud/iteration_30000/point_cloud.ply",
+        "truck/point_cloud/iteration_30000/point_cloud.ply"
+      ]
+    }
+  ]
+}
+```
+
+`NOTICE.md` 必须说明：DAVIS 素材保留官方引用信息；Graphdeco 预训练模型只用于内部非商业研究与评估，不得随应用重新分发，商业化前必须换成自有或明确允许商业使用的场景。
+由于 Graphdeco 官方预训练模型归档约 14 GB，`fetch --group acceptance --dry-run` 必须在下载前显示预计下载量、缓存位置和剩余磁盘空间；下载需要用户显式执行，不能作为普通单元测试的隐式副作用。
+
+- [ ] **Step 4: 实现 HTTPS 下载、断点续传、选择性解压和锁定**
+
+```python
+def safe_member_path(root: Path, member: str) -> Path:
+    destination = (root / member).resolve()
+    if root.resolve() not in destination.parents:
+        raise AssetSecurityError(f"压缩包包含越界路径: {member}")
+    return destination
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def default_cache_root() -> Path:
+    override = os.environ.get("GS_VIDEO_TEST_ASSETS")
+    if override:
+        return Path(override)
+    return Path(os.environ["LOCALAPPDATA"]) / "GS-Video" / "TestAssets"
+```
+
+下载器只接受 HTTPS；使用 `.partial` 文件和 HTTP `Range` 续传；服务器不接受 Range 时重新下载；连接/读取超时均为 60 秒；重定向目标仍必须为 HTTPS。解压只处理 `include` 匹配项，并对归档和每个已选文件计算 SHA-256。
+
+`lock` 子命令必须显式传入 `--acknowledge-source-review`，下载并生成 `tests/assets/lock.json`；后续 `fetch` 只信任锁文件中的归档哈希与成员哈希。CI 和验收不得自动刷新锁文件。
+
+- [ ] **Step 5: 下载官方素材并提交锁文件**
+
+Run: `python -m tools.fetch_test_assets lock --group acceptance --acknowledge-source-review`
+
+Expected: 下载 DAVIS 2017 TrainVal 480p 与 Graphdeco 预训练模型归档；仅提取清单中的视频序列、标注和 `train`/`truck` PLY；`tests/assets/lock.json` 包含非空的归档与成员 SHA-256。
+
+Run: `python -m tools.fetch_test_assets fetch --group acceptance --offline`
+
+Expected: 不访问网络，全部从已验证缓存命中并通过哈希检查。
+
+- [ ] **Step 6: 阻止大型素材进入 Git 并运行测试**
+
+```gitignore
+.cache/
+tests/.assets/
+*.partial
+acceptance-report.json
+```
+
+Run: `python -m pytest tests/unit/tools/test_fetch_test_assets.py -v`
+
+Expected: PASS。
+
+Run: `git status --short`
+
+Expected: 只显示工具、manifest、lock、NOTICE、测试和 `.gitignore`；不显示下载归档、视频帧或 PLY。
+
+- [ ] **Step 7: 提交**
+
+```powershell
+git add .gitignore tools tests/assets tests/unit/tools
+git commit -m "test: add locked network acceptance assets"
+```
+
+### Task 5: 实现视频探测、输入限制与代理帧生成
 
 **Files:**
 - Create: `src/gs_video/media/ffmpeg.py`
@@ -705,7 +869,7 @@ git add src/gs_video/media tests/unit/media tests/integration/media tests/fixtur
 git commit -m "feat: validate and ingest source video"
 ```
 
-### Task 5: 校验 Gaussian PLY、估算显存并建立场景相机数学
+### Task 6: 校验 Gaussian PLY、估算显存并建立场景相机数学
 
 **Files:**
 - Create: `src/gs_video/scene/ply.py`
@@ -784,7 +948,7 @@ git add src/gs_video/scene tests/unit/scene tests/fixtures/scene
 git commit -m "feat: load Gaussian PLY and model scene camera"
 ```
 
-### Task 6: 实现受控输入的 OpenCV 相机求解与轨迹映射
+### Task 7: 实现受控输入的 OpenCV 相机求解与轨迹映射
 
 **Files:**
 - Create: `src/gs_video/camera/classify.py`
@@ -880,20 +1044,20 @@ git add src/gs_video/camera tests/unit/camera tests/integration/camera
 git commit -m "feat: solve and map controlled camera motion"
 ```
 
-### Task 7: 实现前景分割契约与 SAM 2 外部 worker
+### Task 8: 实现 EdgeTAM 默认分割 worker 与 SAM 2.1 对照后端
 
 **Files:**
 - Modify: `src/gs_video/domain/contracts.py`
 - Modify: `src/gs_video/environment/doctor.py`
-- Create: `src/gs_video/segmentation/sam2.py`
+- Create: `src/gs_video/segmentation/client.py`
 - Create: `src/gs_video/segmentation/worker.py`
-- Create: `tests/unit/segmentation/test_sam2_client.py`
+- Create: `tests/unit/segmentation/test_worker_client.py`
 - Create: `tests/integration/segmentation/test_worker_protocol.py`
 
 **Interfaces:**
 - Produces: `ForegroundSegmenter.segment(frames, prompt, output_dir, emit, token) -> MaskSequence`
 - Produces: newline-delimited JSON worker events: `progress`, `result`, `error`
-- Consumes: SAM 2.1 checkpoint/config paths and a configurable worker command prefix
+- Consumes: `SegmentationBackend.EDGETAM|SAM2`、每个后端独立的 worker prefix、checkpoint 和 config
 
 - [ ] **Step 1: 写 worker 命令、进度解析和取消测试**
 
@@ -903,7 +1067,10 @@ def test_client_parses_progress_and_result(tmp_path: Path) -> None:
         '{"type":"progress","current":1,"total":2}\n',
         '{"type":"result","mask_dir":"masks","frames":2}\n',
     ]
-    client = Sam2Segmenter(process_factory=fake_process(lines))
+    client = VideoSegmenterClient(
+        backend=SegmentationBackend.EDGETAM,
+        process_factory=fake_process(lines),
+    )
     result = client.segment([tmp_path / "000001.jpg"], Prompt(frame_index=0, x=10, y=20), tmp_path / "masks", lambda event: None, CancellationToken())
     assert result.frame_count == 2
     assert result.mask_dir == tmp_path / "masks"
@@ -913,7 +1080,7 @@ def test_client_parses_progress_and_result(tmp_path: Path) -> None:
 
 Run: `python -m pytest tests/unit/segmentation tests/integration/segmentation -v`
 
-Expected: FAIL，缺少 `Sam2Segmenter`。
+Expected: FAIL，缺少 `VideoSegmenterClient`。
 
 - [ ] **Step 3: 实现不经 shell 的外部 worker 客户端**
 
@@ -921,20 +1088,22 @@ Expected: FAIL，缺少 `Sam2Segmenter`。
 
 ```text
 <worker-prefix> -m gs_video.segmentation.worker
+  --backend edgetam
   --frames <proxy-dir>
   --output <mask-dir>
   --frame-index <int>
   --point <x>,<y>
-  --config <sam2.1_hiera_t.yaml>
-  --checkpoint <sam2.1_hiera_tiny.pt>
+  --config <edgetam.yaml>
+  --checkpoint <edgetam.pt>
 ```
 
-`worker-prefix` 默认为当前 Python 可执行文件，也可配置为 `wsl.exe -d Ubuntu -- <venv-python>`。取消时先发送 `terminate()`，5 秒未退出再 `kill()`；无论何种退出都读取 stderr 并写入项目日志。
+EdgeTAM 与 SAM 2.1 使用各自的 worker prefix，避免两个仓库都提供 `sam2` Python namespace 时发生包覆盖。prefix 可配置为原生 Python，也可配置为 `wsl.exe -d Ubuntu -- <venv-python>`。取消时先发送 `terminate()`，5 秒未退出再 `kill()`；无论何种退出都读取 stderr 并写入项目日志。
 
 ```python
 def _start_worker(self, request: SegmentRequest) -> subprocess.Popen[str]:
     command = [
         *self.worker_prefix, "-m", "gs_video.segmentation.worker",
+        "--backend", self.backend.value,
         "--frames", str(request.frames_dir),
         "--output", str(request.output_dir),
         "--frame-index", str(request.prompt.frame_index),
@@ -948,9 +1117,20 @@ def _start_worker(self, request: SegmentRequest) -> subprocess.Popen[str]:
     )
 ```
 
-- [ ] **Step 4: 实现 SAM 2.1 worker 的单点传播**
+- [ ] **Step 4: 实现共享 predictor 协议和双后端装配**
 
-Worker 使用官方 `build_sam2_video_predictor`，初始化视频状态后在代表帧加入正点提示，向前传播所有帧，再从代表帧向后传播缺失帧。每帧写 8-bit PNG Alpha，文件名与代理帧编号一致。推理包裹在 `torch.inference_mode()` 与适合 GPU 的 autocast 中；进程退出前删除 predictor 并调用 `torch.cuda.empty_cache()`。
+EdgeTAM worker 环境使用 EdgeTAM 官方 config/checkpoint 调用 `build_sam2_video_predictor`；SAM 2.1 worker 环境使用 SAM 2.1 Hiera Tiny config/checkpoint 调用同名入口。两者都初始化视频状态、在代表帧加入正点提示、向前传播全部帧，再从代表帧反向传播缺失帧。每帧写 8-bit PNG Alpha，文件名与代理帧编号一致。推理包裹在 `torch.inference_mode()` 与合适的 autocast 中；进程退出前删除 predictor 并调用 `torch.cuda.empty_cache()`。
+
+```python
+class SegmentationBackend(StrEnum):
+    EDGETAM = "edgetam"
+    SAM2 = "sam2"
+
+
+def build_predictor(config: Path, checkpoint: Path) -> object:
+    from sam2.build_sam import build_sam2_video_predictor
+    return build_sam2_video_predictor(str(config), str(checkpoint))
+```
 
 集成测试不加载真实模型，而是向 worker 注入 `FakeVideoPredictor`，验证双向帧覆盖、PNG 命名和 JSONL 事件。真实 checkpoint smoke test 标记为 `@pytest.mark.gpu`。
 
@@ -968,7 +1148,7 @@ def propagate_masks(predictor: object, state: object, output_dir: Path) -> int:
     return len(written)
 ```
 
-Worker 完成后计算每帧非零 Alpha 比例；连续 15 帧低于 `0.001` 时返回 `unsupported_material`，信息为“主要人物长时间不可见”。环境诊断在启动分割前检查 worker 命令、config 和 checkpoint 均存在且可读取。
+Worker 完成后计算每帧非零 Alpha 比例；连续 15 帧低于 `0.001` 时返回 `unsupported_material`，信息为“主要人物长时间不可见”。环境诊断在启动分割前检查所选后端的 worker 命令、config 和 checkpoint 均存在且可读取，并通过 `--probe` 子进程确认实际载入的后端与配置一致。
 
 Run: `python -m pytest tests/unit/segmentation tests/integration/segmentation -v -m "not gpu"`
 
@@ -978,10 +1158,10 @@ Expected: PASS。
 
 ```powershell
 git add src/gs_video/domain/contracts.py src/gs_video/segmentation tests/unit/segmentation tests/integration/segmentation
-git commit -m "feat: add isolated SAM2 video segmentation"
+git commit -m "feat: add isolated EdgeTAM and SAM2 segmentation"
 ```
 
-### Task 8: 实现 gsplat 串行渲染器和预览降采样
+### Task 9: 实现 gsplat 串行渲染器和预览降采样
 
 **Files:**
 - Modify: `src/gs_video/domain/contracts.py`
@@ -1058,7 +1238,7 @@ git add src/gs_video/domain/contracts.py src/gs_video/scene/gsplat_renderer.py t
 git commit -m "feat: render Gaussian backgrounds with gsplat"
 ```
 
-### Task 9: 实现 Alpha 合成、音轨恢复和帧精确导出
+### Task 10: 实现 Alpha 合成、音轨恢复和帧精确导出
 
 **Files:**
 - Create: `src/gs_video/composite/alpha.py`
@@ -1139,7 +1319,7 @@ git add src/gs_video/composite src/gs_video/media/export.py tests/unit/composite
 git commit -m "feat: composite frames and export synchronized mp4"
 ```
 
-### Task 10: 组装完整工作流、缓存依赖和低分辨率预览
+### Task 11: 组装完整工作流、缓存依赖和低分辨率预览
 
 **Files:**
 - Modify: `src/gs_video/pipeline/workflow.py`
@@ -1150,7 +1330,7 @@ git commit -m "feat: composite frames and export synchronized mp4"
 **Interfaces:**
 - Produces: `build_mvp_workflow(services) -> PipelineRunner`
 - Produces: `WorkflowServices` 显式依赖容器
-- Consumes: Tasks 4–9 的全部稳定接口
+- Consumes: Tasks 5–10 的全部稳定接口；Task 4 提供验收资产解析
 
 - [ ] **Step 1: 写 mock 后端端到端阶段顺序与定向失效测试**
 
@@ -1232,7 +1412,7 @@ git add src/gs_video/pipeline tests/integration/pipeline
 git commit -m "feat: assemble cached MVP processing workflow"
 ```
 
-### Task 11: 建立 PySide6 向导、后台任务桥和人物选择交互
+### Task 12: 建立 PySide6 向导、后台任务桥和人物选择交互
 
 **Files:**
 - Modify: `src/gs_video/app.py`
@@ -1330,7 +1510,7 @@ git add src/gs_video/app.py src/gs_video/ui tests/unit/ui
 git commit -m "feat: add guided desktop shell and subject selection"
 ```
 
-### Task 12: 完成场景视口、落脚点、预览、导出与错误恢复 UI
+### Task 13: 完成场景视口、落脚点、预览、导出与错误恢复 UI
 
 **Files:**
 - Create: `src/gs_video/ui/viewport.py`
@@ -1424,11 +1604,12 @@ git add src/gs_video/ui tests/unit/ui tests/e2e
 git commit -m "feat: complete guided preview and export workflow"
 ```
 
-### Task 13: 建立 8 GB 验收工具、文档和完整发布门
+### Task 14: 建立 8 GB 验收工具、文档和完整发布门
 
 **Files:**
 - Create: `scripts/run_acceptance.py`
 - Create: `tests/acceptance/cases.json`
+- Create: `tests/acceptance/segmentation_backends.json`
 - Create: `tests/acceptance/test_cases.py`
 - Create: `README.md`
 - Create: `docs/development/model-installation.md`
@@ -1456,7 +1637,9 @@ Expected: FAIL，缺少 `AcceptanceReport`。
 
 - [ ] **Step 3: 实现固定案例清单与报告器**
 
-`cases.json` 每项记录视频、场景、人物提示、目标相机、落脚点、运动幅度和预期镜头类型。报告器记录：是否导出、是否人工修改中间文件、失败分类、每阶段耗时、每阶段峰值显存、输出帧数、音视频时长误差。缺失素材时标记 `fixture_missing` 并使发布门失败，不得跳过。
+`cases.json` 不记录机器相关绝对路径，而是引用 Task 4 的 `asset_id` 和派生素材 ID。DAVIS 帧序列通过固定 FFmpeg 参数重定时为 10 秒、1080p H.264 测试视频，并加入确定性的正弦测试音轨；Graphdeco `train` 与 `truck` PLY 使用固定随机种子生成 250k/500k Gaussian 的派生副本。所有派生产物、转换参数和 SHA-256 写入 lock，保证不同机器得到相同测试输入。
+
+每个案例记录视频 asset ID、场景 asset ID、人物提示、目标相机、落脚点、运动幅度和预期镜头类型。报告器记录：是否导出、是否人工修改中间文件、失败分类、每阶段耗时、每阶段峰值显存、输出帧数、音视频时长误差。缺失素材时标记 `fixture_missing` 并使发布门失败，不得跳过。
 
 ```python
 class AcceptanceReport(BaseModel):
@@ -1479,9 +1662,25 @@ class AcceptanceReport(BaseModel):
         )
 ```
 
-- [ ] **Step 4: 写开发与模型安装文档**
+- [ ] **Step 4: 对比 EdgeTAM 默认后端和 SAM 2.1 对照后端**
 
-README 必须包含 Python 3.11 venv、`pip install -e ".[dev]"`、FFmpeg PATH、CUDA/PyTorch 单独安装、SAM 2.1 Tiny checkpoint、gsplat 安装、`python -m gs_video --doctor --json` 和测试命令。模型文档明确记录 SAM 2 官方 Windows/WSL建议、第三方模型许可证检查和离线 checkpoint 路径。
+`segmentation_backends.json` 选择 DAVIS 的四个人物序列。提示点由首帧真值 Mask 的最大内切位置确定，两个后端接收完全相同的帧和提示。报告平均 IoU、Mask 丢失帧数、耗时和峰值显存。
+
+```python
+def backend_gate(edgetam: BackendMetrics, sam2: BackendMetrics) -> bool:
+    return (
+        edgetam.peak_vram_mb <= 8192
+        and edgetam.mean_iou >= 0.75
+        and edgetam.missing_mask_frames == 0
+        and edgetam.mean_iou >= sam2.mean_iou - 0.07
+    )
+```
+
+EdgeTAM 是应用默认值；SAM 2.1 只用于显式诊断对照，不做静默自动回退，避免一次任务连续加载两个模型。若上述 gate 失败，发布门失败并要求重新评估默认后端。
+
+- [ ] **Step 5: 写开发、模型和测试素材安装文档**
+
+README 必须包含 Python 3.11 venv、`pip install -e ".[dev]"`、FFmpeg PATH、CUDA/PyTorch 单独安装、EdgeTAM 默认 worker、SAM 2.1 Tiny 对照 worker、gsplat 安装、联网素材下载、`python -m gs_video --doctor --json` 和测试命令。模型文档明确记录独立 worker 环境、Windows/WSL 选项、第三方模型许可证和离线 checkpoint 路径。验收文档明确记录 DAVIS 引用、Graphdeco 非商业研究限制、约 14 GB 的一次性归档下载和缓存迁移方式。
 
 ```markdown
 ## Local development
@@ -1489,12 +1688,14 @@ README 必须包含 Python 3.11 venv、`pip install -e ".[dev]"`、FFmpeg PATH�
 1. Create a Python 3.11 virtual environment.
 2. Run `python -m pip install -e ".[dev]"`.
 3. Install the CUDA-enabled PyTorch build that matches the local driver.
-4. Install gsplat and SAM 2 in the configured GPU worker environment.
-5. Add `ffmpeg` and `ffprobe` to `PATH`.
-6. Run `python -m gs_video --doctor --json` before opening the desktop app.
+4. Install EdgeTAM in the default GPU worker environment and SAM 2.1 Tiny in a separate comparison environment.
+5. Install gsplat in the renderer environment.
+6. Add `ffmpeg` and `ffprobe` to `PATH`.
+7. Run `python -m tools.fetch_test_assets fetch --group acceptance` once while online.
+8. Run `python -m gs_video --doctor --json` before opening the desktop app.
 ```
 
-- [ ] **Step 5: 运行完整发布门**
+- [ ] **Step 6: 运行完整发布门**
 
 Run: `python -m ruff check src tests scripts`
 
@@ -1512,11 +1713,19 @@ Run on 8 GB NVIDIA acceptance machine: `python -m pytest tests/integration/scene
 
 Expected: PASS。
 
+Run on 8 GB NVIDIA acceptance machine: `python -m tools.fetch_test_assets fetch --group acceptance --offline`
+
+Expected: PASS；所有网络素材和派生产物均从缓存命中并通过锁文件哈希校验。
+
+Run on 8 GB NVIDIA acceptance machine: `python scripts/run_acceptance.py --segmentation-backends tests/acceptance/segmentation_backends.json --report segmentation-report.json`
+
+Expected: EdgeTAM 峰值显存不超过 8 GB、平均 IoU 至少 0.75、无 Mask 丢失帧，且平均 IoU 不低于 SAM 2.1 Tiny 超过 0.07。
+
 Run on 8 GB NVIDIA acceptance machine: `python scripts/run_acceptance.py --cases tests/acceptance/cases.json --report acceptance-report.json`
 
 Expected: 12 个案例全部执行；自动闭环成功率至少 80%；规定案例峰值显存不超过 8 GB；成功案例音视频时长误差不超过一帧。
 
-- [ ] **Step 6: 提交**
+- [ ] **Step 7: 提交**
 
 ```powershell
 git add scripts tests/acceptance README.md docs/development
@@ -1526,11 +1735,12 @@ git commit -m "test: add MVP acceptance and release gate"
 ## 实施顺序与检查点
 
 - Tasks 1–3 完成后：得到可测试的项目状态与阶段框架，进行一次架构审查。
-- Tasks 4–6 完成后：用固定视频验证媒体、PLY 和相机轨迹，不加载 SAM 2 或 gsplat。
-- Tasks 7–9 完成后：在 8 GB 基准机分别验证分割、渲染和导出，确认 GPU 阶段串行释放。
-- Task 10 完成后：用 mock 服务跑完整管线并审查缓存失效。
-- Tasks 11–12 完成后：用 mock 后端验证三次交互的桌面闭环，再接真实后端。
-- Task 13 完成后：运行完整发布门，只有验收报告达到 PRD 指标才判定 MVP 验证完成。
+- Task 4 完成后：官方测试素材已下载、审查、锁定并可离线复用，大型二进制未进入 Git。
+- Tasks 5–7 完成后：用固定视频验证媒体、PLY 和相机轨迹，不加载分割模型或 gsplat。
+- Tasks 8–10 完成后：在 8 GB 基准机分别验证 EdgeTAM/SAM 2、渲染和导出，确认 GPU 阶段串行释放。
+- Task 11 完成后：用 mock 服务跑完整管线并审查缓存失效。
+- Tasks 12–13 完成后：用 mock 后端验证三次交互的桌面闭环，再接真实后端。
+- Task 14 完成后：运行完整发布门，只有验收报告达到 PRD 指标才判定 MVP 验证完成。
 
 ## 计划明确不实施的工作
 
