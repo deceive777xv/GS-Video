@@ -29,6 +29,7 @@ REQUIRED_PROPERTIES = {
     "f_dc_2",
 }
 SUPPORTED_SH_COEFFICIENT_COUNTS = {1, 4, 9, 16}
+MAX_SUPPORTED_REST_PROPERTY_INDEX = 44
 
 
 @dataclass(frozen=True)
@@ -121,15 +122,20 @@ def _rest_property_names(property_names: set[str]) -> tuple[str, ...]:
             raise UnsupportedMaterialError(
                 f"Gaussian PLY 球谐属性 {names[0]} 不是规范名称 f_rest_{index}"
             )
+        if index > MAX_SUPPORTED_REST_PROPERTY_INDEX:
+            raise UnsupportedMaterialError(
+                f"Gaussian PLY 球谐属性 {names[0]} 超过最大支持索引 "
+                f"{MAX_SUPPORTED_REST_PROPERTY_INDEX}"
+            )
 
     indexed = {index: names[0] for index, names in aliases.items()}
-
-    expected_indices = set(range(max(indexed) + 1))
-    missing = sorted(expected_indices - indexed.keys())
-    if missing:
-        missing_names = ", ".join(f"f_rest_{index}" for index in missing)
-        raise UnsupportedMaterialError(f"Gaussian PLY 球谐属性不连续，缺少: {missing_names}")
-    return tuple(indexed[index] for index in range(len(indexed)))
+    sorted_indices = sorted(indexed)
+    for expected_index, actual_index in enumerate(sorted_indices):
+        if actual_index != expected_index:
+            raise UnsupportedMaterialError(
+                f"Gaussian PLY 球谐属性不连续，缺少: f_rest_{expected_index}"
+            )
+    return tuple(indexed[index] for index in sorted_indices)
 
 
 def load_gaussian_ply(path: Path | str) -> GaussianScene:

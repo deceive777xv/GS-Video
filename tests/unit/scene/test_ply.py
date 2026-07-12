@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from plyfile import PlyData, PlyElement
 
+import gs_video.scene.ply as ply_module
 from gs_video.domain.errors import UnsupportedMaterialError
 from gs_video.scene.ply import (
     GaussianScene,
@@ -154,6 +155,25 @@ def test_reports_duplicate_numeric_rest_aliases_deterministically(tmp_path: Path
         UnsupportedMaterialError,
         match="重复.*f_rest_0, f_rest_00",
     ):
+        load_gaussian_ply(path)
+
+
+def test_rejects_huge_rest_index_without_range_sized_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "huge-rest-index.ply"
+    _write_ply(
+        path,
+        BASE_PROPERTIES + ("f_rest_1000000000",),
+        [_valid_row(1.0)],
+    )
+
+    def forbid_untrusted_range(*args: int) -> range:
+        raise AssertionError(f"must not allocate range from untrusted index: {args}")
+
+    monkeypatch.setattr(ply_module, "range", forbid_untrusted_range, raising=False)
+
+    with pytest.raises(UnsupportedMaterialError, match="f_rest_1000000000.*44"):
         load_gaussian_ply(path)
 
 
