@@ -23,6 +23,7 @@
 - 真实测试素材通过开发脚本从已审查的官方 URL 下载到 Git 忽略的缓存目录；素材清单、许可证记录和 SHA-256 锁文件必须提交。
 - `project.json` 是版本化状态源；大体积逐帧数据只保存文件引用和内容摘要。
 - 每个昂贵阶段必须支持进度、取消、缓存、失败分类和从最近成功阶段重试。
+- Python 环境和依赖统一由 `uv` 管理：项目使用 `.python-version` 固定 Python 3.11、`.venv` 作为本地环境并提交 `uv.lock`；计划中的 Python/pytest/ruff/mypy 命令实施时均通过 `uv run --extra dev` 执行。
 - 代码先写失败测试，再写最小实现；每个任务完成后单独提交。
 
 ## 技术决策说明
@@ -147,6 +148,9 @@ GS-Video/
 
 **Files:**
 - Create: `pyproject.toml`
+- Modify: `.gitignore`
+- Create: `.python-version`
+- Create: `uv.lock`
 - Create: `src/gs_video/__init__.py`
 - Create: `src/gs_video/__main__.py`
 - Create: `src/gs_video/app.py`
@@ -156,6 +160,7 @@ GS-Video/
 **Interfaces:**
 - Produces: `EnvironmentReport`, `EnvironmentDoctor.check() -> EnvironmentReport`
 - Produces: `python -m gs_video --doctor --json`
+- Produces: `uv venv --python 3.11` + `uv sync --extra dev --locked` 的可复现本地环境
 
 - [ ] **Step 1: 写环境诊断失败测试**
 
