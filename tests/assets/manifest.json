@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "id": "davis-2017-trainval-480p",
+      "group": "acceptance",
+      "url": "https://data.vision.ee.ethz.ch/csergi/share/davis/DAVIS-2017-trainval-480p.zip",
+      "source_page": "https://davischallenge.org/davis2017/code.html",
+      "usage": "internal-research-evaluation",
+      "expected_size": 832766765,
+      "citation": "Pont-Tuset et al., The 2017 DAVIS Challenge on Video Object Segmentation",
+      "include": [
+        "DAVIS/JPEGImages/480p/breakdance/**",
+        "DAVIS/JPEGImages/480p/dance-jump/**",
+        "DAVIS/JPEGImages/480p/dance-twirl/**",
+        "DAVIS/JPEGImages/480p/parkour/**",
+        "DAVIS/Annotations/480p/breakdance/**",
+        "DAVIS/Annotations/480p/dance-jump/**",
+        "DAVIS/Annotations/480p/dance-twirl/**",
+        "DAVIS/Annotations/480p/parkour/**"
+      ]
+    },
+    {
+      "id": "graphdeco-3dgs-pretrained-models",
+      "group": "acceptance",
+      "url": "https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/pretrained/models.zip",
+      "source_page": "https://github.com/graphdeco-inria/gaussian-splatting",
+      "license_url": "https://github.com/graphdeco-inria/gaussian-splatting/blob/main/LICENSE.md",
+      "usage": "internal-noncommercial-research-evaluation-only",
+      "expected_size": 14660630999,
+      "include": [
+        "train/point_cloud/iteration_30000/point_cloud.ply",
+        "truck/point_cloud/iteration_30000/point_cloud.ply"
+      ]
+    }
+  ]
+}

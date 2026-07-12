@@ -4,3 +4,7 @@
 *.egg-info/
 __pycache__/
 .pytest_cache/
+.cache/
+tests/.assets/
+*.partial
+acceptance-report.json
