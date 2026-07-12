@@ -129,6 +129,14 @@ def test_validate_source_rejects_out_of_range_material(
         validate_source(metadata)
 
 
+@pytest.mark.parametrize("duration", [float("nan"), float("inf"), float("-inf")])
+def test_validate_source_rejects_non_finite_duration(duration: float) -> None:
+    metadata = VideoMetadata(width=1920, height=1080, duration=duration, fps="30/1")
+
+    with pytest.raises(UnsupportedMaterialError, match="有限"):
+        validate_source(metadata)
+
+
 def test_commands_keep_windows_paths_as_single_unquoted_arguments() -> None:
     source = Path(r"C:\clips & drafts\take (final); $raw.mp4")
     output = Path(r"C:\proxy frames & temp")
@@ -148,6 +156,24 @@ def test_commands_keep_windows_paths_as_single_unquoted_arguments() -> None:
         str(output / "%06d.jpg"),
     ]
     assert '"' not in command[3]
+
+
+def test_proxy_command_defaults_to_mvp_max_height() -> None:
+    command = proxy_command(Path("source.mp4"), Path("frames"))
+
+    assert command[6] == r"scale=-2:min(540\,ih)"
+
+
+@pytest.mark.parametrize("max_height", [0, -1])
+def test_proxy_command_rejects_non_positive_height(max_height: int) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        proxy_command(Path("source.mp4"), Path("frames"), max_height=max_height)
+
+
+@pytest.mark.parametrize("max_height", [541, 720])
+def test_proxy_command_rejects_height_above_mvp_maximum(max_height: int) -> None:
+    with pytest.raises(ValueError, match="540"):
+        proxy_command(Path("source.mp4"), Path("frames"), max_height=max_height)
 
 
 def test_probe_video_runs_argument_list_without_shell(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -106,6 +106,8 @@ def parse_probe(payload: Mapping[str, Any]) -> VideoMetadata:
 
 
 def validate_source(metadata: VideoMetadata) -> None:
+    if not math.isfinite(metadata.duration):
+        raise UnsupportedMaterialError("视频时长必须是有限数值")
     if metadata.duration < 10:
         raise UnsupportedMaterialError("视频时长不能短于 10 秒")
     if metadata.duration > 30:
@@ -148,6 +150,8 @@ def probe_video(path: Path) -> VideoMetadata:
 def proxy_command(source: Path, output_dir: Path, max_height: int = 540) -> list[str]:
     if max_height <= 0:
         raise ValueError("max_height must be positive")
+    if max_height > 540:
+        raise ValueError("max_height must not exceed the MVP maximum of 540")
     return [
         "ffmpeg",
         "-y",

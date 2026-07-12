@@ -121,6 +121,20 @@ def test_extract_proxy_frames_rejects_empty_output(
         extract_proxy_frames(tmp_path / "source.mp4", tmp_path / "frames")
 
 
+@pytest.mark.parametrize("max_height", [541, 720])
+def test_extract_proxy_frames_rejects_height_above_mvp_maximum(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, max_height: int
+) -> None:
+    def unexpected_run(*args: object, **kwargs: object) -> None:
+        pytest.fail("ffmpeg must not run for an invalid proxy height")
+
+    monkeypatch.setattr(subprocess, "run", unexpected_run)
+    output_dir = tmp_path / "frames"
+
+    with pytest.raises(ValueError, match="540"):
+        extract_proxy_frames(tmp_path / "source.mp4", output_dir, max_height=max_height)
+
+
 def test_extract_proxy_frames_rejects_detected_shot_cut(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
