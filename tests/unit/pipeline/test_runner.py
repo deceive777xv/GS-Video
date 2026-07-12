@@ -103,6 +103,35 @@ def test_runner_cancels_during_execute_before_registering_returned_outputs() -> 
     ]
 
 
+def test_runner_cancellation_clears_prior_same_stage_cache_key() -> None:
+    project = project_with_prior_output()
+    project.stages[StageName.RENDER] = StageState(
+        status=StageStatus.SUCCEEDED,
+        cache_key="old-render-key",
+        output_paths=["renders/diagnostic.png"],
+    )
+    token = CancellationToken()
+    token.cancel()
+    saved, save = snapshots()
+    runner = PipelineRunner(
+        project,
+        {
+            StageName.RENDER: RecordingStage(
+                lambda project, token: StageResult((Path("renders/new.png"),), "new-key")
+            )
+        },
+        save=save,
+    )
+
+    state = runner.run(StageName.RENDER, token)
+
+    assert saved[0].stages[StageName.RENDER].status is StageStatus.RUNNING
+    assert saved[0].stages[StageName.RENDER].cache_key is None
+    assert state.status is StageStatus.CANCELLED
+    assert state.cache_key is None
+    assert state.output_paths == ["renders/diagnostic.png"]
+
+
 def test_runner_registers_outputs_only_after_stage_returns_successfully() -> None:
     project = project_with_prior_output()
 
@@ -156,6 +185,30 @@ def test_runner_maps_gs_video_errors_and_saves_terminal_state(
     assert state.status is StageStatus.FAILED
     assert state.error_code == expected_code
     assert project.stages[StageName.INGEST].output_paths == ["source/meta.json"]
+
+
+def test_runner_handled_failure_clears_prior_same_stage_cache_key() -> None:
+    project = project_with_prior_output()
+    project.stages[StageName.RENDER] = StageState(
+        status=StageStatus.SUCCEEDED,
+        cache_key="old-render-key",
+        output_paths=["renders/diagnostic.png"],
+    )
+
+    def fail(project: Project, token: CancellationToken) -> StageResult:
+        raise RepairableError("adjust input")
+
+    saved, save = snapshots()
+    runner = PipelineRunner(project, {StageName.RENDER: RecordingStage(fail)}, save=save)
+
+    state = runner.run(StageName.RENDER, CancellationToken())
+
+    assert saved[0].stages[StageName.RENDER].status is StageStatus.RUNNING
+    assert saved[0].stages[StageName.RENDER].cache_key is None
+    assert state.status is StageStatus.FAILED
+    assert state.cache_key is None
+    assert state.error_code == "repairable"
+    assert state.output_paths == ["renders/diagnostic.png"]
 
 
 def test_runner_clears_stale_error_on_retry_and_success() -> None:

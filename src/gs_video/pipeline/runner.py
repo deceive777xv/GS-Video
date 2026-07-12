@@ -26,6 +26,7 @@ class PipelineRunner:
     def run(self, name: StageName, token: CancellationToken) -> StageState:
         state = self.project.stages.setdefault(name, StageState())
         state.status = StageStatus.RUNNING
+        state.cache_key = None
         state.error_code = None
         self.save(self.project)
 
