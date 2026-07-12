@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gs-video"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "fastapi>=0.128,<1",
+  "numpy>=2,<3",
+  "opencv-python-headless>=4.13,<5",
+  "pillow>=11,<12",
+  "plyfile>=1.1,<2",
+  "pydantic>=2.11,<3",
+  "python-multipart>=0.0.20,<1",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = ["httpx>=0.28,<1", "mypy>=1.16,<2", "pyinstaller>=6.14,<7", "pytest>=8,<9", "ruff>=0.12,<1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["gs_video"]
