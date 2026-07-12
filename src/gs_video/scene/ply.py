@@ -41,6 +41,44 @@ class GaussianScene:
     opacities: Float32Array
     colors: Float32Array
 
+    def __post_init__(self) -> None:
+        arrays = {
+            "means": self.means,
+            "scales": self.scales,
+            "quats": self.quats,
+            "opacities": self.opacities,
+            "colors": self.colors,
+        }
+        expected_shapes = {
+            "means": (2, 3, "[N,3]"),
+            "scales": (2, 3, "[N,3]"),
+            "quats": (2, 4, "[N,4]"),
+            "opacities": (1, None, "[N]"),
+            "colors": (3, 3, "[N,K,3]"),
+        }
+        for name, array in arrays.items():
+            if not isinstance(array, np.ndarray):
+                raise ValueError(f"{name} must be a NumPy array")
+            expected_rank, final_dimension, shape_description = expected_shapes[name]
+            if array.ndim != expected_rank or (
+                final_dimension is not None and array.shape[-1] != final_dimension
+            ):
+                raise ValueError(f"{name} must have shape {shape_description}")
+
+        counts = {array.shape[0] for array in arrays.values()}
+        if len(counts) != 1 or self.means.shape[0] == 0:
+            raise ValueError("GaussianScene arrays must share the same nonzero N")
+        if self.colors.shape[1] not in SUPPORTED_SH_COEFFICIENT_COUNTS:
+            raise ValueError(
+                "colors K must be one of the supported SH coefficient counts: 1, 4, 9, 16"
+            )
+
+        for name, array in arrays.items():
+            if array.dtype != np.float32:
+                raise ValueError(f"{name} must use float32 dtype")
+            if not array.flags.c_contiguous:
+                raise ValueError(f"{name} must be C-contiguous")
+
     @property
     def count(self) -> int:
         return int(self.means.shape[0])
@@ -60,17 +98,31 @@ def _columns(vertex: np.ndarray, names: tuple[str, ...]) -> Float32Array:
 
 
 def _rest_property_names(property_names: set[str]) -> tuple[str, ...]:
-    indexed: dict[int, str] = {}
-    for name in property_names:
+    aliases: dict[int, list[str]] = {}
+    for name in sorted(property_names):
         if not name.startswith("f_rest_"):
             continue
         suffix = name.removeprefix("f_rest_")
         if not suffix.isdecimal():
             raise UnsupportedMaterialError(f"Gaussian PLY 球谐属性名称无效: {name}")
-        indexed[int(suffix)] = name
+        aliases.setdefault(int(suffix), []).append(name)
 
-    if not indexed:
+    if not aliases:
         return ()
+
+    for index in sorted(aliases):
+        names = sorted(aliases[index], key=lambda name: (len(name), name))
+        if len(names) > 1:
+            raise UnsupportedMaterialError(
+                f"Gaussian PLY 球谐属性存在重复索引 {index}: {', '.join(names)}"
+            )
+        suffix = names[0].removeprefix("f_rest_")
+        if suffix != str(index):
+            raise UnsupportedMaterialError(
+                f"Gaussian PLY 球谐属性 {names[0]} 不是规范名称 f_rest_{index}"
+            )
+
+    indexed = {index: names[0] for index, names in aliases.items()}
 
     expected_indices = set(range(max(indexed) + 1))
     missing = sorted(expected_indices - indexed.keys())
@@ -155,7 +207,8 @@ def estimate_scene_vram(scene: GaussianScene, width: int, height: int) -> int:
     )
     framebuffer_bytes = width * height * 4 * 4
     projection_bytes = scene.count * 48
-    return int((gaussian_bytes + framebuffer_bytes + projection_bytes) * 1.5)
+    total_bytes = gaussian_bytes + framebuffer_bytes + projection_bytes
+    return (total_bytes * 3) // 2
 
 
 def assess_scene_vram(

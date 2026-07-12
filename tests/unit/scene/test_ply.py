@@ -65,6 +65,16 @@ def _valid_row(*rest: float) -> tuple[float, ...]:
     )
 
 
+def _valid_scene_arrays() -> dict[str, np.ndarray]:
+    return {
+        "means": np.zeros((2, 3), dtype=np.float32),
+        "scales": np.zeros((2, 3), dtype=np.float32),
+        "quats": np.zeros((2, 4), dtype=np.float32),
+        "opacities": np.zeros(2, dtype=np.float32),
+        "colors": np.zeros((2, 4, 3), dtype=np.float32),
+    }
+
+
 def test_rejects_plain_xyz_point_cloud_and_lists_all_missing_properties(tmp_path: Path) -> None:
     path = tmp_path / "plain.ply"
     _write_ply(path, ("x", "y", "z"), [(0.0, 0.0, 0.0)])
@@ -121,6 +131,29 @@ def test_rejects_discontinuous_rest_coefficients(tmp_path: Path) -> None:
     _write_ply(path, BASE_PROPERTIES + ("f_rest_0", "f_rest_2"), [_valid_row(1.0, 2.0)])
 
     with pytest.raises(UnsupportedMaterialError, match="f_rest_1"):
+        load_gaussian_ply(path)
+
+
+def test_rejects_noncanonical_zero_padded_rest_suffix(tmp_path: Path) -> None:
+    path = tmp_path / "zero-padded.ply"
+    _write_ply(path, BASE_PROPERTIES + ("f_rest_00",), [_valid_row(1.0)])
+
+    with pytest.raises(UnsupportedMaterialError, match="f_rest_00.*规范"):
+        load_gaussian_ply(path)
+
+
+def test_reports_duplicate_numeric_rest_aliases_deterministically(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-alias.ply"
+    _write_ply(
+        path,
+        BASE_PROPERTIES + ("f_rest_0", "f_rest_00"),
+        [_valid_row(1.0, 2.0)],
+    )
+
+    with pytest.raises(
+        UnsupportedMaterialError,
+        match="重复.*f_rest_0, f_rest_00",
+    ):
         load_gaussian_ply(path)
 
 
@@ -198,9 +231,89 @@ def test_estimate_scene_vram_uses_exact_documented_formula() -> None:
     framebuffer_bytes = 10 * 5 * 4 * 4
     projection_bytes = 2 * 48
 
-    assert estimate_scene_vram(scene, 10, 5) == int(
-        (gaussian_bytes + framebuffer_bytes + projection_bytes) * 1.5
+    total_bytes = gaussian_bytes + framebuffer_bytes + projection_bytes
+    assert estimate_scene_vram(scene, 10, 5) == (total_bytes * 3) // 2
+
+
+def test_estimate_scene_vram_uses_exact_integer_safety_factor_for_large_values() -> None:
+    scene = GaussianScene(**_valid_scene_arrays())
+    width = 2**52 + 1
+    total_bytes = (
+        sum(array.nbytes for array in _valid_scene_arrays().values())
+        + width * 4 * 4
+        + scene.count * 48
     )
+
+    assert estimate_scene_vram(scene, width, 1) == (total_bytes * 3) // 2
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("means", np.zeros((2, 3, 1), dtype=np.float32)),
+        ("scales", np.zeros((2, 2), dtype=np.float32)),
+        ("quats", np.zeros((2, 3), dtype=np.float32)),
+        ("opacities", np.zeros((2, 1), dtype=np.float32)),
+        ("colors", np.zeros((2, 4, 4), dtype=np.float32)),
+    ],
+)
+def test_gaussian_scene_rejects_wrong_rank_or_final_dimensions(
+    field: str, replacement: np.ndarray
+) -> None:
+    arrays = _valid_scene_arrays()
+    arrays[field] = replacement
+
+    with pytest.raises(ValueError, match=field):
+        GaussianScene(**arrays)
+
+
+def test_gaussian_scene_rejects_mismatched_gaussian_counts() -> None:
+    arrays = _valid_scene_arrays()
+    arrays["scales"] = np.zeros((3, 3), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="same nonzero N"):
+        GaussianScene(**arrays)
+
+
+def test_gaussian_scene_rejects_non_float32_arrays() -> None:
+    arrays = _valid_scene_arrays()
+    arrays["means"] = np.zeros((2, 3), dtype=np.float64)
+
+    with pytest.raises(ValueError, match="means.*float32"):
+        GaussianScene(**arrays)
+
+
+def test_gaussian_scene_rejects_non_contiguous_arrays() -> None:
+    arrays = _valid_scene_arrays()
+    arrays["means"] = np.zeros((3, 2), dtype=np.float32).T
+    assert not arrays["means"].flags.c_contiguous
+
+    with pytest.raises(ValueError, match="means.*C-contiguous"):
+        GaussianScene(**arrays)
+
+
+def test_gaussian_scene_rejects_empty_gaussian_dimension() -> None:
+    arrays = {
+        "means": np.zeros((0, 3), dtype=np.float32),
+        "scales": np.zeros((0, 3), dtype=np.float32),
+        "quats": np.zeros((0, 4), dtype=np.float32),
+        "opacities": np.zeros(0, dtype=np.float32),
+        "colors": np.zeros((0, 4, 3), dtype=np.float32),
+    }
+
+    with pytest.raises(ValueError, match="nonzero N"):
+        GaussianScene(**arrays)
+
+
+@pytest.mark.parametrize("coefficient_count", [0, 2])
+def test_gaussian_scene_rejects_empty_or_unsupported_sh_basis(
+    coefficient_count: int,
+) -> None:
+    arrays = _valid_scene_arrays()
+    arrays["colors"] = np.zeros((2, coefficient_count, 3), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="colors.*K"):
+        GaussianScene(**arrays)
 
 
 def test_vram_assessment_accepts_exact_eighty_percent_boundary() -> None:
