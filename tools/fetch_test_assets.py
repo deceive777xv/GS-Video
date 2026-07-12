@@ -20,6 +20,8 @@ MANIFEST_PATH = REPOSITORY_ROOT / "tests" / "assets" / "manifest.json"
 LOCK_PATH = REPOSITORY_ROOT / "tests" / "assets" / "lock.json"
 DOWNLOAD_TIMEOUT_SECONDS = 60.0
 HASH_BLOCK_SIZE = 8 * 1024 * 1024
+DOWNLOAD_BLOCK_SIZE = 256 * 1024
+PROGRESS_INTERVAL_BYTES = 8 * 1024 * 1024
 
 
 class AssetError(RuntimeError):
@@ -135,6 +137,7 @@ class AssetLock:
 
 class ResponseLike(Protocol):
     status: int
+    headers: Mapping[str, str]
 
     def read(self, size: int = -1) -> bytes: ...
 
@@ -146,6 +149,11 @@ class ResponseLike(Protocol):
 
 
 Opener = Callable[..., ResponseLike]
+Progress = Callable[[str], None]
+
+
+def _print_progress(message: str) -> None:
+    print(message, flush=True)
 
 
 def _require_https(url: str) -> None:
@@ -207,9 +215,16 @@ def _partial_path(target: Path) -> Path:
 
 
 class AssetFetcher:
-    def __init__(self, *, opener: Opener = urllib.request.urlopen, offline: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        opener: Opener = urllib.request.urlopen,
+        offline: bool = False,
+        progress: Progress = _print_progress,
+    ) -> None:
         self._opener = opener
         self._offline = offline
+        self._progress = progress
 
     def fetch(self, lock: LockedAsset, target: Path) -> Path:
         _require_https(lock.url)
@@ -217,10 +232,10 @@ class AssetFetcher:
             return verify_or_remove(target, lock.archive_sha256)
         if self._offline:
             raise AssetOfflineError(f"离线模式下缓存缺失: {target}")
-        self.download(lock.url, target)
+        self.download(lock.url, target, asset_id=lock.id)
         return verify_or_remove(target, lock.archive_sha256)
 
-    def download(self, url: str, target: Path) -> Path:
+    def download(self, url: str, target: Path, *, asset_id: str = "asset") -> Path:
         _require_https(url)
         target.parent.mkdir(parents=True, exist_ok=True)
         partial = _partial_path(target)
@@ -231,19 +246,53 @@ class AssetFetcher:
             with self._opener(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
                 _require_https(response.geturl())
                 append = offset > 0 and response.status == 206
+                resumed = offset if append else 0
+                total = _response_total(response, resumed)
+                total_text = str(total) if total is not None else "unknown"
+                self._progress(
+                    f"download asset={asset_id} status={response.status} "
+                    f"resumed={resumed} total={total_text}"
+                )
                 mode = "ab" if append else "wb"
+                downloaded = resumed
+                first_progress = True
+                next_progress = downloaded + PROGRESS_INTERVAL_BYTES
                 with partial.open(mode) as stream:
                     while True:
-                        block = response.read(HASH_BLOCK_SIZE)
+                        block = response.read(DOWNLOAD_BLOCK_SIZE)
                         if not block:
                             break
                         stream.write(block)
+                        stream.flush()
+                        downloaded += len(block)
+                        if (
+                            first_progress
+                            or downloaded >= next_progress
+                            or (total is not None and downloaded >= total)
+                        ):
+                            self._progress(
+                                f"download asset={asset_id} bytes={downloaded} total={total_text}"
+                            )
+                            first_progress = False
+                            next_progress = downloaded + PROGRESS_INTERVAL_BYTES
             partial.replace(target)
             return target
         except Exception:
             if partial.exists() and isinstance(sys.exc_info()[1], AssetSecurityError):
                 partial.unlink(missing_ok=True)
             raise
+
+
+def _response_total(response: ResponseLike, resumed: int) -> int | None:
+    content_range = response.headers.get("Content-Range")
+    if content_range:
+        match = re.fullmatch(r"bytes\s+\d+-\d+/(\d+|\*)", content_range.strip())
+        if match and match.group(1) != "*":
+            return int(match.group(1))
+    content_length = response.headers.get("Content-Length")
+    if content_length and content_length.isdigit():
+        return resumed + int(content_length)
+    return None
 
 
 def _matches(member: str, patterns: Sequence[str]) -> bool:
@@ -350,7 +399,7 @@ def _lock_assets(
         asset_root = cache_root / entry.id
         archive_path = asset_root / "archive.zip"
         if not archive_path.exists():
-            fetcher.download(entry.url, archive_path)
+            fetcher.download(entry.url, archive_path, asset_id=entry.id)
         hashes = extract_selected(archive_path, asset_root / "selected", entry.include)
         if not hashes:
             raise AssetNeedsContextError(

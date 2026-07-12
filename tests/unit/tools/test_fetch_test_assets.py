@@ -79,6 +79,21 @@ class FailIfCalledOpener:
         raise AssertionError(f"network opened with timeout={timeout}")
 
 
+class ObservingResponse(Response):
+    def __init__(self, body: bytes, partial: Path, progress: list[str], **kwargs: Any) -> None:
+        super().__init__(body, **kwargs)
+        self.partial = partial
+        self.progress = progress
+        self.read_count = 0
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_count += 1
+        if self.read_count == 2:
+            assert self.partial.read_bytes() == b"first"
+            assert self.progress[-1] == "download asset=demo bytes=5 total=11"
+        return super().read(5 if self.read_count == 1 else size)
+
+
 def locked_asset(
     archive_hash: str,
     *,
@@ -169,6 +184,62 @@ def test_range_resume_restarts_when_server_returns_200(tmp_path: Path) -> None:
     AssetFetcher(opener=opener).fetch(locked_asset(sha256_bytes(b"fresh")), target)
 
     assert target.read_bytes() == b"fresh"
+
+
+def test_partial_grows_and_progress_emits_before_response_completes(tmp_path: Path) -> None:
+    target = tmp_path / "asset.zip"
+    partial = target.with_suffix(".zip.partial")
+    progress: list[str] = []
+    response = ObservingResponse(
+        b"firstsecond",
+        partial,
+        progress,
+        headers={"Content-Length": "11"},
+    )
+
+    AssetFetcher(
+        opener=RecordingOpener([response]), progress=progress.append
+    ).fetch(locked_asset(sha256_bytes(b"firstsecond")), target)
+
+    assert progress == [
+        "download asset=demo status=200 resumed=0 total=11",
+        "download asset=demo bytes=5 total=11",
+        "download asset=demo bytes=11 total=11",
+    ]
+
+
+def test_resumed_progress_accounts_for_existing_bytes(tmp_path: Path) -> None:
+    target = tmp_path / "asset.zip"
+    target.with_suffix(".zip.partial").write_bytes(b"abc")
+    progress: list[str] = []
+    opener = RecordingOpener(
+        [Response(b"def", status=206, headers={"Content-Range": "bytes 3-5/6"})]
+    )
+
+    AssetFetcher(opener=opener, progress=progress.append).fetch(
+        locked_asset(sha256_bytes(b"abcdef")), target
+    )
+
+    assert progress == [
+        "download asset=demo status=206 resumed=3 total=6",
+        "download asset=demo bytes=6 total=6",
+    ]
+
+
+def test_restart_progress_resets_existing_partial_accounting(tmp_path: Path) -> None:
+    target = tmp_path / "asset.zip"
+    target.with_suffix(".zip.partial").write_bytes(b"stale")
+    progress: list[str] = []
+    opener = RecordingOpener([Response(b"fresh", status=200, headers={"Content-Length": "5"})])
+
+    AssetFetcher(opener=opener, progress=progress.append).fetch(
+        locked_asset(sha256_bytes(b"fresh")), target
+    )
+
+    assert progress == [
+        "download asset=demo status=200 resumed=0 total=5",
+        "download asset=demo bytes=5 total=5",
+    ]
 
 
 def test_extracts_only_selected_members_and_returns_hashes(tmp_path: Path) -> None:
