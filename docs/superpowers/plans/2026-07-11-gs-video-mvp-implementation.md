@@ -4,9 +4,9 @@
 
 **Goal:** 构建一个在 Windows 11 与 8 GB NVIDIA 显存环境中运行的内部桌面工具，让用户通过选择人物、确认 Gaussian 场景初始机位和指定落脚点，将 10–30 秒单人单镜头视频自动合成为新的 Gaussian 背景视频。
 
-**Architecture:** 使用单一 Python 3.11 代码库实现 PySide6 桌面向导、版本化项目模型和可恢复的阶段管线。高变动的分割、相机求解和 Gaussian 渲染通过窄接口隔离；GPU 阶段串行运行，并允许在独立 Python 进程中加载模型以可靠释放显存。MVP 相机求解先使用 OpenCV 的受控视频基线，后续可通过同一契约接入 ViPE 或 VGGT。
+**Architecture:** 使用 Tauri 2 承载 React + TypeScript + Vite SPA，业务能力由只监听 `127.0.0.1` 的 FastAPI 本地服务提供。浏览器和 Tauri WebView 复用同一套页面、`BackendClient` 与 REST/WebSocket 契约；Tauri 只负责 API sidecar 生命周期、原生文件对话框、打开/显示文件和窗口/安装包。高变动的分割、相机求解和 Gaussian 渲染继续通过 Python 窄接口与独立 GPU worker 隔离，GPU 阶段串行运行。MVP 相机求解先使用 OpenCV 受控视频基线，后续可通过同一契约接入 ViPE 或 VGGT。
 
-**Tech Stack:** Python 3.11、PySide6 6、Pydantic 2、NumPy 2、OpenCV 4.13、Pillow、FFmpeg/ffprobe、PyTorch、EdgeTAM、SAM 2.1 Hiera Tiny 对照后端、gsplat 1.x、plyfile、pytest、pytest-qt、ruff、mypy。
+**Tech Stack:** Tauri 2、Rust stable、React 19、TypeScript 5、Vite 8、Vitest 4、Testing Library、Playwright、Python 3.11、FastAPI、Uvicorn、Pydantic 2、NumPy 2、OpenCV 4.13、Pillow、FFmpeg/ffprobe、PyTorch、EdgeTAM、SAM 2.1 Hiera Tiny 对照后端、gsplat 1.x、plyfile、PyInstaller、pytest、ruff、mypy。
 
 ## Global Constraints
 
@@ -17,6 +17,9 @@
 - 正常案例只要求选择人物、确认初始机位、指定落脚点三次关键交互。
 - MVP 只做 RGB Gaussian 背景与人物 Alpha 合成，不做人物深度、遮挡、阴影或重光照。
 - 所有原始素材只读；所有产物写入项目目录；运行过程不发起素材上传。
+- FastAPI 只监听 `127.0.0.1` 随机端口；每次启动生成高熵会话令牌。所有 REST、WebSocket 和浏览器上传均须认证；CORS 只允许当前开发或桌面 origin。
+- REST 是项目与任务状态的权威来源；WebSocket 只传进度/状态变化事件，断线重连后必须能通过 REST 恢复，不得依赖未持久化事件完成业务流程。
+- React 业务组件不得直接导入 `@tauri-apps/*`；平台能力只能通过 `PlatformBridge` 注入。桌面导入使用路径引用，浏览器导入使用分块上传。
 - 真实测试素材通过开发脚本从已审查的官方 URL 下载到 Git 忽略的缓存目录；素材清单、许可证记录和 SHA-256 锁文件必须提交。
 - `project.json` 是版本化状态源；大体积逐帧数据只保存文件引用和内容摘要。
 - 每个昂贵阶段必须支持进度、取消、缓存、失败分类和从最近成功阶段重试。
@@ -24,7 +27,9 @@
 
 ## 技术决策说明
 
-- PySide6 使用 Qt 官方的主线程 UI + worker signal 模式；后台线程不得直接修改 Qt model 或 widget。
+- React 页面只依赖 `BackendClient`、`PlatformBridge` 和可替换状态 store；WebSocket 订阅必须清理并以 REST 快照收敛。平台专有实现放在 composition root，不进入业务组件。
+- Tauri 使用最小 capability：只允许启动固定的 `gs-video-api` sidecar、打开文件/目录和显示原生文件对话框。不得授予任意 shell、任意 URL 或任意文件系统访问。
+- FastAPI 使用 lifespan 管理启动/关闭；API sidecar 负责 worker 子进程树清理，Tauri 负责 sidecar 退出。PyInstaller 使用可审查的 spec 文件生成不含 GPU 运行时的 Windows onefile sidecar，再按 Tauri target-triple 规则命名。
 - Pydantic 2 使用 `model_validate_json()` 读取、`model_dump_json()` 写入，并在进入当前模型验证前运行显式字典迁移。
 - gsplat 使用 `rasterization(means, quats, scales, opacities, colors, viewmats, Ks, width, height)`；MVP 每次只渲染一个视角以控制显存。
 - EdgeTAM 作为 MVP 默认分割后端，SAM 2.1 Hiera Tiny 作为质量对照后端。两者使用同一外部 worker 协议和相近的视频 predictor API，不在桌面进程内驻留模型。
@@ -34,7 +39,12 @@
 
 实施时优先核对以下官方资料，避免复制过时 API：
 
-- [Qt for Python 6 documentation](https://doc.qt.io/qtforpython-6/)
+- [Tauri 2 documentation](https://v2.tauri.app/)
+- [React documentation](https://react.dev/)
+- [Vite documentation](https://vite.dev/)
+- [Vitest documentation](https://vitest.dev/)
+- [FastAPI documentation](https://fastapi.tiangolo.com/)
+- [PyInstaller documentation](https://pyinstaller.org/en/stable/)
 - [Pydantic documentation](https://docs.pydantic.dev/)
 - [OpenCV 4.13 documentation](https://docs.opencv.org/4.13.0/)
 - [FFmpeg documentation](https://ffmpeg.org/documentation.html)
@@ -50,11 +60,39 @@
 ```text
 GS-Video/
 ├─ pyproject.toml                         # 包元数据、依赖、pytest/ruff/mypy 配置
+├─ package.json                           # 前端 workspace 与 Tauri CLI 脚本
+├─ package-lock.json                      # 固定 Node 依赖
+├─ tsconfig.base.json                     # 共享严格 TypeScript 配置
 ├─ README.md                              # 开发环境、模型安装、运行与验证命令
+├─ apps/
+│  ├─ web/
+│  │  ├─ package.json
+│  │  ├─ vite.config.ts
+│  │  ├─ vitest.config.ts
+│  │  ├─ index.html
+│  │  └─ src/
+│  │     ├─ app/                          # 页面路由、store 与 composition root
+│  │     ├─ api/                          # BackendClient、REST/WS 客户端与 DTO
+│  │     ├─ platform/                     # Browser/Tauri PlatformBridge
+│  │     ├─ features/                     # import/subject/camera/preview/export
+│  │     └─ test/                         # Vitest setup 与 fake adapters
+│  └─ desktop/
+│     └─ src-tauri/
+│        ├─ Cargo.toml
+│        ├─ tauri.conf.json
+│        ├─ capabilities/default.json
+│        ├─ binaries/                     # Git 忽略的 target-triple sidecar 产物
+│        └─ src/                          # 启动握手、进程清理、平台 commands
 ├─ src/gs_video/
 │  ├─ __init__.py
 │  ├─ __main__.py                         # python -m gs_video 入口
-│  ├─ app.py                              # QApplication 组装，不含业务规则
+│  ├─ app.py                              # FastAPI app factory 与 lifespan 组装
+│  ├─ api/
+│  │  ├─ auth.py                         # 启动令牌、origin 与 WS 认证
+│  │  ├─ routes.py                       # 项目、素材、任务、预览与导出 REST
+│  │  ├─ uploads.py                      # 浏览器分块上传与配额
+│  │  ├─ events.py                       # 可重连的任务事件 hub
+│  │  └─ schemas.py                      # 版本化 API DTO
 │  ├─ domain/
 │  │  ├─ models.py                        # 项目、素材、相机、场景、阶段 Pydantic 模型
 │  │  ├─ errors.py                        # 可修复/素材不适用/系统错误
@@ -87,18 +125,11 @@ GS-Video/
 │  │  └─ gsplat_renderer.py               # 单视角、串行 gsplat 渲染
 │  ├─ composite/
 │  │  └─ alpha.py                         # Alpha 边缘处理与逐帧合成
-│  └─ ui/
-│     ├─ main_window.py                    # QWizard/QStackedWidget 导航与项目绑定
-│     ├─ task_worker.py                    # QThread worker 与 Signal 桥接
-│     ├─ viewport.py                       # 场景预览、轨道相机和落脚点交互
-│     └─ pages/
-│        ├─ import_page.py
-│        ├─ subject_page.py
-│        ├─ camera_page.py
-│        ├─ preview_page.py
-│        └─ export_page.py
 ├─ tools/
-│  └─ fetch_test_assets.py                 # 官方素材下载、续传、解压、裁剪与哈希校验
+│  ├─ fetch_test_assets.py                 # 官方素材下载、续传、解压、裁剪与哈希校验
+│  └─ build_sidecar.py                     # PyInstaller 构建和 Tauri binary 命名
+├─ packaging/
+│  └─ gs-video-api.spec                    # 可复现 API sidecar 打包入口
 └─ tests/
    ├─ assets/
    │  ├─ manifest.json                     # 来源、用途、许可证、选择规则
@@ -106,12 +137,13 @@ GS-Video/
    ├─ fixtures/                            # 可提交的小型合成视频、PLY、相机与 Alpha 资产
    ├─ unit/
    ├─ integration/
-   └─ e2e/
+   ├─ e2e/                                # API 与真实浏览器契约/E2E
+   └─ security/                           # 令牌、CORS、路径和上传边界
 ```
 
 ---
 
-### Task 1: 建立可测试的应用骨架与环境诊断
+### Task 1: 建立可测试的 Python 服务骨架与环境诊断
 
 **Files:**
 - Create: `pyproject.toml`
@@ -162,16 +194,18 @@ name = "gs-video"
 version = "0.1.0"
 requires-python = ">=3.11,<3.12"
 dependencies = [
+  "fastapi>=0.128,<1",
   "numpy>=2,<3",
   "opencv-python-headless>=4.13,<5",
   "pillow>=11,<12",
   "plyfile>=1.1,<2",
   "pydantic>=2.11,<3",
-  "PySide6>=6.9,<7",
+  "python-multipart>=0.0.20,<1",
+  "uvicorn[standard]>=0.35,<1",
 ]
 
 [project.optional-dependencies]
-dev = ["mypy>=1.16,<2", "pytest>=8,<9", "pytest-qt>=4.5,<5", "ruff>=0.12,<1"]
+dev = ["httpx>=0.28,<1", "mypy>=1.16,<2", "pyinstaller>=6.14,<7", "pytest>=8,<9", "ruff>=0.12,<1"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -258,13 +292,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="gs-video")
     parser.add_argument("--doctor", action="store_true")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--serve", action="store_true")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=0)
     args = parser.parse_args()
     if args.doctor:
         report = EnvironmentDoctor().check()
         print(report.model_dump_json(indent=2) if args.json else report)
         return 0 if report.ready else 2
-    from gs_video.app import run
-    return run()
+    if args.serve:
+        from gs_video.app import run_api
+        return run_api(host=args.host, port=args.port)
+    parser.print_help()
+    return 0
 
 
 if __name__ == "__main__":
@@ -273,8 +313,9 @@ if __name__ == "__main__":
 
 ```python
 # src/gs_video/app.py
-def run() -> int:
-    print("GS Video desktop UI has not been assembled yet. Run with --doctor.")
+def run_api(host: str, port: int) -> int:
+    # Task 12 将此占位入口替换为 FastAPI app factory 与 Uvicorn 启动握手。
+    print(f"GS Video API has not been assembled yet: {host}:{port}")
     return 0
 ```
 
@@ -290,7 +331,7 @@ Expected: `All checks passed!`
 
 ```powershell
 git add pyproject.toml src/gs_video tests/unit/environment
-git commit -m "feat: scaffold application and environment doctor"
+git commit -m "feat: scaffold core service and environment doctor"
 ```
 
 ### Task 2: 定义版本化项目模型、原子存储与迁移
@@ -1412,199 +1453,414 @@ git add src/gs_video/pipeline tests/integration/pipeline
 git commit -m "feat: assemble cached MVP processing workflow"
 ```
 
-### Task 12: 建立 PySide6 向导、后台任务桥和人物选择交互
+### Task 12: 建立安全、可恢复的 FastAPI 本地服务契约
 
 **Files:**
 - Modify: `src/gs_video/app.py`
-- Create: `src/gs_video/ui/main_window.py`
-- Create: `src/gs_video/ui/task_worker.py`
-- Create: `src/gs_video/ui/pages/import_page.py`
-- Create: `src/gs_video/ui/pages/subject_page.py`
-- Create: `tests/unit/ui/test_main_window.py`
-- Create: `tests/unit/ui/test_task_worker.py`
+- Modify: `src/gs_video/__main__.py`
+- Create: `src/gs_video/api/auth.py`
+- Create: `src/gs_video/api/schemas.py`
+- Create: `src/gs_video/api/events.py`
+- Create: `src/gs_video/api/routes.py`
+- Create: `src/gs_video/api/uploads.py`
+- Create: `tests/integration/api/test_projects.py`
+- Create: `tests/integration/api/test_tasks.py`
+- Create: `tests/security/test_local_api.py`
 
 **Interfaces:**
-- Produces: `run() -> int`, `MainWindow`, `PipelineTaskWorker`
-- Consumes: `ProjectRepository`, `EnvironmentDoctor`, `PipelineRunner`
+- Produces: `create_app(settings, services) -> FastAPI`
+- Produces: `GET /api/v1/bootstrap`、项目/素材/任务/预览/导出 REST 与 `WS /api/v1/events`
+- Consumes: `ProjectRepository`、`EnvironmentDoctor`、`PipelineRunner`
 
-- [ ] **Step 1: 写页面门控和主线程信号测试**
+- [ ] **Step 1: 写令牌、origin、任务恢复和 WebSocket 断线测试**
 
 ```python
-def test_import_page_blocks_next_until_both_inputs_validate(qtbot, window) -> None:
-    qtbot.addWidget(window)
-    window.import_page.set_video(valid_video_path())
-    assert window.next_button.isEnabled() is False
-    window.import_page.set_scene(valid_scene_path())
-    assert window.next_button.isEnabled() is True
+def test_protected_route_rejects_missing_session_token(api_client) -> None:
+    response = api_client.get("/api/v1/projects/current")
+    assert response.status_code == 401
 
 
-def test_worker_emits_progress_without_touching_widgets(qtbot) -> None:
-    worker = PipelineTaskWorker(lambda emit, token: emit(3, 10, "分割"))
-    with qtbot.waitSignal(worker.progress, timeout=1000) as signal:
-        worker.start()
-    assert signal.args == [3, 10, "分割"]
+def test_task_state_is_recoverable_without_websocket(api_client, auth_headers) -> None:
+    task_id = api_client.post(
+        "/api/v1/tasks", json={"target_stage": "segment"}, headers=auth_headers
+    ).json()["id"]
+    snapshot = api_client.get(f"/api/v1/tasks/{task_id}", headers=auth_headers).json()
+    assert snapshot["status"] in {"queued", "running", "succeeded"}
+    assert "revision" in snapshot
+
+
+def test_browser_upload_rejects_path_traversal_and_oversized_chunk(api_client, auth_headers) -> None:
+    response = api_client.put(
+        "/api/v1/uploads/u1/chunks/../../project.json",
+        content=b"x" * (CHUNK_LIMIT + 1), headers=auth_headers,
+    )
+    assert response.status_code in {400, 413}
 ```
 
 - [ ] **Step 2: 运行测试并确认失败**
 
-Run: `python -m pytest tests/unit/ui -v`
+Run: `python -m pytest tests/integration/api tests/security/test_local_api.py -v`
 
-Expected: FAIL，UI 模块不存在。
+Expected: FAIL，API app factory 和路由不存在。
 
-- [ ] **Step 3: 实现 QStackedWidget 向导骨架**
+- [ ] **Step 3: 定义版本化 DTO、启动认证与严格本地边界**
 
-窗口固定包含左侧步骤列表、中央页面、底部“上一步/下一步/取消任务”。页面完成状态来自项目模型而非 widget 临时状态。导入页显示媒体摘要、场景 Gaussian 数量、显存预估和可修复错误。
-
-```python
-class MainWindow(QMainWindow):
-    def __init__(self, controller: ProjectController) -> None:
-        super().__init__()
-        self.controller = controller
-        self.stack = QStackedWidget()
-        self.pages = [ImportPage(controller), SubjectPage(controller)]
-        for page in self.pages:
-            self.stack.addWidget(page)
-            page.completionChanged.connect(self._refresh_navigation)
-        self.setCentralWidget(self._build_shell())
-
-    @Slot()
-    def _refresh_navigation(self) -> None:
-        page = self.pages[self.stack.currentIndex()]
-        self.next_button.setEnabled(page.isComplete())
-```
-
-- [ ] **Step 4: 实现 QThread worker 与人物点击页**
-
-`PipelineTaskWorker` 继承 `QThread`，只通过 `Signal(int, int, str)`、`Signal(object)` 和 `Signal(str, str)` 返回进度、结果和错误；所有 widget 更新在主线程 slot 中执行。人物页显示代理帧，点击位置转换到原代理图像像素坐标，保存 `Prompt(frame_index, x, y)` 后运行分割并显示 Alpha 叠加。
+`ApiSettings` 必须校验 host 只能是 loopback；端口传 `0` 由系统分配。桌面启动令牌使用 `secrets.token_urlsafe(32)`，只通过父子进程私有启动握手传递，不写日志或项目文件。认证后的 `/healthz` 只返回进程存活；`/api/v1/bootstrap` 返回 API 版本、能力、项目快照和环境报告并要求 Bearer token。开发 origin 来自显式 allowlist，不允许 `*`；WebSocket 还要单独验证 `Origin`，不能依赖 CORS 中间件。
 
 ```python
-class PipelineTaskWorker(QThread):
-    progress = Signal(int, int, str)
-    succeeded = Signal(object)
-    failed = Signal(str, str)
-
-    def __init__(self, operation: Callable[[ProgressEmitter, CancellationToken], object]) -> None:
-        super().__init__()
-        self.operation = operation
-        self.token = CancellationToken()
-
-    def run(self) -> None:
-        try:
-            result = self.operation(lambda a, b, c: self.progress.emit(a, b, c), self.token)
-            self.succeeded.emit(result)
-        except GsVideoError as error:
-            self.failed.emit(error.code, str(error))
-
-    def cancel(self) -> None:
-        self.token.cancel()
+def require_session(
+    authorization: Annotated[str | None, Header()] = None,
+    settings: ApiSettings = Depends(get_settings),
+) -> None:
+    scheme, _, value = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(value, settings.session_token):
+        raise HTTPException(status_code=401, detail="invalid session")
 ```
 
-Run: `python -m pytest tests/unit/ui -v`
+禁止 API 接收任意“输出绝对路径”后直接写入。桌面路径导入先经过 `PlatformBridge` 用户选择，再由 API canonicalize 并复制/引用到项目；浏览器上传只能写入服务器分配的 upload ID 目录。所有错误返回稳定的 `code`、`category`、`message`、`retryable`。
+
+- [ ] **Step 4: 实现任务 REST、可重连事件流和 lifespan 清理**
+
+任务创建返回 `202` 与 task ID；`GET /tasks/{id}` 是权威状态。WebSocket 连接建立后必须在 3 秒内把令牌放在首个 `authenticate` 消息中，认证前不订阅也不发送业务事件，避免把令牌放入 URL；认证失败立即以策略错误关闭。事件包含 `task_id`、单调 `revision`、阶段、帧进度和错误摘要，不发送大二进制。客户端认证后发送 `resume(after_revision)`；若内存事件窗口已丢失，服务端发送 `resync_required`，客户端随后 GET 快照。
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await app.state.task_service.start()
+    try:
+        yield
+    finally:
+        await app.state.task_service.cancel_all()
+        await app.state.worker_registry.terminate_all()
+```
+
+`TaskService` 将同步 `PipelineRunner` 放入受控线程/进程执行器，取消请求映射到 `CancellationToken`。服务关闭时先协作取消，再限时终止剩余 worker 进程树。
+
+- [ ] **Step 5: 实现浏览器分块上传**
+
+`POST /uploads` 预声明文件名、MIME、总大小和 SHA-256；`PUT /uploads/{id}/chunks/{index}` 使用固定上限与偏移验证；`POST /uploads/{id}/complete` 校验块数、总大小和整文件哈希后原子移动到项目输入区。支持查询已上传块和取消，测试中覆盖重复块幂等、断点续传、磁盘不足、哈希不符和取消清理。
+
+Run: `python -m pytest tests/integration/api tests/security -v`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 6: 提交**
 
 ```powershell
-git add src/gs_video/app.py src/gs_video/ui tests/unit/ui
-git commit -m "feat: add guided desktop shell and subject selection"
+git add src/gs_video/app.py src/gs_video/__main__.py src/gs_video/api tests/integration/api tests/security
+git commit -m "feat: expose secure recoverable local API"
 ```
 
-### Task 13: 完成场景视口、落脚点、预览、导出与错误恢复 UI
+### Task 13: 建立共享 React/Vite SPA、客户端契约和双平台桥
 
 **Files:**
-- Create: `src/gs_video/ui/viewport.py`
-- Create: `src/gs_video/ui/pages/camera_page.py`
-- Create: `src/gs_video/ui/pages/preview_page.py`
-- Create: `src/gs_video/ui/pages/export_page.py`
-- Modify: `src/gs_video/ui/main_window.py`
-- Create: `tests/unit/ui/test_viewport.py`
-- Create: `tests/e2e/test_guided_workflow.py`
+- Create: `package.json`
+- Create: `package-lock.json`
+- Create: `tsconfig.base.json`
+- Create: `apps/web/package.json`
+- Create: `apps/web/vite.config.ts`
+- Create: `apps/web/vitest.config.ts`
+- Create: `apps/web/index.html`
+- Create: `apps/web/src/api/types.ts`
+- Create: `apps/web/src/api/backend-client.ts`
+- Create: `apps/web/src/api/http-backend-client.ts`
+- Create: `apps/web/src/api/task-events.ts`
+- Create: `apps/web/src/platform/platform-bridge.ts`
+- Create: `apps/web/src/platform/browser-platform-bridge.ts`
+- Create: `apps/web/src/platform/tauri-platform-bridge.ts`
+- Create: `apps/web/src/test/setup.ts`
+- Create: `apps/web/src/api/http-backend-client.test.ts`
+- Create: `apps/web/src/platform/platform-boundary.test.ts`
 
 **Interfaces:**
-- Produces: `SceneViewport.cameraChanged`, `SceneViewport.anchorSelected`
-- Produces: 完整三次交互后的预览与导出向导
+- Produces: `BackendClient`、`TaskEventSource`、`PlatformBridge`
+- Produces: 浏览器与 Tauri 两个 composition root，业务组件无平台导入
 
-- [ ] **Step 1: 写轨道相机交互、落脚点和 mock E2E 测试**
+- [ ] **Step 1: 写客户端认证、重连收敛和平台边界失败测试**
 
-```python
-def test_viewport_click_emits_world_anchor(qtbot, viewport) -> None:
-    with qtbot.waitSignal(viewport.anchorSelected) as signal:
-        qtbot.mouseClick(viewport, Qt.MouseButton.LeftButton, pos=QPoint(320, 180))
-    assert len(signal.args[0]) == 3
+```ts
+it('resyncs authoritative task state after an event gap', async () => {
+  const client = fakeBackendClient({ task: { id: 't1', revision: 9, status: 'running' } })
+  const store = createTaskStore(client)
+  store.onEvent({ type: 'resync_required', taskId: 't1', revision: 9 })
+  await store.whenIdle()
+  expect(client.getTask).toHaveBeenCalledWith('t1')
+  expect(store.snapshot().revision).toBe(9)
+})
 
-
-def test_guided_workflow_exports_after_three_interactions(qtbot, app_harness) -> None:
-    app_harness.import_assets()
-    app_harness.click_subject(100, 120)
-    app_harness.confirm_camera()
-    app_harness.click_anchor(320, 180)
-    app_harness.generate_and_export()
-    assert app_harness.output.exists()
-    assert app_harness.interaction_count == 3
+it('keeps tauri imports outside business features', async () => {
+  const forbidden = await findImports('apps/web/src/features', /^@tauri-apps\//)
+  expect(forbidden).toEqual([])
+})
 ```
 
 - [ ] **Step 2: 运行测试并确认失败**
 
-Run: `python -m pytest tests/unit/ui/test_viewport.py tests/e2e/test_guided_workflow.py -v`
+Run: `npm ci && npm run test:web -- --run`
 
-Expected: FAIL，缺少 viewport 和后续页面。
+Expected: FAIL，workspace 和客户端模块不存在。
 
-- [ ] **Step 3: 实现延迟渲染场景视口**
+- [ ] **Step 3: 建立 Vite/React/Vitest 严格工程**
 
-视口显示最近一次 gsplat 预览帧；鼠标拖动更新 yaw/pitch，滚轮更新 distance，焦距使用垂直 FOV slider。交互期间以 150 ms debounce 请求 540p 单帧渲染，旧请求用 generation id 丢弃。用户点击“确认初始机位”才计为第二次关键交互。
+根 workspace 固定 Node 版本与 lockfile。Vite 开发服务器只代理 `/api` 和 `/ws` 到显式本地 API 地址；生产构建使用相对 base 以供 Tauri 加载。Vitest 使用 `jsdom`、setup file、自动恢复 mock 和 V8 coverage；React Testing Library 只测试用户可见行为。CI 一律 `vitest run`，不进入 watch。
 
-落脚点通过当前相机射线与用户选择的场景深度相交。MVP renderer 可额外为单帧交互请求 `render_mode="RGB+ED"`，但最终视频仍只保存 RGB；深度只用于把屏幕点击还原到目标场景坐标，不参与人物遮挡。
-
-```python
-def unproject_anchor(x: int, y: int, depth: float, K: np.ndarray, camera_to_world: np.ndarray) -> np.ndarray:
-    pixel = np.array([x, y, 1.0], dtype=np.float64)
-    camera_point = np.linalg.inv(K) @ pixel * depth
-    world = camera_to_world @ np.array([*camera_point, 1.0])
-    return world[:3] / world[3]
-
-
-def accept_pick(self, x: int, y: int) -> None:
-    depth = float(self.pick_buffer.expected_depth[y, x])
-    if not np.isfinite(depth) or depth <= 0:
-        self.pickRejected.emit("该位置没有可用的场景深度")
-        return
-    self.anchorSelected.emit(unproject_anchor(x, y, depth, self.K, self.camera_to_world))
+```ts
+// apps/web/vitest.config.ts
+export default defineConfig({
+  test: {
+    environment: 'jsdom',
+    setupFiles: ['./src/test/setup.ts'],
+    clearMocks: true,
+    restoreMocks: true,
+    coverage: { provider: 'v8', reporter: ['text', 'lcov'] },
+  },
+})
 ```
 
-- [ ] **Step 4: 实现预览、导出、取消和重试页面**
+- [ ] **Step 4: 实现 REST/WS 客户端与可恢复 store**
 
-预览页显示低分辨率合成视频、焦距和 `motion_scale`；修改后只失效映射及下游阶段。进度页展示阶段、当前帧、总帧数、耗时和 ETA。失败页依据错误分类显示操作：重新选择人物、降低分辨率、返回机位页或重试当前阶段。导出页只在 ffprobe 后验校验通过后显示成功。
+`HttpBackendClient` 统一设置 API 版本、Bearer token、超时、AbortSignal 和稳定错误解析。`TaskEventSource` 在 WebSocket 建立后先发送认证消息，收到 `authenticated` 后才恢复 revision。会话配置只驻留内存；不得放入 URL、localStorage 或日志。任务 store 按 revision 去重；WebSocket 清理在 React effect cleanup 中完成，外部状态订阅使用稳定 subscribe 函数。任何连接状态变化只影响实时提示，不改变 REST 权威状态。
 
-```python
-@Slot(float)
-def _motion_scale_changed(self, value: float) -> None:
-    self.controller.update_motion_scale(value)
-    self.controller.invalidate(ChangeKind.MOTION_SCALE)
-
-
-@Slot(str, str)
-def _show_failure(self, code: str, message: str) -> None:
-    actions = {
-        "repairable": self._show_repair_action,
-        "unsupported_material": self._show_material_rejection,
-        "system_error": self._show_log_action,
-    }
-    actions.get(code, self._show_log_action)(message)
+```ts
+export interface BackendClient {
+  bootstrap(signal?: AbortSignal): Promise<BootstrapDto>
+  importLocalPath(kind: AssetKind, path: string): Promise<AssetDto>
+  createUpload(input: UploadInit): Promise<UploadSessionDto>
+  putUploadChunk(id: string, index: number, data: Blob, signal?: AbortSignal): Promise<void>
+  getProject(): Promise<ProjectDto>
+  updateProject(patch: ProjectPatch): Promise<ProjectDto>
+  startTask(targetStage: StageName): Promise<TaskDto>
+  getTask(id: string): Promise<TaskDto>
+  cancelTask(id: string): Promise<TaskDto>
+}
 ```
 
-Run: `python -m pytest tests/unit/ui tests/e2e/test_guided_workflow.py -v -m "not gpu"`
+- [ ] **Step 5: 实现 Browser/Tauri PlatformBridge**
 
-Expected: PASS。
+```ts
+export interface PlatformBridge {
+  readonly kind: 'browser' | 'tauri'
+  pickInputFile(options: PickFileOptions): Promise<PickedFile | null>
+  saveExport(suggestedName: string, source: ExportSource): Promise<void>
+  revealPath?(path: string): Promise<void>
+  openExternal(url: string): Promise<void>
+}
+```
+
+浏览器实现返回 `File` 并走分块上传，导出使用受用户手势触发的下载；Tauri 实现动态导入 dialog/opener API，返回本地路径并调用 `importLocalPath`。在线资源目录未来也只能通过 `BackendClient`，不得加入 bridge 或在 WebView 直接下载。
+
+浏览器 composition root 在没有桌面注入配置时显示本地连接页：用户粘贴由 `python -m gs_video --serve` 在交互式终端仅显示一次的端口与会话令牌；连接成功后立即清空输入值，令牌只保存在内存。Tauri composition root 由 Rust 在 WebView 显示前注入同样的内存配置，不出现连接页。该连接动作不计入三次创作关键交互。
+
+Run: `npm run typecheck:web && npm run test:web -- --run && npm run build:web`
+
+Expected: 全部 PASS，生产 bundle 中业务 feature 不含直接 Tauri import。
+
+- [ ] **Step 6: 提交**
+
+```powershell
+git add package.json package-lock.json tsconfig.base.json apps/web
+git commit -m "feat: add shared browser-ready React client"
+```
+
+### Task 14: 实现三次关键交互的 React 向导与场景视口
+
+**Files:**
+- Create: `apps/web/src/app/app.tsx`
+- Create: `apps/web/src/app/project-store.ts`
+- Create: `apps/web/src/features/import/import-page.tsx`
+- Create: `apps/web/src/features/subject/subject-page.tsx`
+- Create: `apps/web/src/features/camera/camera-page.tsx`
+- Create: `apps/web/src/features/camera/scene-viewport.tsx`
+- Create: `apps/web/src/features/preview/preview-page.tsx`
+- Create: `apps/web/src/features/export/export-page.tsx`
+- Create: `apps/web/src/features/workflow/guided-workflow.test.tsx`
+- Create: `apps/web/src/features/camera/scene-viewport.test.tsx`
+
+**Interfaces:**
+- Produces: 同一 SPA 中完整导入、人物、机位、落脚点、预览与导出流程
+- Consumes: Task 12 API 与 Task 13 adapters
+
+- [ ] **Step 1: 写三次交互、页面门控和错误恢复失败测试**
+
+```tsx
+it('completes the guided workflow with three creative interactions', async () => {
+  const user = userEvent.setup()
+  render(<App backend={fakeBackend()} platform={fakePlatform()} />)
+  await importPreparedAssets(user)
+  await user.click(screen.getByLabelText('人物位置 100,120'))
+  await user.click(screen.getByRole('button', { name: '确认初始机位' }))
+  await user.click(screen.getByLabelText('场景落脚点 320,180'))
+  await user.click(screen.getByRole('button', { name: '生成预览' }))
+  expect(await screen.findByRole('button', { name: '导出视频' })).toBeEnabled()
+  expect(interactionCounter()).toBe(3)
+})
+```
+
+导入文件选择、等待任务、调整自动默认值和导出保存不计入三次“创作关键交互”；人物点击、确认机位、落脚点点击各计一次。
+
+- [ ] **Step 2: 运行测试并确认失败**
+
+Run: `npm run test:web -- --run apps/web/src/features/workflow/guided-workflow.test.tsx`
+
+Expected: FAIL，向导页面不存在。
+
+- [ ] **Step 3: 实现以项目快照为状态源的向导**
+
+页面完成度由 API 项目快照和阶段状态推导，不把业务真相藏在组件 state。左侧显示导入、人物、机位、预览、导出步骤；底部提供上一步、下一步、取消任务。导入页显示视频摘要、Gaussian 数量、显存估算和可修复错误。人物页在代理帧上把 CSS 坐标转换为图像像素坐标，提交 prompt 后显示 Alpha 叠加。
+
+任务进度来自事件 store；收到 WS 事件只更新可验证 revision。刷新页面、WS 断开或 Tauri WebView 重载后调用 bootstrap/project/task REST 恢复当前页与任务状态。
+
+- [ ] **Step 4: 实现场景视口、机位和落脚点**
+
+视口显示后端生成的最近预览帧；拖动更新 yaw/pitch，滚轮更新 distance，滑杆调整垂直 FOV。交互期间 150 ms debounce 请求 540p 单帧预览，并以 generation ID + AbortController 忽略旧响应。点击“确认初始机位”才计第二次交互。
+
+落脚点点击向后端发送视口像素、当前相机 revision 和 pick-buffer revision；后端用当前 RGB+ED 单帧深度执行反投影并返回世界坐标。revision 不匹配、深度无效或点击超出内容区时拒绝确认。深度只用于拾取，不进入最终人物遮挡。
+
+```ts
+function toImagePoint(event: PointerEvent, bounds: DOMRect, image: ImageSize): Point {
+  const scale = Math.min(bounds.width / image.width, bounds.height / image.height)
+  const left = bounds.left + (bounds.width - image.width * scale) / 2
+  const top = bounds.top + (bounds.height - image.height * scale) / 2
+  return { x: (event.clientX - left) / scale, y: (event.clientY - top) / scale }
+}
+```
+
+- [ ] **Step 5: 实现预览、导出、取消、重试与可访问性**
+
+预览页显示低分辨率合成、焦距、`motion_scale` 和阶段缓存状态；修改参数只调用对应 patch，后端负责定向失效。失败页按错误类别显示重新选人物、降低分辨率、返回机位或重试。导出成功必须来自后端 ffprobe 后验验证。键盘可完成全部按钮/滑杆操作；画布点击提供坐标文本替代输入；任务进度使用 `aria-live="polite"`，错误使用聚焦后的 alert。
+
+Run: `npm run typecheck:web && npm run test:web -- --run && npm run build:web`
+
+Expected: 全部 PASS。
+
+- [ ] **Step 6: 提交**
+
+```powershell
+git add apps/web/src
+git commit -m "feat: implement guided Gaussian video workflow"
+```
+
+### Task 15: 打包 FastAPI sidecar 并实现最小权限 Tauri 2 宿主
+
+**Files:**
+- Create: `packaging/gs-video-api.spec`
+- Create: `tools/build_sidecar.py`
+- Create: `tests/unit/tools/test_build_sidecar.py`
+- Create: `apps/desktop/src-tauri/Cargo.toml`
+- Create: `apps/desktop/src-tauri/build.rs`
+- Create: `apps/desktop/src-tauri/tauri.conf.json`
+- Create: `apps/desktop/src-tauri/capabilities/default.json`
+- Create: `apps/desktop/src-tauri/src/lib.rs`
+- Create: `apps/desktop/src-tauri/src/sidecar.rs`
+- Create: `apps/desktop/src-tauri/tests/sidecar_lifecycle.rs`
+
+**Interfaces:**
+- Produces: `python tools/build_sidecar.py --target <rust-target-triple>`
+- Produces: Tauri 启动握手、健康检查、优雅关闭与强制清理
+
+- [ ] **Step 1: 写 sidecar 命名、握手解析和生命周期失败测试**
+
+```python
+def test_sidecar_name_contains_tauri_target_triple(tmp_path: Path) -> None:
+    output = plan_sidecar_output(tmp_path, "x86_64-pc-windows-msvc")
+    assert output.name == "gs-video-api-x86_64-pc-windows-msvc.exe"
+```
+
+Rust 集成测试使用 fake sidecar：输出单行 JSON handshake 后常驻；验证窗口启动前得到 port/token、正常关闭发送终止请求、超时后 kill，且 stdout 日志不会包含 token。
+
+- [ ] **Step 2: 运行测试并确认失败**
+
+Run: `python -m pytest tests/unit/tools/test_build_sidecar.py -v`
+
+Run: `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml`
+
+Expected: FAIL，打包器和 Tauri crate 不存在。
+
+- [ ] **Step 3: 建立可审查的 PyInstaller onefile 构建**
+
+使用 spec 文件固定 entrypoint、datas、hidden imports 和 exclusions。Tauri bundle 使用 onefile，因为 API sidecar 明确排除 EdgeTAM、SAM 2、gsplat、PyTorch 和 CUDA runtime，体积与启动解压成本可控；这些 GPU 组件仍位于独立可配置 worker 环境。诊断时允许显式 `--mode onedir` 生成可检查目录，但发布门只接受 onefile。构建脚本创建 Tauri 要求的 target-triple 可执行文件，输出 manifest 与 SHA-256。
+
+```python
+# packaging/gs-video-api.spec 核心意图
+a = Analysis(
+    ["src/gs_video/__main__.py"],
+    hiddenimports=["uvicorn.logging", "uvicorn.loops.auto", "uvicorn.protocols.http.auto"],
+    excludes=["torch"],
+)
+```
+
+- [ ] **Step 4: 实现 Tauri sidecar 启动与私有握手**
+
+`tauri.conf.json` 的 `externalBin` 只声明 `binaries/gs-video-api`。Tauri 启动 sidecar 时只通过参数传入 loopback 与 port 0，一次性 token 通过继承的私有 stdin pipe 发送，禁止出现在命令行、环境变量、stdout 或日志中；sidecar 绑定成功后向 stdout 写一行 JSON `{port, apiVersion, pid}`。Rust 端验证 schema，以令牌调用认证的 `/healthz`，将 bootstrap 配置注入 WebView 内存后再显示主窗口。若 15 秒未就绪或健康检查失败，显示可诊断启动错误并清理进程。
+
+Tauri capability 只允许固定 sidecar execute、dialog 和 opener 所需动作；不允许 `shell:allow-open` 通配、任意 command args 或宽文件系统 scope。CSP 只允许本地应用资源和当前 loopback API/WS；release 禁用开发者工具。
+
+- [ ] **Step 5: 实现关闭顺序和 worker 树回收**
+
+窗口关闭先调用认证的 API shutdown/cancel，等待 API 清理 GPU workers；超时后 Rust 终止 sidecar job/process tree。崩溃重启检测未完成任务并依赖 `project.json`/REST 状态恢复，不尝试复用旧 token 或旧端口。
+
+Run: `python tools/build_sidecar.py --target x86_64-pc-windows-msvc --dry-run`
+
+Run: `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml`
+
+Run: `npm run build:web && npm run tauri:build -- --debug`
+
+Expected: 测试通过，debug bundle 中包含命名正确的 sidecar 和 web dist。
+
+- [ ] **Step 6: 提交**
+
+```powershell
+git add packaging tools/build_sidecar.py tests/unit/tools apps/desktop package.json package-lock.json
+git commit -m "feat: host local API in Tauri sidecar"
+```
+
+### Task 16: 建立浏览器与 Tauri 双宿主 E2E 和安全回归门
+
+**Files:**
+- Create: `playwright.config.ts`
+- Create: `tests/e2e/browser/guided-workflow.spec.ts`
+- Create: `tests/e2e/browser/reconnect.spec.ts`
+- Create: `tests/e2e/browser/upload-resume.spec.ts`
+- Create: `tests/e2e/contracts/desktop-platform.spec.ts`
+- Create: `scripts/check_frontend_boundaries.mjs`
+- Modify: `package.json`
+
+**Interfaces:**
+- Produces: 同一 mock API 下浏览器/桌面 adapter 契约套件
+- Produces: 真实浏览器三次交互 E2E 与 sidecar smoke
+
+- [ ] **Step 1: 写浏览器刷新恢复、断点上传与平台契约 E2E**
+
+浏览器测试启动真实 FastAPI（mock pipeline services）和 Vite preview，使用临时项目目录。覆盖：上传中断后续传、WS 断线后 REST 收敛、页面刷新后恢复任务、三次关键交互后导出、取消后无孤儿任务。平台契约用相同案例分别运行 BrowserBridge 与 fake TauriBridge，确保语义一致。
+
+- [ ] **Step 2: 运行测试并确认失败**
+
+Run: `npm run test:e2e:browser`
+
+Expected: FAIL，E2E harness 和边界检查器不存在。
+
+- [ ] **Step 3: 实现确定性的双宿主 harness**
+
+测试 API 使用固定端口仅限测试进程、固定 token 通过 Playwright bootstrap fixture 注入内存；REST 断言使用 Bearer header，WebSocket 仍走真实首消息认证。生产代码使用随机端口和随机 token。mock pipeline 保留真实项目存储、任务 revision、取消和导出后验契约，只替换昂贵 GPU 实现。每次测试结束确认 API、worker、临时文件均清理。
+
+桌面 smoke 不重复全套 WebView UI 自动化：Rust lifecycle 测试验证 sidecar，浏览器 E2E 验证共享 SPA，另用一次 debug bundle smoke 验证 WebView 能 bootstrap、原生对话框 adapter 被调用、关闭后 sidecar 退出。
+
+- [ ] **Step 4: 建立静态边界和安全回归检查**
+
+`check_frontend_boundaries.mjs` 失败条件：`features/` 或 `api/` 直接导入 `@tauri-apps/*`；前端出现硬编码生产端口/token；WebView 直接请求外部资源目录；Tauri capability 出现宽 shell/fs scope。Python 安全测试继续覆盖非 loopback bind、CORS、WS 未认证、上传路径逃逸、符号链接/重解析点和输出路径注入。
+
+Run: `npm run lint:boundaries && npm run test:e2e:browser && npm run test:desktop-smoke`
+
+Expected: 全部 PASS。
 
 - [ ] **Step 5: 提交**
 
 ```powershell
-git add src/gs_video/ui tests/unit/ui tests/e2e
-git commit -m "feat: complete guided preview and export workflow"
+git add playwright.config.ts tests/e2e scripts/check_frontend_boundaries.mjs package.json package-lock.json
+git commit -m "test: verify browser and Tauri host parity"
 ```
 
-### Task 14: 建立 8 GB 验收工具、文档和完整发布门
+### Task 17: 建立 8 GB 验收工具、文档和完整发布门
 
 **Files:**
 - Create: `scripts/run_acceptance.py`
@@ -1680,19 +1936,20 @@ EdgeTAM 是应用默认值；SAM 2.1 只用于显式诊断对照，不做静默�
 
 - [ ] **Step 5: 写开发、模型和测试素材安装文档**
 
-README 必须包含 Python 3.11 venv、`pip install -e ".[dev]"`、FFmpeg PATH、CUDA/PyTorch 单独安装、EdgeTAM 默认 worker、SAM 2.1 Tiny 对照 worker、gsplat 安装、联网素材下载、`python -m gs_video --doctor --json` 和测试命令。模型文档明确记录独立 worker 环境、Windows/WSL 选项、第三方模型许可证和离线 checkpoint 路径。验收文档明确记录 DAVIS 引用、Graphdeco 非商业研究限制、约 14 GB 的一次性归档下载和缓存迁移方式。
+README 必须包含 Node/Rust/Tauri 前置条件、Python 3.11 venv、`pip install -e ".[dev]"`、`npm ci`、FFmpeg PATH、CUDA/PyTorch 单独安装、EdgeTAM 默认 worker、SAM 2.1 Tiny 对照 worker、gsplat 安装、联网素材下载、`python -m gs_video --doctor --json`、浏览器开发模式、Tauri 开发模式、sidecar 构建和测试命令。模型文档明确记录独立 worker 环境、Windows/WSL 选项、第三方模型许可证和离线 checkpoint 路径。验收文档明确记录 DAVIS 引用、Graphdeco 非商业研究限制、约 14 GB 的一次性归档下载和缓存迁移方式。
 
 ```markdown
 ## Local development
 
 1. Create a Python 3.11 virtual environment.
 2. Run `python -m pip install -e ".[dev]"`.
-3. Install the CUDA-enabled PyTorch build that matches the local driver.
-4. Install EdgeTAM in the default GPU worker environment and SAM 2.1 Tiny in a separate comparison environment.
-5. Install gsplat in the renderer environment.
-6. Add `ffmpeg` and `ffprobe` to `PATH`.
+3. Install the pinned Node.js and Rust toolchains, then run `npm ci`.
+4. Install the CUDA-enabled PyTorch build that matches the local driver.
+5. Install EdgeTAM in the default GPU worker environment and SAM 2.1 Tiny in a separate comparison environment.
+6. Install gsplat in the renderer environment and add `ffmpeg`/`ffprobe` to `PATH`.
 7. Run `python -m tools.fetch_test_assets fetch --group acceptance` once while online.
-8. Run `python -m gs_video --doctor --json` before opening the desktop app.
+8. Run `python -m gs_video --doctor --json` before starting browser or Tauri development.
+9. Use `npm run dev:web` for browser UI and `npm run tauri:dev` for the desktop host.
 ```
 
 - [ ] **Step 6: 运行完整发布门**
@@ -1708,6 +1965,18 @@ Expected: `Success: no issues found`。
 Run: `python -m pytest tests/unit tests/integration tests/e2e -v -m "not gpu"`
 
 Expected: 全部 PASS。
+
+Run: `npm run lint:boundaries && npm run typecheck:web && npm run test:web -- --run && npm run build:web`
+
+Expected: 全部 PASS，且业务 feature 无直接 Tauri API 依赖。
+
+Run: `npm run test:e2e:browser`
+
+Expected: Chromium 中导入/上传、刷新恢复、WS 重连和三次交互闭环全部 PASS。
+
+Run: `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml && npm run test:desktop-smoke`
+
+Expected: sidecar 生命周期、最小权限配置和 WebView bootstrap smoke 全部 PASS；退出后无 API/GPU worker 残留。
 
 Run on 8 GB NVIDIA acceptance machine: `python -m pytest tests/integration/scene/test_gsplat_smoke.py -v -m gpu`
 
@@ -1739,13 +2008,16 @@ git commit -m "test: add MVP acceptance and release gate"
 - Tasks 5–7 完成后：用固定视频验证媒体、PLY 和相机轨迹，不加载分割模型或 gsplat。
 - Tasks 8–10 完成后：在 8 GB 基准机分别验证 EdgeTAM/SAM 2、渲染和导出，确认 GPU 阶段串行释放。
 - Task 11 完成后：用 mock 服务跑完整管线并审查缓存失效。
-- Tasks 12–13 完成后：用 mock 后端验证三次交互的桌面闭环，再接真实后端。
-- Task 14 完成后：运行完整发布门，只有验收报告达到 PRD 指标才判定 MVP 验证完成。
+- Task 12 完成后：FastAPI 的认证、任务恢复、上传和关闭语义固定，进行一次安全审查。
+- Tasks 13–14 完成后：同一 React SPA 在 fake adapters 下跑通三次交互，再接真实 API。
+- Tasks 15–16 完成后：验证 Tauri sidecar 生命周期、最小权限和浏览器/Tauri 双宿主一致性。
+- Task 17 完成后：运行完整发布门，只有 8 GB 验收报告、浏览器 E2E 和桌面 smoke 同时达标才判定 MVP 验证完成。
 
 ## 计划明确不实施的工作
 
 - ViPE/VGGT 真实后端：保留 `CameraSolver` 契约，待 OpenCV 基线和 8 GB 验收结果出来后单独计划。
 - 视频深度、Gaussian depth 视频输出和人物遮挡：只允许场景视口使用单帧深度拾取，不进入合成管线。
 - Gaussian 场景重建：作为独立 V3 项目，不加入本计划依赖。
-- 安装器或单文件 EXE：内部 MVP 先使用 Python 3.11 虚拟环境运行。
+- 面向公众的签名安装器、自动更新和代码签名：MVP 只产出内部 Tauri debug/release bundle 与 onefile API sidecar。
+- 在线 Gaussian 资源目录与下载：只保留 `BackendClient`、资源元数据和安全下载器的扩展接口，不在 MVP 接入真实目录。
 - 云端、账户、协作、节点图、专业时间线和 DCC 集成。
