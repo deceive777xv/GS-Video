@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import tools.fetch_test_assets as fetch_assets
 
 from tools.fetch_test_assets import (
     AssetFetcher,
@@ -167,13 +168,35 @@ def test_range_resume_appends_when_server_returns_206(tmp_path: Path) -> None:
     target = tmp_path / "asset.zip"
     partial = target.with_suffix(".zip.partial")
     partial.write_bytes(b"abc")
-    opener = RecordingOpener([Response(b"def", status=206)])
+    opener = RecordingOpener(
+        [Response(b"def", status=206, headers={"Content-Range": "bytes 3-5/6"})]
+    )
 
     AssetFetcher(opener=opener).fetch(locked_asset(sha256_bytes(b"abcdef")), target)
 
     assert target.read_bytes() == b"abcdef"
     assert opener.requests[0].get_header("Range") == "bytes=3-"
     assert opener.timeouts == [60.0]
+
+
+@pytest.mark.parametrize(
+    "content_range",
+    [None, "not-a-content-range", "bytes 2-5/6"],
+)
+def test_range_resume_rejects_missing_malformed_or_wrong_start_content_range(
+    tmp_path: Path, content_range: str | None
+) -> None:
+    target = tmp_path / "asset.zip"
+    partial = target.with_suffix(".zip.partial")
+    partial.write_bytes(b"abc")
+    headers = {"Content-Range": content_range} if content_range is not None else {}
+    opener = RecordingOpener([Response(b"def", status=206, headers=headers)])
+
+    with pytest.raises(AssetIntegrityError, match="Content-Range"):
+        AssetFetcher(opener=opener).fetch(locked_asset(sha256_bytes(b"abcdef")), target)
+
+    assert partial.read_bytes() == b"abc"
+    assert not target.exists()
 
 
 def test_range_resume_restarts_when_server_returns_200(tmp_path: Path) -> None:
@@ -287,8 +310,82 @@ def test_fetch_asset_verifies_each_selected_member(tmp_path: Path) -> None:
             )
         ],
     )
+    selected = cache / "demo" / "selected" / "keep" / "a.txt"
+    selected.parent.mkdir(parents=True)
+    selected.write_bytes(b"trusted")
     with pytest.raises(AssetIntegrityError, match="keep/a.txt"):
         fetch_asset(entry, lock, cache, opener=FailIfCalledOpener())
+    assert selected.read_bytes() == b"trusted"
+    assert not (cache / "demo" / "selected.partial").exists()
+
+
+def test_redirect_handler_rejects_https_to_http_hop_before_a_later_https_hop() -> None:
+    handler = fetch_assets.HTTPSOnlyRedirectHandler()
+    request = fetch_assets.urllib.request.Request("https://example.test/start")
+
+    with pytest.raises(AssetSecurityError, match="HTTPS"):
+        handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "http://example.test/intermediate",
+        )
+
+
+def test_replace_with_retry_recovers_from_transient_windows_sharing_violation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "asset.zip.partial"
+    target = tmp_path / "asset.zip"
+    source.write_bytes(b"complete")
+    attempts = 0
+    sleeps: list[float] = []
+
+    def transient_replace(old: Path, new: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError(32, "sharing violation")
+        old.replace(new)
+
+    fetch_assets.replace_with_retry(
+        source,
+        target,
+        replace=transient_replace,
+        sleep=sleeps.append,
+        attempts=4,
+        delay=0.01,
+    )
+
+    assert target.read_bytes() == b"complete"
+    assert attempts == 3
+    assert sleeps == [0.01, 0.01]
+
+
+def test_replace_with_retry_is_bounded(tmp_path: Path) -> None:
+    source = tmp_path / "asset.zip.partial"
+    target = tmp_path / "asset.zip"
+    source.write_bytes(b"complete")
+    attempts = 0
+
+    def always_locked(_old: Path, _new: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise PermissionError(32, "sharing violation")
+
+    with pytest.raises(PermissionError):
+        fetch_assets.replace_with_retry(
+            source,
+            target,
+            replace=always_locked,
+            sleep=lambda _delay: None,
+            attempts=3,
+        )
+
+    assert attempts == 3
+    assert source.read_bytes() == b"complete"
 
 
 def test_offline_missing_cache_fails_without_network(tmp_path: Path) -> None:

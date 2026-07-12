@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sys
+import time
 import urllib.request
 import zipfile
 from dataclasses import asdict, dataclass, field
@@ -150,6 +151,8 @@ class ResponseLike(Protocol):
 
 Opener = Callable[..., ResponseLike]
 Progress = Callable[[str], None]
+Replace = Callable[[Path, Path], object]
+Sleep = Callable[[float], object]
 
 
 def _print_progress(message: str) -> None:
@@ -159,6 +162,27 @@ def _print_progress(message: str) -> None:
 def _require_https(url: str) -> None:
     if urlparse(url).scheme.lower() != "https":
         raise AssetSecurityError(f"测试素材只允许 HTTPS URL: {url}")
+
+
+class HTTPSOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Mapping[str, str],
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        _require_https(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_HTTPS_OPENER = urllib.request.build_opener(HTTPSOnlyRedirectHandler())
+
+
+def _https_urlopen(request: urllib.request.Request, *, timeout: float) -> ResponseLike:
+    return _HTTPS_OPENER.open(request, timeout=timeout)
 
 
 def _normalized_member(member: str) -> str:
@@ -214,11 +238,32 @@ def _partial_path(target: Path) -> Path:
     return Path(f"{target}.partial")
 
 
+def replace_with_retry(
+    source: Path,
+    target: Path,
+    *,
+    replace: Replace = os.replace,
+    sleep: Sleep = time.sleep,
+    attempts: int = 8,
+    delay: float = 0.25,
+) -> None:
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
+    for attempt in range(1, attempts + 1):
+        try:
+            replace(source, target)
+            return
+        except PermissionError:
+            if attempt == attempts:
+                raise
+            sleep(delay)
+
+
 class AssetFetcher:
     def __init__(
         self,
         *,
-        opener: Opener = urllib.request.urlopen,
+        opener: Opener = _https_urlopen,
         offline: bool = False,
         progress: Progress = _print_progress,
     ) -> None:
@@ -246,6 +291,13 @@ class AssetFetcher:
             with self._opener(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
                 _require_https(response.geturl())
                 append = offset > 0 and response.status == 206
+                if append:
+                    content_range = _parse_content_range(response.headers.get("Content-Range"))
+                    if content_range is None or content_range[0] != offset:
+                        raise AssetIntegrityError(
+                            f"恢复下载的 Content-Range 无效或起点不匹配: "
+                            f"expected={offset}, actual={response.headers.get('Content-Range')!r}"
+                        )
                 resumed = offset if append else 0
                 total = _response_total(response, resumed)
                 total_text = str(total) if total is not None else "unknown"
@@ -275,7 +327,7 @@ class AssetFetcher:
                             )
                             first_progress = False
                             next_progress = downloaded + PROGRESS_INTERVAL_BYTES
-            partial.replace(target)
+            replace_with_retry(partial, target)
             return target
         except Exception:
             if partial.exists() and isinstance(sys.exc_info()[1], AssetSecurityError):
@@ -283,12 +335,23 @@ class AssetFetcher:
             raise
 
 
+def _parse_content_range(value: str | None) -> tuple[int, int, int | None] | None:
+    if not value:
+        return None
+    match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", value.strip())
+    if not match:
+        return None
+    start, end = int(match.group(1)), int(match.group(2))
+    total = None if match.group(3) == "*" else int(match.group(3))
+    if end < start or (total is not None and end >= total):
+        return None
+    return start, end, total
+
+
 def _response_total(response: ResponseLike, resumed: int) -> int | None:
-    content_range = response.headers.get("Content-Range")
-    if content_range:
-        match = re.fullmatch(r"bytes\s+\d+-\d+/(\d+|\*)", content_range.strip())
-        if match and match.group(1) != "*":
-            return int(match.group(1))
+    content_range = _parse_content_range(response.headers.get("Content-Range"))
+    if content_range and content_range[2] is not None:
+        return content_range[2]
     content_length = response.headers.get("Content-Length")
     if content_length and content_length.isdigit():
         return resumed + int(content_length)
@@ -326,7 +389,7 @@ def fetch_asset(
     lock: AssetLock,
     cache_root: Path,
     *,
-    opener: Opener = urllib.request.urlopen,
+    opener: Opener = _https_urlopen,
     offline: bool = False,
 ) -> list[Path]:
     locked = lock.for_id(entry.id)
@@ -337,14 +400,26 @@ def fetch_asset(
         locked, asset_root / "archive.zip"
     )
     extracted_root = asset_root / "selected"
-    actual = extract_selected(archive_path, extracted_root, entry.include)
-    if actual != locked.members:
-        unexpected = sorted(set(actual) ^ set(locked.members))
-        mismatched = sorted(
-            name for name in set(actual) & set(locked.members) if actual[name] != locked.members[name]
-        )
-        names = unexpected + mismatched
-        raise AssetIntegrityError(f"锁定成员哈希不匹配: {entry.id}: {', '.join(names)}")
+    temporary_root = asset_root / "selected.partial"
+    if temporary_root.exists():
+        shutil.rmtree(temporary_root)
+    try:
+        actual = extract_selected(archive_path, temporary_root, entry.include)
+        if actual != locked.members:
+            unexpected = sorted(set(actual) ^ set(locked.members))
+            mismatched = sorted(
+                name
+                for name in set(actual) & set(locked.members)
+                if actual[name] != locked.members[name]
+            )
+            names = unexpected + mismatched
+            raise AssetIntegrityError(f"锁定成员哈希不匹配: {entry.id}: {', '.join(names)}")
+        shutil.rmtree(extracted_root, ignore_errors=True)
+        temporary_root.replace(extracted_root)
+    except Exception:
+        if temporary_root.exists():
+            shutil.rmtree(temporary_root)
+        raise
     return [safe_member_path(extracted_root, name) for name in sorted(actual)]
 
 
