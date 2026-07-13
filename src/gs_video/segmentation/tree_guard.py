@@ -124,9 +124,15 @@ class WindowsJobObjectGuard:
                 wintypes.HANDLE(handle), wintypes.HANDLE(int(process_handle))
             ):
                 raise ctypes.WinError(ctypes.get_last_error())
-        except BaseException:
-            self._kernel32.CloseHandle(handle)
-            self._handle = None
+        except BaseException as exc:
+            closed = bool(self._kernel32.CloseHandle(handle))
+            if not closed:
+                closed = bool(self._kernel32.CloseHandle(handle))
+            if closed:
+                self._handle = None
+            else:
+                cleanup_error = ctypes.WinError(ctypes.get_last_error())
+                exc.add_note(f"CloseHandle failed during Job Object cleanup: {cleanup_error}")
             raise
 
     def terminate(self, *, force: bool) -> bool:
@@ -154,9 +160,9 @@ class WindowsJobObjectGuard:
             if self._handle is None:
                 return
             handle = self._handle
-            self._handle = None
             if not self._kernel32.CloseHandle(wintypes.HANDLE(handle)):
                 raise ctypes.WinError(ctypes.get_last_error())
+            self._handle = None
 
 
 def create_process_tree_guard(process: Any) -> ProcessTreeGuard:

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import numpy as np
 import pytest
 from PIL import Image
+
+import gs_video.segmentation.worker as worker_module
 
 from gs_video.domain.errors import UnsupportedMaterialError
 from gs_video.segmentation.worker import _has_invisible_run, probe_backend, run_segmentation
@@ -242,6 +245,41 @@ def test_invisibility_run_boundaries() -> None:
     assert _has_invisible_run([below] * 15)
     assert not _has_invisible_run([below] * 14 + [0.5] + [below] * 14)
     assert not _has_invisible_run([0.001] * 15)
+
+
+def test_worker_waits_for_startup_gate_before_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, checkpoint = _assets(tmp_path)
+    gate = tmp_path / "startup.gate"
+    gate.write_text("WAIT\n", encoding="utf-8")
+    observed: list[str] = []
+
+    def probe(backend: str, actual_config: Path, actual_checkpoint: Path) -> dict[str, object]:
+        del backend, actual_config, actual_checkpoint
+        observed.append(gate.read_text(encoding="utf-8"))
+        return {
+            "type": "probe", "backend": "edgetam", "config": str(config.resolve()),
+            "checkpoint": str(checkpoint.resolve()), "predictor": "fake.Predictor",
+        }
+
+    monkeypatch.setattr(worker_module, "probe_backend", probe)
+    release = gate.with_suffix(".release")
+
+    def release_gate() -> None:
+        release.write_text("RELEASE\n", encoding="utf-8")
+        release.replace(gate)
+
+    timer = threading.Timer(0.1, release_gate)
+    timer.start()
+    try:
+        assert worker_module.main([
+            "--backend", "edgetam", "--config", str(config),
+            "--checkpoint", str(checkpoint), "--probe", "--startup-gate", str(gate),
+        ]) == 0
+    finally:
+        timer.cancel()
+    assert observed == ["RELEASE\n"]
 
 
 @pytest.mark.gpu

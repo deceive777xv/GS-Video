@@ -139,6 +139,8 @@ def test_client_preserves_wsl_prefix(tmp_path: Path) -> None:
     }
     for option, expected in expected_paths.items():
         assert command[command.index(option) + 1] == expected
+    gate_arg = command[command.index("--startup-gate") + 1]
+    assert gate_arg.startswith(worker_path(tmp_path, prefix) + "/.gs-video-segmentation-gate-")
     assert "\\" not in " ".join(command)
 
 
@@ -497,17 +499,69 @@ def test_client_terminates_process_tree_before_parent_exits(tmp_path: Path) -> N
 def test_client_reaps_worker_when_tree_guard_assignment_fails(tmp_path: Path) -> None:
     process = FakeProcess([])
 
+    gate_paths: list[Path] = []
+
+    def capture_process(command: list[str], **options: object) -> FakeProcess:
+        del options
+        gate = Path(command[command.index("--startup-gate") + 1])
+        gate_paths.append(gate)
+        assert gate.read_text(encoding="utf-8") == "WAIT\n"
+        return process
+
     def fail_guard(actual_process: object) -> object:
         del actual_process
         raise OSError("job assignment failed")
 
     client = _client(tmp_path, process, tree_guard_factory=fail_guard)
+    client._process_factory = capture_process
     with pytest.raises(GsVideoError, match="进程树隔离"):
         client.segment(
             _frames(tmp_path, ("000001.jpg",)), Prompt(0, 1, 1), tmp_path / "masks",
             lambda *_: None, CancellationToken(),
         )
     assert process.terminated and process.returncode is not None
+    assert gate_paths and not gate_paths[0].exists()
+
+
+def test_client_releases_startup_gate_only_after_guard_assignment(tmp_path: Path) -> None:
+    class RecordingGuard:
+        def terminate(self, *, force: bool) -> bool:
+            del force
+            return False
+
+        def close(self) -> None:
+            return
+
+    output = tmp_path / "masks"
+    output.mkdir()
+    _write_mask(output / "000001.png")
+    process = FakeProcess([
+        '{"type":"progress","current":1,"total":1}\n',
+        '{"type":"result","mask_dir":"masks","frames":1}\n',
+    ])
+    gate_paths: list[Path] = []
+
+    def process_factory(command: list[str], **options: object) -> FakeProcess:
+        del options
+        gate = Path(command[command.index("--startup-gate") + 1])
+        gate_paths.append(gate)
+        assert gate.read_text(encoding="utf-8") == "WAIT\n"
+        return process
+
+    def guard_factory(actual_process: object) -> RecordingGuard:
+        assert actual_process is process
+        assert gate_paths[0].read_text(encoding="utf-8") == "WAIT\n"
+        return RecordingGuard()
+
+    client = _client(tmp_path, process, tree_guard_factory=guard_factory)
+    client._process_factory = process_factory
+    result = client.segment(
+        _frames(tmp_path, ("000001.jpg",)), Prompt(0, 1, 1), output,
+        lambda *_: None, CancellationToken(),
+    )
+
+    assert result.frame_count == 1
+    assert gate_paths and not gate_paths[0].exists()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Job Object regression")
@@ -515,16 +569,19 @@ def test_real_job_guard_kills_child_after_parent_exits(tmp_path: Path) -> None:
     child_pid_path = tmp_path / "child.pid"
     parent_code = (
         "import pathlib,subprocess,sys,time;"
+        "gate=pathlib.Path(sys.argv[1]);"
+        "\nwhile gate.read_text()!='RELEASE\\n':time.sleep(0.01);"
+        "\n"
         "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],"
         "stdout=sys.stdout,stderr=sys.stderr);"
-        "pathlib.Path(sys.argv[1]).write_text(str(child.pid));"
+        "pathlib.Path(sys.argv[2]).write_text(str(child.pid));"
         "time.sleep(0.5)"
     )
 
     def factory(command: list[str], **options: object) -> subprocess.Popen[str]:
-        del command
+        gate = command[command.index("--startup-gate") + 1]
         return subprocess.Popen(  # type: ignore[call-overload]
-            [sys.executable, "-c", parent_code, str(child_pid_path)], **options
+            [sys.executable, "-c", parent_code, gate, str(child_pid_path)], **options
         )
 
     frames = _frames(tmp_path, ("000001.jpg",))
@@ -538,7 +595,7 @@ def test_real_job_guard_kills_child_after_parent_exits(tmp_path: Path) -> None:
         process_factory=factory,
     )
     token = CancellationToken()
-    timer = threading.Timer(1.0, token.cancel)
+    timer = threading.Timer(0.6, token.cancel)
     started = time.monotonic()
     timer.start()
     try:
@@ -548,6 +605,81 @@ def test_real_job_guard_kills_child_after_parent_exits(tmp_path: Path) -> None:
         timer.cancel()
 
     assert time.monotonic() - started < 5
+    child_pid = int(child_pid_path.read_text())
+    import ctypes
+
+    handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, child_pid)
+    if handle:
+        exit_code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        assert exit_code.value != 259
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object regression")
+def test_real_success_closes_descendant_inherited_pipes(tmp_path: Path) -> None:
+    child_pid_path = tmp_path / "success-child.pid"
+    output = tmp_path / "masks"
+    parent_code = (
+        "import json,pathlib,subprocess,sys,time;from PIL import Image;"
+        "gate=pathlib.Path(sys.argv[1]);"
+        "\nwhile gate.read_text()!='RELEASE\\n':time.sleep(0.01);"
+        "\nout=pathlib.Path(sys.argv[2]);out.mkdir();"
+        "Image.new('L',(32,32),255).save(out/'000001.png');"
+        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],"
+        "stdout=sys.stdout,stderr=sys.stderr);"
+        "pathlib.Path(sys.argv[3]).write_text(str(child.pid));"
+        "print(json.dumps({'type':'progress','current':1,'total':1}),flush=True);"
+        "print(json.dumps({'type':'result','mask_dir':'masks','frames':1}),flush=True)"
+    )
+
+    def factory(command: list[str], **options: object) -> subprocess.Popen[str]:
+        gate = command[command.index("--startup-gate") + 1]
+        return subprocess.Popen(  # type: ignore[call-overload]
+            [sys.executable, "-c", parent_code, gate, str(output), str(child_pid_path)], **options
+        )
+
+    frames = _frames(tmp_path, ("000001.jpg",))
+    config = tmp_path / "model.yaml"
+    checkpoint = tmp_path / "model.pt"
+    config.write_text("model", encoding="utf-8")
+    checkpoint.write_bytes(b"weights")
+    client = VideoSegmenterClient(
+        backend=SegmentationBackend.EDGETAM,
+        worker_prefix=(sys.executable,), model_config=config, checkpoint=checkpoint,
+        process_factory=factory,
+    )
+    results: list[MaskSequence] = []
+    errors: list[BaseException] = []
+
+    def invoke() -> None:
+        try:
+            results.append(
+                client.segment(
+                    frames, Prompt(0, 1, 1), output, lambda *_: None, CancellationToken()
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=invoke, daemon=True)
+    started = time.monotonic()
+    thread.start()
+    thread.join(timeout=5)
+    stuck = thread.is_alive()
+    if stuck and child_pid_path.exists():
+        subprocess.run(
+            ["taskkill", "/PID", child_pid_path.read_text(), "/T", "/F"],
+            check=False, capture_output=True, shell=False,
+        )
+        thread.join(timeout=2)
+
+    assert not stuck
+    assert not errors
+    assert results == [MaskSequence(mask_dir=output, frame_count=1)]
+    assert time.monotonic() - started < 5
+    with Image.open(output / "000001.png") as mask:
+        assert mask.format == "PNG" and mask.mode == "L" and mask.size == (32, 32)
     child_pid = int(child_pid_path.read_text())
     import ctypes
 

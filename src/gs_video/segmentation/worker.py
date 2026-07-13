@@ -6,6 +6,7 @@ import json
 import shutil
 import sys
 import tempfile
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -290,6 +291,24 @@ def _emit(event: dict[str, object]) -> None:
     print(json.dumps(event, ensure_ascii=False), flush=True)
 
 
+def _wait_for_startup_gate(gate: Path, timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            state = gate.read_text(encoding="utf-8")
+        except OSError as exc:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("startup gate 不可读") from exc
+        else:
+            if state == "RELEASE\n":
+                return
+            if state != "WAIT\n":
+                raise ValueError("startup gate 状态无效")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("startup gate 等待超时")
+        time.sleep(0.01)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("edgetam", "sam2"), required=True)
@@ -300,7 +319,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--probe", action="store_true")
+    parser.add_argument("--startup-gate", type=Path)
     args = parser.parse_args(argv)
+    if args.startup_gate is not None:
+        _wait_for_startup_gate(args.startup_gate)
     protocol_stdout = sys.stdout
     try:
         with contextlib.redirect_stdout(sys.stderr):

@@ -5,6 +5,8 @@ import os
 import queue
 import subprocess
 import threading
+import time
+import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TextIO, cast
@@ -47,7 +49,9 @@ class VideoSegmenterClient:
         self._tree_guard_factory = tree_guard_factory
         self.log_path = log_path or self.model_config.parent / "logs" / "segmentation-worker.log"
 
-    def _command(self, frames_dir: Path, output_dir: Path, prompt: Prompt) -> list[str]:
+    def _command(
+        self, frames_dir: Path, output_dir: Path, prompt: Prompt, startup_gate: Path
+    ) -> list[str]:
         return [
             *self.worker_prefix,
             "-m", "gs_video.segmentation.worker",
@@ -58,11 +62,61 @@ class VideoSegmenterClient:
             "--point", f"{prompt.x},{prompt.y}",
             "--config", worker_path(self.model_config, self.worker_prefix),
             "--checkpoint", worker_path(self.checkpoint, self.worker_prefix),
+            "--startup-gate", worker_path(startup_gate, self.worker_prefix),
         ]
+
+    @staticmethod
+    def _create_startup_gate(output_dir: Path) -> Path:
+        parent = output_dir.parent.absolute()
+        parent.mkdir(parents=True, exist_ok=True)
+        if has_reparse_component(parent):
+            raise GsVideoError("startup gate 父目录包含链接或重解析点")
+        gate = parent / f".gs-video-segmentation-gate-{uuid.uuid4().hex}"
+        with gate.open("x", encoding="utf-8", newline="\n") as stream:
+            stream.write("WAIT\n")
+        return gate
+
+    @staticmethod
+    def _release_startup_gate(gate: Path) -> None:
+        release = gate.parent / f".{gate.name}.release-{uuid.uuid4().hex}"
+        try:
+            with release.open("x", encoding="utf-8", newline="\n") as stream:
+                stream.write("RELEASE\n")
+            release.replace(gate)
+        finally:
+            release.unlink(missing_ok=True)
+
+    @staticmethod
+    def _remove_startup_gate(gate: Path) -> None:
+        try:
+            gate.unlink(missing_ok=True)
+        except OSError:
+            return
+
+    @staticmethod
+    def _reap_direct_best_effort(process: Any) -> None:
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            else:
+                process.wait()
+        except BaseException:
+            pass
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
 
     def _start_worker(
         self, frames_dir: Path, output_dir: Path, prompt: Prompt
-    ) -> tuple[Any, ProcessTreeGuard]:
+    ) -> tuple[Any, ProcessTreeGuard, Path]:
         options: dict[str, object] = {
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
@@ -75,27 +129,31 @@ class VideoSegmenterClient:
             )
         else:
             options["start_new_session"] = True
-        process = self._process_factory(self._command(frames_dir, output_dir, prompt), **options)
+        gate = self._create_startup_gate(output_dir)
+        try:
+            process = self._process_factory(
+                self._command(frames_dir, output_dir, prompt, gate), **options
+            )
+        except BaseException:
+            self._remove_startup_gate(gate)
+            raise
         try:
             guard = self._tree_guard_factory(process)
         except BaseException as exc:
-            try:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5.0)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
-            finally:
-                for stream in (process.stdout, process.stderr):
-                    if stream is not None:
-                        try:
-                            stream.close()
-                        except (OSError, ValueError):
-                            pass
+            self._reap_direct_best_effort(process)
+            self._remove_startup_gate(gate)
             raise GsVideoError("无法建立 segmentation worker 进程树隔离") from exc
-        return process, guard
+        try:
+            self._release_startup_gate(gate)
+        except BaseException as exc:
+            try:
+                guard.close()
+            except BaseException:
+                pass
+            self._reap_direct_best_effort(process)
+            self._remove_startup_gate(gate)
+            raise GsVideoError("无法释放 segmentation worker startup gate") from exc
+        return process, guard, gate
 
     @staticmethod
     def _reader(stream: TextIO, target: queue.Queue[str | None]) -> None:
@@ -334,7 +392,7 @@ class VideoSegmenterClient:
         ordered = self._validate_request(frames, prompt, output_dir)
         frames_dir = ordered[0].parent
         try:
-            process, guard = self._start_worker(frames_dir, output_dir, prompt)
+            process, guard, startup_gate = self._start_worker(frames_dir, output_dir, prompt)
         except ValueError as exc:
             raise GsVideoError("segmentation worker 路径无效") from exc
         lines: queue.Queue[str | None] = queue.Queue()
@@ -343,6 +401,7 @@ class VideoSegmenterClient:
         stderr_thread: threading.Thread | None = None
         terminal: dict[str, object] | None = None
         last_current = 0
+        exit_drain_deadline: float | None = None
         try:
             if process.stdout is None or process.stderr is None:
                 raise GsVideoError("segmentation worker 管道不可用")
@@ -356,11 +415,17 @@ class VideoSegmenterClient:
             stderr_thread.start()
             while True:
                 token.raise_if_cancelled()
-                try:
-                    line = lines.get(timeout=0.05)
-                except queue.Empty:
-                    if process.poll() is not None and not stdout_thread.is_alive():
+                if process.poll() is not None and exit_drain_deadline is None:
+                    exit_drain_deadline = time.monotonic() + 1.0
+                timeout = 0.05
+                if exit_drain_deadline is not None:
+                    remaining = exit_drain_deadline - time.monotonic()
+                    if remaining <= 0:
                         break
+                    timeout = min(timeout, remaining)
+                try:
+                    line = lines.get(timeout=timeout)
+                except queue.Empty:
                     continue
                 if line is None:
                     break
@@ -417,3 +482,4 @@ class VideoSegmenterClient:
                 except (OSError, ValueError):
                     pass
             self._cleanup_process(process, guard, (stdout_thread, stderr_thread), stderr_chunks)
+            self._remove_startup_gate(startup_gate)
