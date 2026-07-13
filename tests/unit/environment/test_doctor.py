@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from gs_video.domain.contracts import SegmentationBackend
-from gs_video.environment.doctor import EnvironmentDoctor, probe_cuda
+from gs_video.environment.doctor import EnvironmentDoctor, probe_cuda, probe_renderer
 from gs_video.segmentation.paths import worker_path
 
 
@@ -83,6 +83,53 @@ def test_probe_cuda_converts_total_vram_to_mib(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
     assert probe_cuda() == (True, 8192)
+
+
+def test_probe_renderer_imports_torch_and_gsplat_independently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_torch = SimpleNamespace(__version__="2.8.0")
+    fake_gsplat = SimpleNamespace(__version__="1.5.3", rasterization=lambda **kwargs: None)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "gsplat", fake_gsplat)
+    assert probe_renderer() == ("2.8.0", "1.5.3")
+
+
+def test_doctor_renderer_check_is_opt_in_and_records_versions() -> None:
+    base = EnvironmentDoctor(
+        which=lambda name: f"C:/{name}.exe", cuda_probe=lambda: (True, 8192)
+    ).check()
+    assert base.ready
+    assert base.renderer_versions is None
+
+    report = EnvironmentDoctor(
+        which=lambda name: f"C:/{name}.exe",
+        cuda_probe=lambda: (True, 8192),
+        check_renderer=True,
+        renderer_probe=lambda: ("2.8.0", "1.5.3"),
+    ).check()
+    assert report.ready
+    assert report.renderer_versions == {"torch": "2.8.0", "gsplat": "1.5.3"}
+
+
+@pytest.mark.parametrize(
+    ("probe", "code"),
+    [
+        (lambda: (None, "1.5.3"), "torch_missing"),
+        (lambda: ("2.8.0", None), "gsplat_missing"),
+        (lambda: ("2.8.0", "2.0.0"), "gsplat_unsupported"),
+    ],
+)
+def test_doctor_reports_renderer_dependency_issues(
+    probe: object, code: str
+) -> None:
+    report = EnvironmentDoctor(
+        which=lambda name: f"C:/{name}.exe",
+        cuda_probe=lambda: (True, 8192),
+        check_renderer=True,
+        renderer_probe=probe,  # type: ignore[arg-type]
+    ).check()
+    assert code in [issue.code for issue in report.issues]
 
 
 def test_doctor_checks_selected_segmentation_assets_and_probe(tmp_path: Path) -> None:

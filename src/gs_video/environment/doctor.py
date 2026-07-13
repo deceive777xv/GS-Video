@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -23,6 +24,7 @@ class EnvironmentReport(BaseModel):
     ready: bool
     vram_mb: int
     issues: list[EnvironmentIssue]
+    renderer_versions: dict[str, str] | None = None
 
 
 def probe_cuda() -> tuple[bool, int]:
@@ -38,6 +40,30 @@ def probe_cuda() -> tuple[bool, int]:
     return True, total_vram // (1024 * 1024)
 
 
+def probe_renderer() -> tuple[str | None, str | None]:
+    """Import optional renderer dependencies independently and return identities."""
+
+    torch_version: str | None = None
+    gsplat_version: str | None = None
+    try:
+        import torch
+    except ImportError:
+        pass
+    else:
+        value = getattr(torch, "__version__", None)
+        if isinstance(value, str) and value:
+            torch_version = value
+    try:
+        import gsplat  # type: ignore[import-not-found]
+    except ImportError:
+        pass
+    else:
+        value = getattr(gsplat, "__version__", None)
+        if isinstance(value, str) and value:
+            gsplat_version = value
+    return torch_version, gsplat_version
+
+
 class EnvironmentDoctor:
     def __init__(
         self,
@@ -49,6 +75,8 @@ class EnvironmentDoctor:
         model_config: Path | None = None,
         checkpoint: Path | None = None,
         process_runner: Callable[..., Any] = subprocess.run,
+        check_renderer: bool = False,
+        renderer_probe: Callable[[], tuple[str | None, str | None]] = probe_renderer,
     ) -> None:
         self._which = which
         self._cuda_probe = cuda_probe
@@ -57,6 +85,24 @@ class EnvironmentDoctor:
         self._model_config = model_config
         self._checkpoint = checkpoint
         self._process_runner = process_runner
+        self._check_renderer = check_renderer
+        self._renderer_probe = renderer_probe
+
+    def _renderer_versions(self, issues: list[EnvironmentIssue]) -> dict[str, str] | None:
+        if not self._check_renderer:
+            return None
+        torch_version, gsplat_version = self._renderer_probe()
+        if torch_version is None:
+            issues.append(EnvironmentIssue(code="torch_missing", message="PyTorch is not installed"))
+        if gsplat_version is None:
+            issues.append(EnvironmentIssue(code="gsplat_missing", message="gsplat is not installed"))
+        elif re.match(r"^1(?:\.|$)", gsplat_version) is None:
+            issues.append(
+                EnvironmentIssue(code="gsplat_unsupported", message="gsplat 1.x is required")
+            )
+        if torch_version is None or gsplat_version is None:
+            return None
+        return {"torch": torch_version, "gsplat": gsplat_version}
 
     @staticmethod
     def _readable_file(path: Path | None) -> bool:
@@ -163,6 +209,12 @@ class EnvironmentDoctor:
                 EnvironmentIssue(code="cuda_unavailable", message="CUDA is not available")
             )
 
+        renderer_versions = self._renderer_versions(issues)
         self._check_segmentation(issues)
 
-        return EnvironmentReport(ready=not issues, vram_mb=vram_mb, issues=issues)
+        return EnvironmentReport(
+            ready=not issues,
+            vram_mb=vram_mb,
+            issues=issues,
+            renderer_versions=renderer_versions,
+        )
