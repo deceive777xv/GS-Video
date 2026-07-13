@@ -7,6 +7,7 @@ import sys
 import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from threading import Lock, RLock
 from typing import Any, Protocol
 
 import numpy as np
@@ -177,21 +178,35 @@ class GsplatRenderer:
         device: str = "cuda",
         available_vram_bytes: int | None = None,
         cuda_metrics: CudaMetrics | None = None,
+        backup_cleanup: Callable[[Path], None] | None = None,
     ) -> None:
-        self._rasterizer = rasterizer
         self._device = device
         self._available_vram_bytes = available_vram_bytes
-        self._metrics = cuda_metrics
+        self._configured_rasterizer = rasterizer
+        self._configured_metrics = cuda_metrics
+        self._dependency_pair: tuple[Rasterizer, CudaMetrics] | None = None
+        self._dependency_lock = Lock()
+        self._operation_lock = RLock()
+        self._backup_cleanup = backup_cleanup or shutil.rmtree
 
     def _dependencies(self) -> tuple[Rasterizer, CudaMetrics]:
-        if self._rasterizer is None:
-            adapter, metrics = _load_gsplat_adapter(self._device)
-            self._rasterizer = adapter
-            if self._metrics is None:
-                self._metrics = metrics
-        if self._metrics is None:
-            self._metrics = _CpuMetrics()
-        return self._rasterizer, self._metrics
+        pair = self._dependency_pair
+        if pair is not None:
+            return pair
+        with self._dependency_lock:
+            pair = self._dependency_pair
+            if pair is None:
+                rasterizer = self._configured_rasterizer
+                metrics = self._configured_metrics
+                if rasterizer is None:
+                    rasterizer, loaded_metrics = _load_gsplat_adapter(self._device)
+                    if metrics is None:
+                        metrics = loaded_metrics
+                elif metrics is None:
+                    metrics = _CpuMetrics()
+                pair = (rasterizer, metrics)
+                self._dependency_pair = pair
+        return pair
 
     @staticmethod
     def _version(rasterizer: Rasterizer) -> str:
@@ -205,6 +220,14 @@ class GsplatRenderer:
             raise ValueError(
                 f"SH degree {settings.sh_degree} requires {required_coefficients} coefficients"
             )
+
+    @staticmethod
+    def _scene_sh_degree(scene: GaussianScene) -> int:
+        degrees = {1: 0, 4: 1, 9: 2, 16: 3}
+        try:
+            return degrees[int(scene.colors.shape[1])]
+        except KeyError as exc:
+            raise ValueError("scene SH coefficient count must be exactly 1, 4, 9, or 16") from exc
 
     @staticmethod
     def _camera_arguments(
@@ -259,15 +282,43 @@ class GsplatRenderer:
         output = Path(output_dir).absolute()
         if not output.name or output == output.parent:
             raise GsVideoError("render output directory is unsafe")
-        output.parent.mkdir(parents=True, exist_ok=True)
         if has_reparse_component(output.parent) or has_reparse_component(output):
             raise GsVideoError("render output directory must not contain links or reparse points")
         if output.exists() and not output.is_dir():
             raise GsVideoError("render output path must be a directory")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        GsplatRenderer._assert_safe_output(output)
         return output
 
     @staticmethod
-    def _publish(staging: Path, output: Path) -> None:
+    def _assert_safe_output(output: Path) -> None:
+        if has_reparse_component(output.parent) or has_reparse_component(output):
+            raise GsVideoError("render output directory must not contain links or reparse points")
+        if output.exists() and not output.is_dir():
+            raise GsVideoError("render output path must be a directory")
+
+    @staticmethod
+    def _assert_owned_tree(path: Path, parent: Path, prefix: str) -> None:
+        absolute = path.absolute()
+        expected_parent = parent.absolute()
+        suffix = absolute.name.removeprefix(prefix)
+        if (
+            absolute.parent != expected_parent
+            or not absolute.name.startswith(prefix)
+            or len(suffix) != 32
+            or any(character not in "0123456789abcdef" for character in suffix)
+            or has_reparse_component(absolute)
+        ):
+            raise GsVideoError("refusing to remove unchecked renderer-owned directory")
+
+    def _cleanup_staging_best_effort(self, staging: Path, output: Path) -> None:
+        try:
+            self._assert_owned_tree(staging, output.parent, f".{output.name}.staging-")
+            shutil.rmtree(staging)
+        except (GsVideoError, OSError):
+            return
+
+    def _publish(self, staging: Path, output: Path) -> None:
         backup = output.parent / f".{output.name}.backup-{uuid.uuid4().hex}"
         moved_old = False
         try:
@@ -280,7 +331,13 @@ class GsplatRenderer:
                 backup.replace(output)
             raise
         if moved_old:
-            shutil.rmtree(backup)
+            try:
+                self._assert_owned_tree(backup, output.parent, f".{output.name}.backup-")
+                self._backup_cleanup(backup)
+            except Exception:
+                # Publication is already complete. Preserve the checked backup for later
+                # housekeeping rather than reporting a false render failure.
+                return
 
     def _admit(
         self, scene: GaussianScene, width: int, height: int, metrics: CudaMetrics
@@ -328,6 +385,18 @@ class GsplatRenderer:
         emit: ProgressEmitter,
         token: CancellationToken,
     ) -> RenderSequence:
+        with self._operation_lock:
+            return self._render_locked(scene, cameras, output_dir, settings, emit, token)
+
+    def _render_locked(
+        self,
+        scene: GaussianScene,
+        cameras: Sequence[OrbitCamera],
+        output_dir: Path,
+        settings: RenderSettings,
+        emit: ProgressEmitter,
+        token: CancellationToken,
+    ) -> RenderSequence:
         if not cameras:
             raise ValueError("camera list must not be empty")
         self._validate_scene_settings(scene, settings)
@@ -337,6 +406,7 @@ class GsplatRenderer:
         runtime = _runtime_scene(scene)
         selected = tuple(range(0, len(cameras), settings.preview_stride))
         staging = output.parent / f".{output.name}.staging-{uuid.uuid4().hex}"
+        self._assert_safe_output(output)
         staging.mkdir()
         paths: list[Path] = []
         try:
@@ -371,7 +441,7 @@ class GsplatRenderer:
             self._publish(staging, output)
         except BaseException:
             if staging.exists():
-                shutil.rmtree(staging)
+                self._cleanup_staging_best_effort(staging, output)
             raise
         return RenderSequence(
             frame_dir=output,
@@ -385,7 +455,15 @@ class GsplatRenderer:
     def render_pick(
         self, scene: GaussianScene, camera: OrbitCamera, width: int, height: int
     ) -> PickBuffer:
-        settings = RenderSettings(width=width, height=height, sh_degree=0)
+        with self._operation_lock:
+            return self._render_pick_locked(scene, camera, width, height)
+
+    def _render_pick_locked(
+        self, scene: GaussianScene, camera: OrbitCamera, width: int, height: int
+    ) -> PickBuffer:
+        settings = RenderSettings(
+            width=width, height=height, sh_degree=self._scene_sh_degree(scene)
+        )
         self._validate_scene_settings(scene, settings)
         rasterizer, metrics = self._dependencies()
         self._admit(scene, width, height, metrics)

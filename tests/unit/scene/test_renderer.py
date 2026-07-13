@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import sys
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from gs_video.domain.contracts import RenderSettings
 from gs_video.domain.errors import CancelledError, GsVideoError
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.scene.camera import OrbitCamera
+import gs_video.scene.gsplat_renderer as renderer_module
 from gs_video.scene.gsplat_renderer import (
     GsplatRasterizerAdapter,
     GsplatRenderer,
@@ -202,6 +204,25 @@ def test_cancellation_after_rasterizer_releases_frame_and_does_not_publish(tmp_p
     assert not list(tmp_path.glob(".frames.staging-*"))
 
 
+def test_renderer_rejects_linked_missing_parent_before_creating_target_directory(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "linked"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are not supported for this test user")
+
+    with pytest.raises(GsVideoError, match="links|reparse"):
+        GsplatRenderer(rasterizer=RecordingRasterizer(), device="cpu").render(
+            tiny_scene(), [camera()], link / "created" / "frames", settings(), lambda *_: None,
+            CancellationToken(),
+        )
+    assert not (target / "created").exists()
+
+
 def test_render_error_preserves_previous_valid_directory_and_cleans_staging(
     tmp_path: Path,
 ) -> None:
@@ -224,6 +245,33 @@ def test_render_error_preserves_previous_valid_directory_and_cleans_staging(
     assert (output / "old.png").read_bytes() == b"previous"
     assert not list(tmp_path.glob(".frames.staging-*"))
     assert not list(tmp_path.glob(".frames.backup-*"))
+
+
+def test_backup_cleanup_failure_keeps_new_output_live_and_preserves_checked_backup(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "frames"
+    output.mkdir()
+    (output / "old.png").write_bytes(b"previous")
+    attempted: list[Path] = []
+
+    def fail_cleanup(path: Path) -> None:
+        attempted.append(path)
+        raise RuntimeError("cleanup unavailable")
+
+    result = GsplatRenderer(
+        rasterizer=RecordingRasterizer(), device="cpu", backup_cleanup=fail_cleanup
+    ).render(
+        tiny_scene(), [camera()], output, settings(), lambda *_: None, CancellationToken()
+    )
+
+    assert result.frame_paths[0].is_file()
+    assert not (output / "old.png").exists()
+    assert len(attempted) == 1
+    backup = attempted[0]
+    assert backup.parent == output.parent
+    assert backup.name.startswith(".frames.backup-")
+    assert (backup / "old.png").read_bytes() == b"previous"
 
 
 @pytest.mark.parametrize(
@@ -283,6 +331,17 @@ def test_render_pick_returns_only_rgb_and_expected_depth_without_writing(
     assert np.all(pick.expected_depth == 2.5)
     assert rasterizer.calls[0]["render_mode"] == "RGB+ED"
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(("coefficients", "degree"), [(4, 1), (9, 2), (16, 3)])
+def test_render_pick_uses_all_available_scene_sh_coefficients(
+    coefficients: int, degree: int
+) -> None:
+    rasterizer = RecordingRasterizer()
+    GsplatRenderer(rasterizer=rasterizer, device="cpu").render_pick(
+        tiny_scene(coefficients=coefficients), camera(), 64, 36
+    )
+    assert rasterizer.calls[0]["sh_degree"] == degree
 
 
 def test_renderer_rejects_alpha_outside_unit_interval_and_negative_pick_depth(
@@ -388,3 +447,139 @@ def test_lazy_loader_accepts_rendering_module_export(monkeypatch: pytest.MonkeyP
     monkeypatch.setitem(sys.modules, "gsplat", fake_gsplat)
     adapter, _metrics = _load_gsplat_adapter("cuda")
     assert adapter.version == "1.5.3"
+
+
+def test_lazy_dependencies_initialize_one_immutable_pair_under_first_use_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    rasterizer = RecordingRasterizer()
+    metrics = SimpleNamespace(
+        available_bytes=lambda: sys.maxsize,
+        peak_allocated_bytes=lambda: None,
+        release_frame=lambda: None,
+    )
+
+    def load(device: str) -> tuple[RecordingRasterizer, object]:
+        nonlocal calls
+        assert device == "cuda"
+        calls += 1
+        entered.set()
+        assert release.wait(timeout=2)
+        return rasterizer, metrics
+
+    monkeypatch.setattr(renderer_module, "_load_gsplat_adapter", load)
+    renderer = GsplatRenderer(device="cuda")
+    results: list[tuple[object, object]] = []
+    first = threading.Thread(target=lambda: results.append(renderer._dependencies()))
+    second = threading.Thread(target=lambda: results.append(renderer._dependencies()))
+    first.start()
+    assert entered.wait(timeout=2)
+    second.start()
+    release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert calls == 1
+    assert results == [(rasterizer, metrics), (rasterizer, metrics)]
+    assert results[0] is results[1]
+
+
+def test_render_and_pick_are_serialized_across_the_entire_renderer_operation(
+    tmp_path: Path,
+) -> None:
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+    call_count = 0
+
+    class BlockingRasterizer(RecordingRasterizer):
+        def __call__(self, **kwargs: object) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+            nonlocal active, max_active, call_count
+            with state_lock:
+                call_count += 1
+                current_call = call_count
+                active += 1
+                max_active = max(max_active, active)
+            if current_call == 1:
+                first_entered.set()
+                assert release_first.wait(timeout=2)
+            else:
+                second_entered.set()
+            try:
+                return super().__call__(**kwargs)
+            finally:
+                with state_lock:
+                    active -= 1
+
+    renderer = GsplatRenderer(rasterizer=BlockingRasterizer(), device="cpu")
+    failures: list[BaseException] = []
+
+    def run_render() -> None:
+        try:
+            renderer.render(
+                tiny_scene(), [camera()], tmp_path / "frames", settings(), lambda *_: None,
+                CancellationToken(),
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    def run_pick() -> None:
+        try:
+            renderer.render_pick(tiny_scene(), camera(), 64, 36)
+        except BaseException as exc:
+            failures.append(exc)
+
+    render_thread = threading.Thread(target=run_render)
+    pick_thread = threading.Thread(target=run_pick)
+    render_thread.start()
+    assert first_entered.wait(timeout=2)
+    pick_thread.start()
+    assert not second_entered.wait(timeout=0.1)
+    release_first.set()
+    render_thread.join(timeout=2)
+    pick_thread.join(timeout=2)
+
+    assert not render_thread.is_alive() and not pick_thread.is_alive()
+    assert failures == []
+    assert second_entered.is_set()
+    assert max_active == 1
+
+
+def test_renderer_operation_lock_is_released_after_rasterizer_exception(tmp_path: Path) -> None:
+    class FailsOnce(RecordingRasterizer):
+        def __call__(self, **kwargs: object) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+            if not self.calls:
+                self.calls.append(kwargs)
+                raise RuntimeError("first call fails")
+            return super().__call__(**kwargs)
+
+    renderer = GsplatRenderer(rasterizer=FailsOnce(), device="cpu")
+    with pytest.raises(RuntimeError, match="first call"):
+        renderer.render(
+            tiny_scene(), [camera()], tmp_path / "frames", settings(), lambda *_: None,
+            CancellationToken(),
+        )
+
+    completed = threading.Event()
+    failure: list[BaseException] = []
+
+    def pick_after_failure() -> None:
+        try:
+            renderer.render_pick(tiny_scene(), camera(), 64, 36)
+        except BaseException as exc:
+            failure.append(exc)
+        finally:
+            completed.set()
+
+    thread = threading.Thread(target=pick_after_failure)
+    thread.start()
+    assert completed.wait(timeout=2)
+    thread.join(timeout=2)
+    assert failure == []
