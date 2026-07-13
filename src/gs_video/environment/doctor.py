@@ -1,9 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+import os
+import subprocess
+from collections.abc import Callable, Sequence
+from pathlib import Path
 from shutil import which as find_command
+from typing import Any
 
 from pydantic import BaseModel
+
+from gs_video.domain.contracts import SegmentationBackend
 
 
 class EnvironmentIssue(BaseModel):
@@ -19,7 +26,7 @@ class EnvironmentReport(BaseModel):
 
 def probe_cuda() -> tuple[bool, int]:
     try:
-        import torch
+        import torch  # type: ignore[import-not-found]
     except ImportError:
         return False, 0
 
@@ -35,9 +42,99 @@ class EnvironmentDoctor:
         self,
         which: Callable[[str], str | None] = find_command,
         cuda_probe: Callable[[], tuple[bool, int]] = probe_cuda,
+        *,
+        segmentation_backend: SegmentationBackend | None = None,
+        worker_prefix: Sequence[str] | None = None,
+        model_config: Path | None = None,
+        checkpoint: Path | None = None,
+        process_runner: Callable[..., Any] = subprocess.run,
     ) -> None:
         self._which = which
         self._cuda_probe = cuda_probe
+        self._segmentation_backend = segmentation_backend
+        self._worker_prefix = tuple(worker_prefix or ())
+        self._model_config = model_config
+        self._checkpoint = checkpoint
+        self._process_runner = process_runner
+
+    @staticmethod
+    def _readable_file(path: Path | None) -> bool:
+        if path is None or not path.is_file():
+            return False
+        try:
+            with path.open("rb") as stream:
+                stream.read(1)
+        except OSError:
+            return False
+        return True
+
+    def _check_segmentation(self, issues: list[EnvironmentIssue]) -> None:
+        configured = any(
+            value is not None
+            for value in (self._segmentation_backend, self._model_config, self._checkpoint)
+        ) or bool(self._worker_prefix)
+        if not configured:
+            return
+        if self._segmentation_backend is None:
+            issues.append(EnvironmentIssue(code="segmentation_backend_missing", message="分割后端未配置"))
+        if not self._worker_prefix or any(not item for item in self._worker_prefix):
+            issues.append(EnvironmentIssue(code="segmentation_worker_missing", message="分割 worker 命令未配置"))
+        elif (
+            not Path(self._worker_prefix[0]).is_file()
+            and self._which(self._worker_prefix[0]) is None
+        ):
+            issues.append(
+                EnvironmentIssue(code="segmentation_worker_missing", message="分割 worker 命令不存在")
+            )
+        if not self._readable_file(self._model_config):
+            issues.append(
+                EnvironmentIssue(code="segmentation_config_unreadable", message="分割模型配置不可读")
+            )
+        if not self._readable_file(self._checkpoint):
+            issues.append(
+                EnvironmentIssue(
+                    code="segmentation_checkpoint_unreadable", message="分割模型 checkpoint 不可读"
+                )
+            )
+        if any(issue.code.startswith("segmentation_") for issue in issues):
+            return
+        assert self._segmentation_backend is not None
+        assert self._model_config is not None
+        assert self._checkpoint is not None
+        command = [
+            *self._worker_prefix,
+            "-m", "gs_video.segmentation.worker", "--probe",
+            "--backend", self._segmentation_backend.value,
+            "--config", str(self._model_config),
+            "--checkpoint", str(self._checkpoint),
+        ]
+        options: dict[str, object] = {
+            "capture_output": True, "text": True, "shell": False, "timeout": 30
+        }
+        if os.name == "nt":
+            options["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            completed = self._process_runner(command, **options)
+            lines = completed.stdout.splitlines()
+            payload = json.loads(lines[0]) if len(lines) == 1 else None
+            expected = {
+                "type": "probe", "backend": self._segmentation_backend.value,
+                "config": str(self._model_config.resolve()),
+                "checkpoint": str(self._checkpoint.resolve()),
+            }
+            if (
+                completed.returncode != 0
+                or not isinstance(payload, dict)
+                or set(payload) != {*expected, "builder"}
+                or any(payload[key] != value for key, value in expected.items())
+                or not isinstance(payload["builder"], str)
+                or not payload["builder"].startswith("sam2.")
+            ):
+                raise ValueError("probe mismatch")
+        except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
+            issues.append(
+                EnvironmentIssue(code="segmentation_probe_failed", message="分割 worker 探测失败")
+            )
 
     def check(self) -> EnvironmentReport:
         issues: list[EnvironmentIssue] = []
@@ -56,5 +153,7 @@ class EnvironmentDoctor:
             issues.append(
                 EnvironmentIssue(code="cuda_unavailable", message="CUDA is not available")
             )
+
+        self._check_segmentation(issues)
 
         return EnvironmentReport(ready=not issues, vram_mb=vram_mb, issues=issues)

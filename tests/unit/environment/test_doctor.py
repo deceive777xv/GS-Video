@@ -1,10 +1,14 @@
 import builtins
+import json
+import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from gs_video.environment.doctor import EnvironmentDoctor, probe_cuda
+from gs_video.domain.contracts import SegmentationBackend
 
 
 def test_doctor_reports_missing_commands_without_starting_gpu() -> None:
@@ -78,3 +82,72 @@ def test_probe_cuda_converts_total_vram_to_mib(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
     assert probe_cuda() == (True, 8192)
+
+
+def test_doctor_checks_selected_segmentation_assets_and_probe(tmp_path: Path) -> None:
+    config = tmp_path / "edgetam.yaml"
+    checkpoint = tmp_path / "edgetam.pt"
+    config.write_text("model", encoding="utf-8")
+    checkpoint.write_bytes(b"weights")
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command, 0,
+            json.dumps({
+                "type": "probe", "backend": "edgetam",
+                "config": str(config.resolve()), "checkpoint": str(checkpoint.resolve()),
+                "builder": "sam2.build_sam",
+            }) + "\n", "",
+        )
+
+    report = EnvironmentDoctor(
+        which=lambda name: f"C:/{name}.exe",
+        cuda_probe=lambda: (True, 8192),
+        segmentation_backend=SegmentationBackend.EDGETAM,
+        worker_prefix=("python",),
+        model_config=config,
+        checkpoint=checkpoint,
+        process_runner=run,
+    ).check()
+
+    assert report.ready
+    assert commands[0][:4] == ["python", "-m", "gs_video.segmentation.worker", "--probe"]
+
+
+def test_doctor_rejects_probe_identity_mismatch_and_missing_asset(tmp_path: Path) -> None:
+    config = tmp_path / "edgetam.yaml"
+    config.write_text("model", encoding="utf-8")
+    checkpoint = tmp_path / "missing.pt"
+    report = EnvironmentDoctor(
+        which=lambda name: f"C:/{name}.exe",
+        cuda_probe=lambda: (True, 8192),
+        segmentation_backend=SegmentationBackend.EDGETAM,
+        worker_prefix=("python",), model_config=config, checkpoint=checkpoint,
+        process_runner=lambda command, **options: subprocess.CompletedProcess(
+            command, 0, '{"type":"probe","backend":"sam2","config":"x","checkpoint":"y"}\n', ""
+        ),
+    ).check()
+    assert "segmentation_checkpoint_unreadable" in [issue.code for issue in report.issues]
+
+
+def test_doctor_rejects_probe_identity_mismatch(tmp_path: Path) -> None:
+    config = tmp_path / "edgetam.yaml"
+    checkpoint = tmp_path / "edgetam.pt"
+    config.write_text("model", encoding="utf-8")
+    checkpoint.write_bytes(b"weights")
+    report = EnvironmentDoctor(
+        which=lambda name: f"C:/{name}.exe",
+        cuda_probe=lambda: (True, 8192),
+        segmentation_backend=SegmentationBackend.EDGETAM,
+        worker_prefix=("python",), model_config=config, checkpoint=checkpoint,
+        process_runner=lambda command, **options: subprocess.CompletedProcess(
+            command, 0,
+            json.dumps({
+                "type": "probe", "backend": "sam2", "config": str(config.resolve()),
+                "checkpoint": str(checkpoint.resolve()), "builder": "sam2.build_sam",
+            }) + "\n", "",
+        ),
+    ).check()
+    assert "segmentation_probe_failed" in [issue.code for issue in report.issues]
