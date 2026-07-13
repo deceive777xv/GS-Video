@@ -61,6 +61,33 @@ class RecordingRasterizer:
         return render, alpha, {}
 
 
+class AttemptTrackingLock:
+    """Signal before each delegate acquisition while preserving Lock/RLock semantics."""
+
+    def __init__(self, lock: object) -> None:
+        self._lock = lock
+        self._counter_lock = threading.Lock()
+        self._attempts = 0
+        self.second_attempted = threading.Event()
+
+    @property
+    def attempts(self) -> int:
+        with self._counter_lock:
+            return self._attempts
+
+    def __enter__(self) -> AttemptTrackingLock:
+        with self._counter_lock:
+            self._attempts += 1
+            if self._attempts == 2:
+                self.second_attempted.set()
+        self._lock.acquire()  # type: ignore[attr-defined]
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        del exc_info
+        self._lock.release()  # type: ignore[attr-defined]
+
+
 def settings(**overrides: object) -> RenderSettings:
     values: dict[str, object] = {
         "width": 64,
@@ -472,18 +499,23 @@ def test_lazy_dependencies_initialize_one_immutable_pair_under_first_use_race(
 
     monkeypatch.setattr(renderer_module, "_load_gsplat_adapter", load)
     renderer = GsplatRenderer(device="cuda")
+    dependency_lock = AttemptTrackingLock(threading.Lock())
+    renderer._dependency_lock = dependency_lock  # type: ignore[assignment]
     results: list[tuple[object, object]] = []
     first = threading.Thread(target=lambda: results.append(renderer._dependencies()))
     second = threading.Thread(target=lambda: results.append(renderer._dependencies()))
     first.start()
     assert entered.wait(timeout=2)
     second.start()
+    assert dependency_lock.second_attempted.wait(timeout=2)
+    assert calls == 1
     release.set()
     first.join(timeout=2)
     second.join(timeout=2)
 
     assert not first.is_alive() and not second.is_alive()
     assert calls == 1
+    assert dependency_lock.attempts == 2
     assert results == [(rasterizer, metrics), (rasterizer, metrics)]
     assert results[0] is results[1]
 
@@ -493,7 +525,6 @@ def test_render_and_pick_are_serialized_across_the_entire_renderer_operation(
 ) -> None:
     first_entered = threading.Event()
     release_first = threading.Event()
-    second_entered = threading.Event()
     state_lock = threading.Lock()
     active = 0
     max_active = 0
@@ -510,8 +541,6 @@ def test_render_and_pick_are_serialized_across_the_entire_renderer_operation(
             if current_call == 1:
                 first_entered.set()
                 assert release_first.wait(timeout=2)
-            else:
-                second_entered.set()
             try:
                 return super().__call__(**kwargs)
             finally:
@@ -519,6 +548,8 @@ def test_render_and_pick_are_serialized_across_the_entire_renderer_operation(
                     active -= 1
 
     renderer = GsplatRenderer(rasterizer=BlockingRasterizer(), device="cpu")
+    operation_lock = AttemptTrackingLock(threading.RLock())
+    renderer._operation_lock = operation_lock  # type: ignore[assignment]
     failures: list[BaseException] = []
 
     def run_render() -> None:
@@ -541,14 +572,18 @@ def test_render_and_pick_are_serialized_across_the_entire_renderer_operation(
     render_thread.start()
     assert first_entered.wait(timeout=2)
     pick_thread.start()
-    assert not second_entered.wait(timeout=0.1)
+    assert operation_lock.second_attempted.wait(timeout=2)
+    with state_lock:
+        assert call_count == 1
+        assert max_active == 1
     release_first.set()
     render_thread.join(timeout=2)
     pick_thread.join(timeout=2)
 
     assert not render_thread.is_alive() and not pick_thread.is_alive()
     assert failures == []
-    assert second_entered.is_set()
+    assert operation_lock.attempts == 2
+    assert call_count == 2
     assert max_active == 1
 
 
@@ -561,6 +596,8 @@ def test_renderer_operation_lock_is_released_after_rasterizer_exception(tmp_path
             return super().__call__(**kwargs)
 
     renderer = GsplatRenderer(rasterizer=FailsOnce(), device="cpu")
+    operation_lock = AttemptTrackingLock(threading.RLock())
+    renderer._operation_lock = operation_lock  # type: ignore[assignment]
     with pytest.raises(RuntimeError, match="first call"):
         renderer.render(
             tiny_scene(), [camera()], tmp_path / "frames", settings(), lambda *_: None,
@@ -583,3 +620,4 @@ def test_renderer_operation_lock_is_released_after_rasterizer_exception(tmp_path
     assert completed.wait(timeout=2)
     thread.join(timeout=2)
     assert failure == []
+    assert operation_lock.attempts == 2
