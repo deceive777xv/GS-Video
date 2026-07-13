@@ -18,6 +18,7 @@ from gs_video.camera.classify import (
     MIN_OVERALL_CONFIDENCE,
     MIN_TRACKED_FEATURES,
     ROTATION_HOMOGRAPHY_INLIER_THRESHOLD,
+    ROTATION_HOMOGRAPHY_RESIDUAL_THRESHOLD,
     SIX_DOF_CHEIRALITY_INLIER_THRESHOLD,
     CameraKind,
     classify_motion,
@@ -76,7 +77,7 @@ class _PairPose:
     world_to_camera_increment: Float64Array
     kind: CameraKind
     confidence: float
-    diagnostics: Mapping[str, float | int]
+    diagnostics: Mapping[str, Any]
 
 
 class _PairSolveFailure(RuntimeError):
@@ -99,6 +100,31 @@ def _intrinsics(width: int, height: int) -> Float64Array:
         [[focal, 0.0, width / 2], [0.0, focal, height / 2], [0.0, 0.0, 1.0]],
         dtype=np.float64,
     )
+
+
+def _compose_world_to_camera(
+    accumulated: npt.ArrayLike, increment: npt.ArrayLike
+) -> Float64Array:
+    """Left-compose an adjacent OpenCV world-to-camera increment."""
+
+    current = validate_rigid_transform(accumulated, "accumulated world-to-camera")
+    delta = validate_rigid_transform(increment, "world-to-camera increment")
+    return validate_rigid_transform(delta @ current, "composed world-to-camera")
+
+
+def _homography_rotation(
+    homography: npt.ArrayLike, intrinsics: npt.ArrayLike
+) -> tuple[Float64Array, float]:
+    normalized = np.linalg.inv(np.asarray(intrinsics, dtype=np.float64)) @ np.asarray(
+        homography, dtype=np.float64
+    ) @ np.asarray(intrinsics, dtype=np.float64)
+    scale = np.cbrt(abs(np.linalg.det(normalized)))
+    if not np.isfinite(scale) or scale <= 1e-12:
+        raise _PairSolveFailure("homography normalization failed")
+    normalized /= scale
+    rotation = _project_to_rotation(normalized)
+    residual = float(np.linalg.norm(normalized - rotation, ord="fro"))
+    return rotation, residual
 
 
 def smooth_translations(translations: list[np.ndarray] | tuple[np.ndarray, ...]) -> list[Float64Array]:
@@ -156,7 +182,9 @@ class OpenCvCameraSolver:
             else:
                 consecutive_failures = 0
                 assert pair is not None
-                world_to_camera = pair.world_to_camera_increment @ world_to_camera
+                world_to_camera = _compose_world_to_camera(
+                    world_to_camera, pair.world_to_camera_increment
+                )
             pairs.append(pair)
             poses.append(validate_rigid_transform(np.linalg.inv(world_to_camera), "camera pose"))
             emit(index, total, f"求解相机运动 {index}/{total}")
@@ -222,23 +250,37 @@ class OpenCvCameraSolver:
             raise UnsupportedMaterialError("相机轨迹可信度过低：特征不足")
         flow = np.linalg.norm(matched1 - matched0, axis=1)
         median_flow = float(np.median(flow))
+        tracking_support = len(matched0) / len(points0)
+        try:
+            homography, homography_mask = cv2.findHomography(
+                matched0, matched1, cv2.RANSAC, 2.0
+            )
+        except cv2.error:
+            homography, homography_mask = None, None
+        homography_evaluated = homography is not None and homography_mask is not None
+        if homography_mask is not None:
+            homography_ratio = float(np.count_nonzero(homography_mask)) / len(matched0)
+        else:
+            homography_ratio = 0.0
         if median_flow <= FIXED_FLOW_THRESHOLD_PX:
-            classification = classify_motion(median_flow, 1.0, 0.0)
+            classification = classify_motion(
+                median_flow, homography_ratio, 0.0, tracking_support
+            )
             return _PairPose(
                 np.eye(4), classification.kind, classification.confidence,
-                {"tracked_features": len(matched0), "median_flow_px": median_flow,
-                 "homography_inliers": 1.0, "essential_inliers": 0.0,
-                 "cheirality_inliers": 0.0},
+                {
+                    "detected_features": len(points0),
+                    "tracked_features": len(matched0),
+                    "tracking_support": tracking_support,
+                    "median_flow_px": median_flow,
+                    "homography_inliers": homography_ratio if homography_evaluated else None,
+                    "homography_evaluated": homography_evaluated,
+                    "essential_inliers": None,
+                    "essential_evaluated": False,
+                    "cheirality_inliers": None,
+                },
             )
 
-        homography, homography_mask = cv2.findHomography(
-            matched0, matched1, cv2.RANSAC, 2.0
-        )
-        homography_ratio = (
-            float(np.count_nonzero(homography_mask)) / len(matched0)
-            if homography is not None and homography_mask is not None
-            else 0.0
-        )
         essential, essential_mask = cv2.findEssentialMat(
             matched0, matched1, intrinsics, cv2.RANSAC, 0.999, 1.0
         )
@@ -253,7 +295,22 @@ class OpenCvCameraSolver:
 
         final_kind = classification.kind
         final_confidence = classification.confidence
-        if classification.kind is CameraKind.SIX_DOF and essential is not None and essential_mask is not None:
+        homography_rotation: Float64Array | None = None
+        homography_rotation_residual: float | None = None
+        if homography is not None and homography_ratio >= ROTATION_HOMOGRAPHY_INLIER_THRESHOLD:
+            homography_rotation, homography_rotation_residual = _homography_rotation(
+                homography, intrinsics
+            )
+
+        if (
+            homography_rotation is not None
+            and homography_rotation_residual is not None
+            and homography_rotation_residual <= ROTATION_HOMOGRAPHY_RESIDUAL_THRESHOLD
+        ):
+            increment[:3, :3] = homography_rotation
+            final_kind = CameraKind.ROTATION
+            final_confidence = homography_ratio
+        elif classification.kind is CameraKind.SIX_DOF and essential is not None and essential_mask is not None:
             try:
                 inliers, rotation, translation, pose_mask = cv2.recoverPose(
                     essential, matched0, matched1, intrinsics, mask=essential_mask.copy()
@@ -272,30 +329,29 @@ class OpenCvCameraSolver:
                     raise _PairSolveFailure("pose recovery returned invalid translation")
                 increment[:3, 3] = direction / norm
             elif homography is not None and homography_ratio >= ROTATION_HOMOGRAPHY_INLIER_THRESHOLD:
-                normalized = np.linalg.inv(intrinsics) @ homography @ intrinsics
-                scale = np.cbrt(abs(np.linalg.det(normalized)))
-                if not np.isfinite(scale) or scale <= 1e-12:
-                    raise _PairSolveFailure("homography normalization failed")
-                increment[:3, :3] = _project_to_rotation(normalized / scale)
+                assert homography_rotation is not None
+                increment[:3, :3] = homography_rotation
                 final_kind = CameraKind.ROTATION
                 final_confidence = homography_ratio
             else:
                 raise _PairSolveFailure("pose recovery had insufficient cheirality inliers")
         elif homography is not None and homography_ratio >= ROTATION_HOMOGRAPHY_INLIER_THRESHOLD:
-            normalized = np.linalg.inv(intrinsics) @ homography @ intrinsics
-            scale = np.cbrt(abs(np.linalg.det(normalized)))
-            if not np.isfinite(scale) or scale <= 1e-12:
-                raise _PairSolveFailure("homography normalization failed")
-            increment[:3, :3] = _project_to_rotation(normalized / scale)
+            assert homography_rotation is not None
+            increment[:3, :3] = homography_rotation
         else:
             raise _PairSolveFailure("neither essential nor homography model was credible")
 
         increment = validate_rigid_transform(increment, "world-to-camera increment")
-        diagnostics: dict[str, float | int] = {
+        diagnostics: dict[str, Any] = {
+            "detected_features": len(points0),
             "tracked_features": len(matched0),
+            "tracking_support": tracking_support,
             "median_flow_px": median_flow,
             "homography_inliers": homography_ratio,
+            "homography_evaluated": homography_evaluated,
+            "homography_rotation_residual": homography_rotation_residual,
             "essential_inliers": essential_ratio,
+            "essential_evaluated": essential is not None and essential_mask is not None,
             "cheirality_inliers": cheirality_ratio,
         }
         return _PairPose(increment, final_kind, final_confidence, diagnostics)

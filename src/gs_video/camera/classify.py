@@ -7,6 +7,7 @@ from math import isfinite
 
 FIXED_FLOW_THRESHOLD_PX = 0.5
 ROTATION_HOMOGRAPHY_INLIER_THRESHOLD = 0.7
+ROTATION_HOMOGRAPHY_RESIDUAL_THRESHOLD = 0.01
 SIX_DOF_ESSENTIAL_INLIER_THRESHOLD = 0.6
 SIX_DOF_CHEIRALITY_INLIER_THRESHOLD = 0.25
 MIN_OVERALL_CONFIDENCE = 0.55
@@ -31,18 +32,20 @@ def classify_motion(
     median_flow_px: float,
     homography_inliers: float,
     essential_inliers: float,
+    tracking_support: float = 1.0,
 ) -> MotionClassification:
     """Classify one adjacent pair using centralized, deterministic thresholds."""
 
     if not isfinite(median_flow_px) or median_flow_px < 0:
         raise ValueError("median_flow_px must be finite and non-negative")
-    for value in (homography_inliers, essential_inliers):
+    for value in (homography_inliers, essential_inliers, tracking_support):
         if not isfinite(value) or not 0 <= value <= 1:
             raise ValueError("inlier ratios must be finite and between zero and one")
 
     if median_flow_px <= FIXED_FLOW_THRESHOLD_PX:
         stillness = 1.0 - 0.4 * median_flow_px / FIXED_FLOW_THRESHOLD_PX
-        return MotionClassification(CameraKind.FIXED, max(stillness, homography_inliers))
+        confidence = 0.5 * stillness + 0.25 * tracking_support + 0.25 * homography_inliers
+        return MotionClassification(CameraKind.FIXED, confidence)
     if essential_inliers >= SIX_DOF_ESSENTIAL_INLIER_THRESHOLD:
         return MotionClassification(CameraKind.SIX_DOF, essential_inliers)
     return MotionClassification(CameraKind.ROTATION, homography_inliers)

@@ -35,6 +35,22 @@ def _warp_rotation(image: np.ndarray, degrees: float) -> np.ndarray:
     return cv2.warpAffine(image, matrix, (image.shape[1], image.shape[0]))
 
 
+def _perspective_yaw_frames() -> list[np.ndarray]:
+    image = _texture(seed=17)
+    height, width = image.shape
+    focal = 0.5 * height / np.tan(np.deg2rad(30))
+    intrinsics = np.array([[focal, 0, width / 2], [0, focal, height / 2], [0, 0, 1]])
+    yaw = np.deg2rad(2.0)
+    rotation = np.array(
+        [[np.cos(yaw), 0, np.sin(yaw)], [0, 1, 0], [-np.sin(yaw), 0, np.cos(yaw)]]
+    )
+    homography = intrinsics @ rotation @ np.linalg.inv(intrinsics)
+    return [
+        cv2.warpPerspective(image, np.linalg.matrix_power(homography, index), (width, height))
+        for index in range(3)
+    ]
+
+
 def _parallax_frames() -> list[np.ndarray]:
     rng = np.random.default_rng(3)
     xyz = np.column_stack(
@@ -75,6 +91,55 @@ def test_pure_fixed_sequence_is_solved_without_essential_translation(tmp_path: P
     assert "60" in solution.diagnostics["intrinsics_prior"]
 
 
+def test_fixed_pair_uses_measured_homography_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    image = _texture()
+
+    def measured_homography(*args: object, **kwargs: object) -> tuple[np.ndarray, np.ndarray]:
+        points = np.asarray(args[0])
+        mask = np.zeros((len(points), 1), dtype=np.uint8)
+        mask[: len(points) // 2] = 1
+        return np.eye(3), mask
+
+    def essential_must_be_unevaluated(*args: object, **kwargs: object) -> None:
+        raise AssertionError("fixed pair should not require an essential matrix")
+
+    monkeypatch.setattr(cv2, "findHomography", measured_homography)
+    monkeypatch.setattr(cv2, "findEssentialMat", essential_must_be_unevaluated)
+
+    solution = OpenCvCameraSolver().solve(
+        _write_frames(tmp_path, [image, image.copy()]), lambda *_: None, CancellationToken()
+    )
+
+    pair = solution.diagnostics["pairs"][0]
+    assert pair["homography_inliers"] == pytest.approx(0.5, abs=0.01)
+    assert pair["homography_evaluated"] is True
+    assert pair["essential_inliers"] is None
+    assert pair["essential_evaluated"] is False
+    assert 0.55 <= solution.confidence < 1.0
+
+
+def test_fixed_pair_marks_failed_homography_as_unevaluated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    image = _texture()
+
+    def fail_homography(*args: object, **kwargs: object) -> None:
+        raise cv2.error("homography failed")
+
+    monkeypatch.setattr(cv2, "findHomography", fail_homography)
+
+    solution = OpenCvCameraSolver().solve(
+        _write_frames(tmp_path, [image, image.copy()]), lambda *_: None, CancellationToken()
+    )
+
+    pair = solution.diagnostics["pairs"][0]
+    assert pair["homography_inliers"] is None
+    assert pair["homography_evaluated"] is False
+    assert pair["essential_inliers"] is None
+
+
 def test_pure_rotation_sequence_has_zero_translation(tmp_path: Path) -> None:
     image = _texture()
     frames = [_warp_rotation(image, angle) for angle in (0.0, 2.0, 4.0)]
@@ -87,6 +152,16 @@ def test_pure_rotation_sequence_has_zero_translation(tmp_path: Path) -> None:
     assert any(not np.allclose(pose[:3, :3], np.eye(3), atol=1e-3) for pose in solution.camera_to_world[1:])
     for frame_pose in solution.camera_to_world:
         np.testing.assert_allclose(frame_pose[:3, 3], 0.0, atol=1e-10)
+
+
+def test_calibrated_perspective_yaw_is_rotation_without_translation(tmp_path: Path) -> None:
+    solution = OpenCvCameraSolver().solve(
+        _write_frames(tmp_path, _perspective_yaw_frames()), lambda *_: None, CancellationToken()
+    )
+
+    assert solution.kind is CameraKind.ROTATION
+    for frame_pose in solution.camera_to_world:
+        np.testing.assert_array_equal(frame_pose[:3, 3], np.zeros(3))
 
 
 def test_parallax_sequence_is_solved_as_six_dof(tmp_path: Path) -> None:
