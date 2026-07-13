@@ -167,6 +167,10 @@ def run_segmentation(
         raise ValueError("提示帧不可读") from exc
     if point[0] >= width or point[1] >= height:
         raise ValueError("提示点超出图像边界")
+    frame_sizes: list[tuple[int, int]] = []
+    for frame in frames:
+        with Image.open(frame) as image:
+            frame_sizes.append(image.size)
     for asset in (config, checkpoint):
         if not _readable_regular_file(asset):
             raise ValueError("模型配置或 checkpoint 不可读")
@@ -207,9 +211,12 @@ def run_segmentation(
             for index, _object_ids, logits in propagation:
                 if index in written:
                     continue
-                if not isinstance(index, int) or not 0 <= index < len(frames):
+                if type(index) is not int or not 0 <= index < len(frames):
                     raise ValueError("predictor 返回无效帧索引")
                 mask = _numpy_mask(logits)
+                expected_width, expected_height = frame_sizes[index]
+                if mask.shape != (expected_height, expected_width):
+                    raise ValueError("predictor mask 尺寸与代理帧不一致")
                 Image.fromarray(mask).save(staging / f"{frames[index].stem}.png")
                 written.add(index)
                 ratios_by_index[index] = float(np.count_nonzero(mask)) / float(mask.size)
@@ -256,6 +263,9 @@ def probe_backend(
         identity = f"{type(predictor).__module__}.{type(predictor).__qualname__}"
         if predictor is None or not identity:
             raise RuntimeError("predictor build returned invalid object")
+        required_api = ("init_state", "add_new_points_or_box", "propagate_in_video")
+        if any(not callable(getattr(predictor, name, None)) for name in required_api):
+            raise RuntimeError("predictor 缺少必需视频 API")
         return {
             "type": "probe",
             "backend": backend,

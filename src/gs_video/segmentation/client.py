@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import queue
-import signal
 import subprocess
 import threading
 from collections.abc import Callable, Sequence
@@ -17,8 +16,13 @@ from gs_video.domain.errors import GsVideoError, UnsupportedMaterialError
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
 from gs_video.segmentation.paths import has_reparse_component, worker_path
+from gs_video.segmentation.tree_guard import (
+    ProcessTreeGuard,
+    create_process_tree_guard,
+)
 
 ProcessFactory = Callable[..., Any]
+TreeGuardFactory = Callable[[Any], ProcessTreeGuard]
 
 
 class VideoSegmenterClient:
@@ -30,6 +34,7 @@ class VideoSegmenterClient:
         model_config: Path,
         checkpoint: Path,
         process_factory: ProcessFactory = subprocess.Popen,
+        tree_guard_factory: TreeGuardFactory = create_process_tree_guard,
         log_path: Path | None = None,
     ) -> None:
         if not worker_prefix or any(not item for item in worker_prefix):
@@ -39,6 +44,7 @@ class VideoSegmenterClient:
         self.model_config = Path(model_config)
         self.checkpoint = Path(checkpoint)
         self._process_factory = process_factory
+        self._tree_guard_factory = tree_guard_factory
         self.log_path = log_path or self.model_config.parent / "logs" / "segmentation-worker.log"
 
     def _command(self, frames_dir: Path, output_dir: Path, prompt: Prompt) -> list[str]:
@@ -54,7 +60,9 @@ class VideoSegmenterClient:
             "--checkpoint", worker_path(self.checkpoint, self.worker_prefix),
         ]
 
-    def _start_worker(self, frames_dir: Path, output_dir: Path, prompt: Prompt) -> Any:
+    def _start_worker(
+        self, frames_dir: Path, output_dir: Path, prompt: Prompt
+    ) -> tuple[Any, ProcessTreeGuard]:
         options: dict[str, object] = {
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
@@ -67,7 +75,27 @@ class VideoSegmenterClient:
             )
         else:
             options["start_new_session"] = True
-        return self._process_factory(self._command(frames_dir, output_dir, prompt), **options)
+        process = self._process_factory(self._command(frames_dir, output_dir, prompt), **options)
+        try:
+            guard = self._tree_guard_factory(process)
+        except BaseException as exc:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            finally:
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except (OSError, ValueError):
+                            pass
+            raise GsVideoError("无法建立 segmentation worker 进程树隔离") from exc
+        return process, guard
 
     @staticmethod
     def _reader(stream: TextIO, target: queue.Queue[str | None]) -> None:
@@ -86,49 +114,19 @@ class VideoSegmenterClient:
         except (OSError, ValueError):
             return
 
-    def _stop(self, process: Any) -> None:
+    def _stop(self, process: Any, guard: ProcessTreeGuard) -> None:
         if process.poll() is None:
-            if not self._terminate_process_tree(process, force=False):
+            if not guard.terminate(force=False):
                 process.terminate()
             try:
                 process.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
-                tree_killed = self._terminate_process_tree(process, force=True)
+                tree_killed = guard.terminate(force=True)
                 if not tree_killed or process.poll() is None:
                     process.kill()
                 process.wait()
         else:
             process.wait()
-
-    @staticmethod
-    def _terminate_process_tree(process: Any, *, force: bool) -> bool:
-        pid = getattr(process, "pid", None)
-        if not isinstance(pid, int) or pid <= 0:
-            return False
-        try:
-            if os.name == "nt":
-                command = ["taskkill", "/PID", str(pid), "/T"]
-                if force:
-                    command.append("/F")
-                completed = subprocess.run(
-                    command,
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    shell=False,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                    timeout=5,
-                )
-                return completed.returncode == 0
-            else:
-                kill_process_group = getattr(os, "killpg", None)
-                if callable(kill_process_group):
-                    signal_name = "SIGKILL" if force else "SIGTERM"
-                    kill_process_group(pid, getattr(signal, signal_name, 9 if force else 15))
-                    return True
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return False
 
     def _write_stderr(self, chunks: list[str]) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -142,29 +140,29 @@ class VideoSegmenterClient:
     def _cleanup_process(
         self,
         process: Any,
+        guard: ProcessTreeGuard,
         threads: tuple[threading.Thread | None, threading.Thread | None],
         stderr_chunks: list[str],
     ) -> None:
         truncated = False
         try:
             if process.poll() is None:
-                self._stop(process)
+                self._stop(process, guard)
         except BaseException as exc:
             truncated = True
             stderr_chunks.append(f"\n[segmentation cleanup error: {exc}]\n")
+        try:
+            guard.close()
+        except BaseException as exc:
+            truncated = True
+            stderr_chunks.append(f"\n[segmentation tree guard close error: {exc}]\n")
         live = [thread for thread in threads if thread is not None]
         for thread in live:
-            thread.join(timeout=1.0)
+            thread.join(timeout=0.5)
         if any(thread.is_alive() for thread in live):
             truncated = True
-            for stream in (process.stdout, process.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except (OSError, ValueError):
-                        pass
             for thread in live:
-                thread.join(timeout=0.5)
+                thread.join(timeout=0.1)
         else:
             for stream in (process.stdout, process.stderr):
                 if stream is not None:
@@ -219,11 +217,10 @@ class VideoSegmenterClient:
         frames_dir = ordered[0].parent.resolve()
         if any(path.parent.resolve() != frames_dir for path in ordered):
             raise GsVideoError("代理帧必须位于同一目录")
-        inventory = {
-            path.resolve()
-            for path in frames_dir.iterdir()
-            if path.suffix.lower() in allowed and path.stem.isdigit()
-        }
+        image_candidates = [path for path in frames_dir.iterdir() if path.suffix.lower() in allowed]
+        if any(not path.stem.isdigit() for path in image_candidates):
+            raise GsVideoError("代理帧目录包含非数字文件名图像")
+        inventory = {path.resolve() for path in image_candidates}
         if {path.resolve() for path in ordered} != inventory:
             raise GsVideoError("代理帧必须等于完整目录数字图像清单")
         try:
@@ -337,7 +334,7 @@ class VideoSegmenterClient:
         ordered = self._validate_request(frames, prompt, output_dir)
         frames_dir = ordered[0].parent
         try:
-            process = self._start_worker(frames_dir, output_dir, prompt)
+            process, guard = self._start_worker(frames_dir, output_dir, prompt)
         except ValueError as exc:
             raise GsVideoError("segmentation worker 路径无效") from exc
         lines: queue.Queue[str | None] = queue.Queue()
@@ -419,4 +416,4 @@ class VideoSegmenterClient:
                     stderr_chunks.append(process.stderr.read())
                 except (OSError, ValueError):
                     pass
-            self._cleanup_process(process, (stdout_thread, stderr_thread), stderr_chunks)
+            self._cleanup_process(process, guard, (stdout_thread, stderr_thread), stderr_chunks)

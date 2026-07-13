@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import io
+import os
 import subprocess
+import sys
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -310,6 +313,18 @@ def test_client_rejects_empty_partial_inventory_and_invalid_prompt(tmp_path: Pat
             )
 
 
+def test_client_rejects_nonnumeric_image_in_worker_directory(tmp_path: Path) -> None:
+    frames = _frames(tmp_path, ("000001.jpg",))
+    Image.new("RGB", (32, 32)).save(frames[0].parent / "poster.jpg")
+    client = _client(tmp_path, FakeProcess([]))
+    client._process_factory = lambda *args, **kwargs: pytest.fail("worker must not start")
+    with pytest.raises(GsVideoError, match="数字"):
+        client.segment(
+            frames, Prompt(0, 1, 1), tmp_path / "masks", lambda *_: None,
+            CancellationToken(),
+        )
+
+
 def test_client_rejects_output_overlap_with_frames_or_model(tmp_path: Path) -> None:
     frames = _frames(tmp_path, ("000001.jpg",))
     client = _client(tmp_path, FakeProcess([]))
@@ -456,13 +471,17 @@ def test_client_cancellation_does_not_deadlock_on_inherited_pipe_handles(tmp_pat
 
 
 def test_client_terminates_process_tree_before_parent_exits(tmp_path: Path) -> None:
+    class RecordingGuard:
+        def terminate(self, *, force: bool) -> bool:
+            tree_calls.append(force)
+            return True
+
+        def close(self) -> None:
+            return
+
     process = FakeProcess([])
-    process.pid = 1234  # type: ignore[attr-defined]
-    client = _client(tmp_path, process)
     tree_calls: list[bool] = []
-    client._terminate_process_tree = (  # type: ignore[method-assign]
-        lambda actual_process, *, force: tree_calls.append(force) or True
-    )
+    client = _client(tmp_path, process, tree_guard_factory=lambda _: RecordingGuard())
     token = CancellationToken()
     token.cancel()
 
@@ -473,3 +492,68 @@ def test_client_terminates_process_tree_before_parent_exits(tmp_path: Path) -> N
         )
 
     assert tree_calls == [False]
+
+
+def test_client_reaps_worker_when_tree_guard_assignment_fails(tmp_path: Path) -> None:
+    process = FakeProcess([])
+
+    def fail_guard(actual_process: object) -> object:
+        del actual_process
+        raise OSError("job assignment failed")
+
+    client = _client(tmp_path, process, tree_guard_factory=fail_guard)
+    with pytest.raises(GsVideoError, match="进程树隔离"):
+        client.segment(
+            _frames(tmp_path, ("000001.jpg",)), Prompt(0, 1, 1), tmp_path / "masks",
+            lambda *_: None, CancellationToken(),
+        )
+    assert process.terminated and process.returncode is not None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object regression")
+def test_real_job_guard_kills_child_after_parent_exits(tmp_path: Path) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    parent_code = (
+        "import pathlib,subprocess,sys,time;"
+        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],"
+        "stdout=sys.stdout,stderr=sys.stderr);"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid));"
+        "time.sleep(0.5)"
+    )
+
+    def factory(command: list[str], **options: object) -> subprocess.Popen[str]:
+        del command
+        return subprocess.Popen(  # type: ignore[call-overload]
+            [sys.executable, "-c", parent_code, str(child_pid_path)], **options
+        )
+
+    frames = _frames(tmp_path, ("000001.jpg",))
+    config = tmp_path / "model.yaml"
+    checkpoint = tmp_path / "model.pt"
+    config.write_text("model", encoding="utf-8")
+    checkpoint.write_bytes(b"weights")
+    client = VideoSegmenterClient(
+        backend=SegmentationBackend.EDGETAM,
+        worker_prefix=(sys.executable,), model_config=config, checkpoint=checkpoint,
+        process_factory=factory,
+    )
+    token = CancellationToken()
+    timer = threading.Timer(1.0, token.cancel)
+    started = time.monotonic()
+    timer.start()
+    try:
+        with pytest.raises(CancelledError):
+            client.segment(frames, Prompt(0, 1, 1), tmp_path / "masks", lambda *_: None, token)
+    finally:
+        timer.cancel()
+
+    assert time.monotonic() - started < 5
+    child_pid = int(child_pid_path.read_text())
+    import ctypes
+
+    handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, child_pid)
+    if handle:
+        exit_code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        assert exit_code.value != 259

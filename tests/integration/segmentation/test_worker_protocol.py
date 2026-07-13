@@ -160,6 +160,15 @@ def test_probe_failure_still_clears_cuda(tmp_path: Path) -> None:
     assert cleaned == [True]
 
 
+def test_probe_rejects_predictor_without_video_api(tmp_path: Path) -> None:
+    config, checkpoint = _assets(tmp_path)
+    with pytest.raises(RuntimeError, match="API"):
+        probe_backend(
+            "edgetam", config, checkpoint, predictor_factory=lambda *_: object(),
+            cuda_cleanup=lambda: None,
+        )
+
+
 def test_safe_promotion_rolls_back_old_masks_on_failure(tmp_path: Path) -> None:
     frames = tmp_path / "frames"
     frames.mkdir()
@@ -187,6 +196,44 @@ def test_safe_promotion_rolls_back_old_masks_on_failure(tmp_path: Path) -> None:
         )
     assert (output / "old.png").read_bytes() == b"old"
     assert sorted(path.name for path in output.iterdir()) == ["old.png"]
+
+
+def test_wrong_size_mask_preserves_old_output_without_debris(tmp_path: Path) -> None:
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    Image.new("RGB", (4, 4)).save(frames / "000001.jpg")
+    output = tmp_path / "masks"
+    output.mkdir()
+    Image.new("L", (4, 4), 255).save(output / "000001.png")
+    config, checkpoint = _assets(tmp_path)
+    predictor = FakePredictor([0], [], np.ones((1, 1, 2, 2)))
+
+    with pytest.raises(ValueError, match="尺寸"):
+        run_segmentation(
+            backend="edgetam", frames_dir=frames, output_dir=output,
+            frame_index=0, point=(1, 1), config=config, checkpoint=checkpoint,
+            predictor_factory=lambda *_: predictor, emit=lambda _: None,
+        )
+
+    with Image.open(output / "000001.png") as old_mask:
+        assert old_mask.size == (4, 4)
+    assert not list(tmp_path.glob(".masks-*"))
+    assert not list(tmp_path.glob(".masks.backup-*"))
+
+
+def test_worker_rejects_boolean_predictor_index(tmp_path: Path) -> None:
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    for index in (1, 2):
+        Image.new("RGB", (2, 2)).save(frames / f"{index:06d}.jpg")
+    config, checkpoint = _assets(tmp_path)
+    predictor = FakePredictor([True, 0], [], np.ones((1, 1, 2, 2)))
+    with pytest.raises(ValueError, match="帧索引"):
+        run_segmentation(
+            backend="sam2", frames_dir=frames, output_dir=tmp_path / "masks",
+            frame_index=0, point=(1, 1), config=config, checkpoint=checkpoint,
+            predictor_factory=lambda *_: predictor, emit=lambda _: None,
+        )
 
 
 def test_invisibility_run_boundaries() -> None:
