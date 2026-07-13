@@ -6,6 +6,7 @@ import json
 import shutil
 import sys
 import tempfile
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -16,6 +17,7 @@ from PIL import Image
 from gs_video.domain.errors import UnsupportedMaterialError
 
 EventEmitter = Callable[[dict[str, object]], None]
+PathReplacer = Callable[[Path, Path], None]
 
 
 def build_predictor(config: Path, checkpoint: Path) -> object:
@@ -24,15 +26,45 @@ def build_predictor(config: Path, checkpoint: Path) -> object:
     return build_sam2_video_predictor(str(config), str(checkpoint))
 
 
+def _is_link(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    try:
+        return bool(path.lstat().st_file_attributes & 0x400)
+    except (AttributeError, OSError):
+        return False
+
+
+def _readable_regular_file(path: Path) -> bool:
+    if _is_link(path) or not path.is_file():
+        return False
+    try:
+        with path.open("rb") as stream:
+            stream.read(1)
+    except OSError:
+        return False
+    return True
+
+
 def _frames(frames_dir: Path) -> list[Path]:
+    if _is_link(frames_dir) or not frames_dir.is_dir():
+        raise ValueError("代理帧目录必须是非链接目录")
     candidates = [
         path for path in frames_dir.iterdir() if path.suffix.lower() in {".jpg", ".jpeg", ".png"}
     ]
     if any(not path.stem.isdigit() for path in candidates):
         raise ValueError("代理帧必须使用数字文件名")
+    if any(not _readable_regular_file(path) for path in candidates):
+        raise ValueError("代理帧必须是可读的非链接普通文件")
     candidates.sort(key=lambda path: int(path.stem))
     if len({int(path.stem) for path in candidates}) != len(candidates):
         raise ValueError("代理帧数字编号不能重复")
+    try:
+        for path in candidates:
+            with Image.open(path) as image:
+                image.verify()
+    except (OSError, ValueError) as exc:
+        raise ValueError("代理帧包含不可读图像") from exc
     return candidates
 
 
@@ -60,6 +92,45 @@ def _has_invisible_run(ratios: list[float]) -> bool:
     return False
 
 
+def _overlaps(first: Path, second: Path) -> bool:
+    first_resolved = first.resolve()
+    second_resolved = second.resolve()
+    return (
+        first_resolved == second_resolved
+        or first_resolved in second_resolved.parents
+        or second_resolved in first_resolved.parents
+    )
+
+
+def _replace(source: Path, destination: Path) -> None:
+    source.replace(destination)
+
+
+def _promote_staging(
+    staging: Path,
+    output_dir: Path,
+    replace_path: PathReplacer = _replace,
+) -> None:
+    backup: Path | None = None
+    if _is_link(output_dir):
+        raise ValueError("输出路径必须是非链接目录")
+    if output_dir.exists():
+        if not output_dir.is_dir():
+            raise ValueError("输出路径必须是非链接目录")
+        backup = output_dir.parent / f".{output_dir.name}.backup-{uuid.uuid4().hex}"
+        replace_path(output_dir, backup)
+    try:
+        replace_path(staging, output_dir)
+    except BaseException:
+        if backup is not None and backup.exists() and not output_dir.exists():
+            replace_path(backup, output_dir)
+        raise
+    if backup is not None and backup.exists():
+        if _is_link(backup) or not backup.is_dir() or backup.parent != output_dir.parent:
+            raise RuntimeError("拒绝清理不安全的输出备份")
+        shutil.rmtree(backup)
+
+
 def run_segmentation(
     *,
     backend: str,
@@ -71,14 +142,39 @@ def run_segmentation(
     checkpoint: Path,
     predictor_factory: Callable[[Path, Path], object] = build_predictor,
     emit: EventEmitter,
+    replace_path: PathReplacer = _replace,
 ) -> dict[str, object]:
     if backend not in {"edgetam", "sam2"}:
         raise ValueError("unknown segmentation backend")
     frames = _frames(frames_dir)
     if not frames:
         raise ValueError("未找到代理帧")
-    if not 0 <= frame_index < len(frames):
+    if type(frame_index) is not int or not 0 <= frame_index < len(frames):
         raise ValueError("提示帧索引越界")
+    if (
+        type(point[0]) is not int
+        or type(point[1]) is not int
+        or point[0] < 0
+        or point[1] < 0
+    ):
+        raise ValueError("提示点无效")
+    try:
+        with Image.open(frames[frame_index]) as image:
+            width, height = image.size
+            image.verify()
+    except (OSError, ValueError) as exc:
+        raise ValueError("提示帧不可读") from exc
+    if point[0] >= width or point[1] >= height:
+        raise ValueError("提示点超出图像边界")
+    for asset in (config, checkpoint):
+        if not _readable_regular_file(asset):
+            raise ValueError("模型配置或 checkpoint 不可读")
+    if _is_link(output_dir) or (output_dir.exists() and not output_dir.is_dir()):
+        raise ValueError("输出路径必须是非链接目录")
+    if _overlaps(output_dir, frames_dir) or any(
+        _overlaps(output_dir, asset) for asset in (config, checkpoint)
+    ):
+        raise ValueError("输出路径与输入或模型路径重叠")
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}-", dir=output_dir.parent))
     predictor: object | None = None
@@ -121,9 +217,7 @@ def run_segmentation(
             raise RuntimeError("predictor 未覆盖全部代理帧")
         if _has_invisible_run([ratios_by_index[index] for index in range(len(frames))]):
             raise UnsupportedMaterialError("主要人物长时间不可见")
-        if output_dir.exists():
-            shutil.rmtree(output_dir)
-        staging.replace(output_dir)
+        _promote_staging(staging, output_dir, replace_path)
         return {"type": "result", "mask_dir": output_dir.name, "frames": len(frames)}
     finally:
         inference_stack.close()
@@ -132,15 +226,14 @@ def run_segmentation(
         del predictor
 
 
-def _probe_builder() -> str:
-    from sam2.build_sam import build_sam2_video_predictor
+def _clear_cuda_cache() -> None:
+    try:
+        import torch
 
-    if not callable(build_sam2_video_predictor):
-        raise TypeError("build_sam2_video_predictor is not callable")
-    module = build_sam2_video_predictor.__module__
-    if not module.startswith("sam2."):
-        raise ImportError("unexpected predictor builder module")
-    return cast(str, module)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
 
 
 def probe_backend(
@@ -148,25 +241,30 @@ def probe_backend(
     config: Path,
     checkpoint: Path,
     *,
-    builder_probe: Callable[[], str] = _probe_builder,
+    predictor_factory: Callable[[Path, Path], object] = build_predictor,
+    cuda_cleanup: Callable[[], None] = _clear_cuda_cache,
 ) -> dict[str, object]:
     if backend not in {"edgetam", "sam2"}:
         raise ValueError("unknown segmentation backend")
     for path in (config, checkpoint):
-        if not path.is_file():
+        if not _readable_regular_file(path):
             raise FileNotFoundError(path)
-        with path.open("rb") as stream:
-            stream.read(1)
-    builder = builder_probe()
-    if not builder:
-        raise ImportError("predictor builder identity is empty")
-    return {
-        "type": "probe",
-        "backend": backend,
-        "config": str(config.resolve()),
-        "checkpoint": str(checkpoint.resolve()),
-        "builder": builder,
-    }
+    predictor: object | None = None
+    try:
+        predictor = predictor_factory(config, checkpoint)
+        identity = f"{type(predictor).__module__}.{type(predictor).__qualname__}"
+        if predictor is None or not identity:
+            raise RuntimeError("predictor build returned invalid object")
+        return {
+            "type": "probe",
+            "backend": backend,
+            "config": str(config.resolve()),
+            "checkpoint": str(checkpoint.resolve()),
+            "predictor": identity,
+        }
+    finally:
+        del predictor
+        cuda_cleanup()
 
 
 def _point(value: str) -> tuple[int, int]:
@@ -222,13 +320,7 @@ def main(argv: list[str] | None = None) -> int:
         _emit({"type": "error", "code": "system_error", "message": "分割 worker 失败"})
         return 1
     finally:
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except ImportError:
-            pass
+        _clear_cuda_cache()
 
 
 if __name__ == "__main__":

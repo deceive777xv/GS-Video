@@ -7,7 +7,7 @@ import pytest
 from PIL import Image
 
 from gs_video.domain.errors import UnsupportedMaterialError
-from gs_video.segmentation.worker import probe_backend, run_segmentation
+from gs_video.segmentation.worker import _has_invisible_run, probe_backend, run_segmentation
 
 
 class FakePredictor:
@@ -49,6 +49,14 @@ class TorchLike:
         return self.value
 
 
+def _assets(tmp_path: Path) -> tuple[Path, Path]:
+    config = tmp_path / "model.yaml"
+    checkpoint = tmp_path / "model.pt"
+    config.write_text("model", encoding="utf-8")
+    checkpoint.write_bytes(b"weights")
+    return config, checkpoint
+
+
 @pytest.mark.parametrize("backend", ["edgetam", "sam2"])
 @pytest.mark.parametrize(
     "logits", [np.ones((1, 1, 4, 5), dtype=np.float32), TorchLike(np.ones((1, 1, 4, 5)))]
@@ -62,6 +70,7 @@ def test_worker_covers_forward_then_only_missing_reverse_and_preserves_names(
         Image.new("RGB", (5, 4)).save(frames / name)
     predictor = FakePredictor([1, 2], [1, 0], logits)
     events: list[dict[str, object]] = []
+    config, checkpoint = _assets(tmp_path)
 
     result = run_segmentation(
         backend=backend,
@@ -69,8 +78,8 @@ def test_worker_covers_forward_then_only_missing_reverse_and_preserves_names(
         output_dir=tmp_path / "masks",
         frame_index=1,
         point=(3, 2),
-        config=tmp_path / "model.yaml",
-        checkpoint=tmp_path / "model.pt",
+        config=config,
+        checkpoint=checkpoint,
         predictor_factory=lambda *_: predictor,
         emit=events.append,
     )
@@ -90,10 +99,11 @@ def test_worker_rejects_non_numeric_or_duplicate_frame_stems(tmp_path: Path) -> 
     frames = tmp_path / "frames"
     frames.mkdir()
     Image.new("RGB", (2, 2)).save(frames / "frame.jpg")
+    config, checkpoint = _assets(tmp_path)
     with pytest.raises(ValueError, match="数字"):
         run_segmentation(
             backend="edgetam", frames_dir=frames, output_dir=tmp_path / "masks",
-            frame_index=0, point=(1, 1), config=tmp_path / "c", checkpoint=tmp_path / "k",
+            frame_index=0, point=(1, 1), config=config, checkpoint=checkpoint,
             predictor_factory=lambda *_: FakePredictor([], [], np.ones((1, 1, 2, 2))),
             emit=lambda _: None,
         )
@@ -105,10 +115,11 @@ def test_worker_detects_fifteen_consecutive_invisible_masks(tmp_path: Path) -> N
     for index in range(15):
         Image.new("RGB", (10, 10)).save(frames / f"{index + 1:06d}.jpg")
     predictor = FakePredictor(list(range(15)), [], np.zeros((1, 1, 10, 10)))
+    config, checkpoint = _assets(tmp_path)
     with pytest.raises(UnsupportedMaterialError, match="主要人物长时间不可见"):
         run_segmentation(
             backend="edgetam", frames_dir=frames, output_dir=tmp_path / "masks",
-            frame_index=0, point=(1, 1), config=tmp_path / "c", checkpoint=tmp_path / "k",
+            frame_index=0, point=(1, 1), config=config, checkpoint=checkpoint,
             predictor_factory=lambda *_: predictor, emit=lambda _: None,
         )
     assert not (tmp_path / "masks").exists()
@@ -119,11 +130,71 @@ def test_probe_reports_exact_backend_config_and_checkpoint(tmp_path: Path) -> No
     checkpoint = tmp_path / "model.pt"
     config.write_text("x", encoding="utf-8")
     checkpoint.write_bytes(b"x")
-    assert probe_backend("sam2", config, checkpoint, builder_probe=lambda: "sam2.build_sam") == {
+    predictor = FakePredictor([], [], np.ones((1, 1, 1, 1)))
+    cleaned: list[bool] = []
+    assert probe_backend(
+        "sam2", config, checkpoint,
+        predictor_factory=lambda actual_config, actual_checkpoint: (
+            predictor
+            if (actual_config, actual_checkpoint) == (config, checkpoint)
+            else pytest.fail("wrong assets")
+        ),
+        cuda_cleanup=lambda: cleaned.append(True),
+    ) == {
         "type": "probe", "backend": "sam2",
         "config": str(config.resolve()), "checkpoint": str(checkpoint.resolve()),
-        "builder": "sam2.build_sam",
+        "predictor": f"{type(predictor).__module__}.{type(predictor).__qualname__}",
     }
+    assert cleaned == [True]
+
+
+def test_probe_failure_still_clears_cuda(tmp_path: Path) -> None:
+    config, checkpoint = _assets(tmp_path)
+    cleaned: list[bool] = []
+    with pytest.raises(RuntimeError, match="build failed"):
+        probe_backend(
+            "edgetam", config, checkpoint,
+            predictor_factory=lambda *_: (_ for _ in ()).throw(RuntimeError("build failed")),
+            cuda_cleanup=lambda: cleaned.append(True),
+        )
+    assert cleaned == [True]
+
+
+def test_safe_promotion_rolls_back_old_masks_on_failure(tmp_path: Path) -> None:
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    Image.new("RGB", (4, 4)).save(frames / "000001.jpg")
+    output = tmp_path / "masks"
+    output.mkdir()
+    (output / "old.png").write_bytes(b"old")
+    config, checkpoint = _assets(tmp_path)
+    predictor = FakePredictor([0], [], np.ones((1, 1, 4, 4)))
+    calls = 0
+
+    def replace(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("promotion failed")
+        source.replace(destination)
+
+    with pytest.raises(OSError, match="promotion failed"):
+        run_segmentation(
+            backend="edgetam", frames_dir=frames, output_dir=output,
+            frame_index=0, point=(1, 1), config=config, checkpoint=checkpoint,
+            predictor_factory=lambda *_: predictor, emit=lambda _: None,
+            replace_path=replace,
+        )
+    assert (output / "old.png").read_bytes() == b"old"
+    assert sorted(path.name for path in output.iterdir()) == ["old.png"]
+
+
+def test_invisibility_run_boundaries() -> None:
+    below = 0.0009
+    assert not _has_invisible_run([below] * 14)
+    assert _has_invisible_run([below] * 15)
+    assert not _has_invisible_run([below] * 14 + [0.5] + [below] * 14)
+    assert not _has_invisible_run([0.001] * 15)
 
 
 @pytest.mark.gpu

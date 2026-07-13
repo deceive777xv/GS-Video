@@ -98,7 +98,7 @@ def test_doctor_checks_selected_segmentation_assets_and_probe(tmp_path: Path) ->
             json.dumps({
                 "type": "probe", "backend": "edgetam",
                 "config": str(config.resolve()), "checkpoint": str(checkpoint.resolve()),
-                "builder": "sam2.build_sam",
+                "predictor": "sam2.sam2_video_predictor.SAM2VideoPredictor",
             }) + "\n", "",
         )
 
@@ -146,8 +146,42 @@ def test_doctor_rejects_probe_identity_mismatch(tmp_path: Path) -> None:
             command, 0,
             json.dumps({
                 "type": "probe", "backend": "sam2", "config": str(config.resolve()),
-                "checkpoint": str(checkpoint.resolve()), "builder": "sam2.build_sam",
+                "checkpoint": str(checkpoint.resolve()),
+                "predictor": "sam2.sam2_video_predictor.SAM2VideoPredictor",
             }) + "\n", "",
         ),
     ).check()
     assert "segmentation_probe_failed" in [issue.code for issue in report.issues]
+
+
+def test_doctor_translates_wsl_probe_asset_arguments(tmp_path: Path) -> None:
+    config = tmp_path / "edgetam.yaml"
+    checkpoint = tmp_path / "edgetam.pt"
+    config.write_text("model", encoding="utf-8")
+    checkpoint.write_bytes(b"weights")
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        config_arg = command[command.index("--config") + 1]
+        checkpoint_arg = command[command.index("--checkpoint") + 1]
+        return subprocess.CompletedProcess(
+            command, 0,
+            json.dumps({
+                "type": "probe", "backend": "edgetam", "config": config_arg,
+                "checkpoint": checkpoint_arg,
+                "predictor": "sam2.sam2_video_predictor.SAM2VideoPredictor",
+            }) + "\n", "",
+        )
+
+    report = EnvironmentDoctor(
+        which=lambda name: f"C:/{name}.exe",
+        cuda_probe=lambda: (True, 8192),
+        segmentation_backend=SegmentationBackend.EDGETAM,
+        worker_prefix=("wsl.exe", "-d", "Ubuntu", "--", "/opt/edgetam/bin/python"),
+        model_config=config, checkpoint=checkpoint, process_runner=run,
+    ).check()
+
+    assert report.ready
+    assert commands[0][commands[0].index("--config") + 1].startswith("/mnt/c/")
+    assert commands[0][commands[0].index("--checkpoint") + 1].startswith("/mnt/c/")

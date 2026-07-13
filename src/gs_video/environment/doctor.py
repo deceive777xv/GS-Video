@@ -11,6 +11,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from gs_video.domain.contracts import SegmentationBackend
+from gs_video.segmentation.paths import worker_path
 
 
 class EnvironmentIssue(BaseModel):
@@ -101,12 +102,20 @@ class EnvironmentDoctor:
         assert self._segmentation_backend is not None
         assert self._model_config is not None
         assert self._checkpoint is not None
+        try:
+            config_arg = worker_path(self._model_config, self._worker_prefix)
+            checkpoint_arg = worker_path(self._checkpoint, self._worker_prefix)
+        except ValueError:
+            issues.append(
+                EnvironmentIssue(code="segmentation_path_invalid", message="分割 worker 路径无效")
+            )
+            return
         command = [
             *self._worker_prefix,
             "-m", "gs_video.segmentation.worker", "--probe",
             "--backend", self._segmentation_backend.value,
-            "--config", str(self._model_config),
-            "--checkpoint", str(self._checkpoint),
+            "--config", config_arg,
+            "--checkpoint", checkpoint_arg,
         ]
         options: dict[str, object] = {
             "capture_output": True, "text": True, "shell": False, "timeout": 30
@@ -119,16 +128,16 @@ class EnvironmentDoctor:
             payload = json.loads(lines[0]) if len(lines) == 1 else None
             expected = {
                 "type": "probe", "backend": self._segmentation_backend.value,
-                "config": str(self._model_config.resolve()),
-                "checkpoint": str(self._checkpoint.resolve()),
+                "config": config_arg,
+                "checkpoint": checkpoint_arg,
             }
             if (
                 completed.returncode != 0
                 or not isinstance(payload, dict)
-                or set(payload) != {*expected, "builder"}
+                or set(payload) != {*expected, "predictor"}
                 or any(payload[key] != value for key, value in expected.items())
-                or not isinstance(payload["builder"], str)
-                or not payload["builder"].startswith("sam2.")
+                or not isinstance(payload["predictor"], str)
+                or not payload["predictor"]
             ):
                 raise ValueError("probe mismatch")
         except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
