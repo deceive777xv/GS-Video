@@ -11,7 +11,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from gs_video.domain.contracts import SegmentationBackend
-from gs_video.segmentation.paths import worker_path
+from gs_video.segmentation.paths import has_reparse_component, worker_path
 
 
 class EnvironmentIssue(BaseModel):
@@ -60,7 +60,7 @@ class EnvironmentDoctor:
 
     @staticmethod
     def _readable_file(path: Path | None) -> bool:
-        if path is None or not path.is_file():
+        if path is None or has_reparse_component(path) or not path.is_file():
             return False
         try:
             with path.open("rb") as stream:

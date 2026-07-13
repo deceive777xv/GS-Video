@@ -3,6 +3,30 @@ from __future__ import annotations
 from pathlib import Path, PureWindowsPath
 
 
+def _is_reparse_leaf(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    try:
+        return bool(path.lstat().st_file_attributes & 0x400)
+    except (AttributeError, OSError):
+        return False
+
+
+def has_reparse_component(path: Path) -> bool:
+    absolute = path if path.is_absolute() else path.absolute()
+    parts = absolute.parts
+    if not parts:
+        return False
+    current = Path(parts[0])
+    if _is_reparse_leaf(current):
+        return True
+    for part in parts[1:]:
+        current /= part
+        if _is_reparse_leaf(current):
+            return True
+    return False
+
+
 def is_wsl_prefix(prefix: tuple[str, ...]) -> bool:
     return bool(prefix) and PureWindowsPath(prefix[0]).name.lower() in {"wsl", "wsl.exe"} and "--" in prefix
 

@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image
 
 from gs_video.domain.errors import UnsupportedMaterialError
+from gs_video.segmentation.paths import has_reparse_component
 
 EventEmitter = Callable[[dict[str, object]], None]
 PathReplacer = Callable[[Path, Path], None]
@@ -27,12 +28,7 @@ def build_predictor(config: Path, checkpoint: Path) -> object:
 
 
 def _is_link(path: Path) -> bool:
-    if path.is_symlink():
-        return True
-    try:
-        return bool(path.lstat().st_file_attributes & 0x400)
-    except (AttributeError, OSError):
-        return False
+    return has_reparse_component(path)
 
 
 def _readable_regular_file(path: Path) -> bool:
@@ -112,7 +108,7 @@ def _promote_staging(
     replace_path: PathReplacer = _replace,
 ) -> None:
     backup: Path | None = None
-    if _is_link(output_dir):
+    if _is_link(output_dir) or _is_link(output_dir.parent):
         raise ValueError("输出路径必须是非链接目录")
     if output_dir.exists():
         if not output_dir.is_dir():
@@ -126,7 +122,12 @@ def _promote_staging(
             replace_path(backup, output_dir)
         raise
     if backup is not None and backup.exists():
-        if _is_link(backup) or not backup.is_dir() or backup.parent != output_dir.parent:
+        if (
+            _is_link(backup)
+            or not backup.is_dir()
+            or backup.parent.absolute() != output_dir.parent.absolute()
+            or backup.parent.resolve() != output_dir.parent.resolve()
+        ):
             raise RuntimeError("拒绝清理不安全的输出备份")
         shutil.rmtree(backup)
 

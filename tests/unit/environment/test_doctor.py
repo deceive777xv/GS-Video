@@ -7,8 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from gs_video.environment.doctor import EnvironmentDoctor, probe_cuda
 from gs_video.domain.contracts import SegmentationBackend
+from gs_video.environment.doctor import EnvironmentDoctor, probe_cuda
+from gs_video.segmentation.paths import worker_path
 
 
 def test_doctor_reports_missing_commands_without_starting_gpu() -> None:
@@ -174,14 +175,16 @@ def test_doctor_translates_wsl_probe_asset_arguments(tmp_path: Path) -> None:
             }) + "\n", "",
         )
 
+    prefix = ("wsl.exe", "-d", "Ubuntu", "--", "/opt/edgetam/bin/python")
     report = EnvironmentDoctor(
         which=lambda name: f"C:/{name}.exe",
         cuda_probe=lambda: (True, 8192),
         segmentation_backend=SegmentationBackend.EDGETAM,
-        worker_prefix=("wsl.exe", "-d", "Ubuntu", "--", "/opt/edgetam/bin/python"),
+        worker_prefix=prefix,
         model_config=config, checkpoint=checkpoint, process_runner=run,
     ).check()
 
     assert report.ready
-    assert commands[0][commands[0].index("--config") + 1].startswith("/mnt/c/")
-    assert commands[0][commands[0].index("--checkpoint") + 1].startswith("/mnt/c/")
+    command = commands[0]
+    assert command[command.index("--config") + 1] == worker_path(config, prefix)
+    assert command[command.index("--checkpoint") + 1] == worker_path(checkpoint, prefix)

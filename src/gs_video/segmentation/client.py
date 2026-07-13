@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import signal
 import subprocess
 import threading
 from collections.abc import Callable, Sequence
@@ -12,10 +13,10 @@ from typing import Any, TextIO, cast
 from PIL import Image
 
 from gs_video.domain.contracts import MaskSequence, Prompt, SegmentationBackend
-from gs_video.domain.errors import CancelledError, GsVideoError, UnsupportedMaterialError
+from gs_video.domain.errors import GsVideoError, UnsupportedMaterialError
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
-from gs_video.segmentation.paths import worker_path
+from gs_video.segmentation.paths import has_reparse_component, worker_path
 
 ProcessFactory = Callable[..., Any]
 
@@ -61,7 +62,11 @@ class VideoSegmenterClient:
             "shell": False,
         }
         if os.name == "nt":
-            options["creationflags"] = subprocess.CREATE_NO_WINDOW
+            options["creationflags"] = (
+                subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            options["start_new_session"] = True
         return self._process_factory(self._command(frames_dir, output_dir, prompt), **options)
 
     @staticmethod
@@ -69,23 +74,61 @@ class VideoSegmenterClient:
         try:
             for line in stream:
                 target.put(line)
+        except (OSError, ValueError):
+            pass
         finally:
             target.put(None)
 
     @staticmethod
     def _stderr_reader(stream: TextIO, chunks: list[str]) -> None:
-        chunks.append(stream.read())
+        try:
+            chunks.append(stream.read())
+        except (OSError, ValueError):
+            return
 
     def _stop(self, process: Any) -> None:
         if process.poll() is None:
-            process.terminate()
+            if not self._terminate_process_tree(process, force=False):
+                process.terminate()
             try:
                 process.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
-                process.kill()
+                tree_killed = self._terminate_process_tree(process, force=True)
+                if not tree_killed or process.poll() is None:
+                    process.kill()
                 process.wait()
         else:
             process.wait()
+
+    @staticmethod
+    def _terminate_process_tree(process: Any, *, force: bool) -> bool:
+        pid = getattr(process, "pid", None)
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        try:
+            if os.name == "nt":
+                command = ["taskkill", "/PID", str(pid), "/T"]
+                if force:
+                    command.append("/F")
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    shell=False,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    timeout=5,
+                )
+                return completed.returncode == 0
+            else:
+                kill_process_group = getattr(os, "killpg", None)
+                if callable(kill_process_group):
+                    signal_name = "SIGKILL" if force else "SIGTERM"
+                    kill_process_group(pid, getattr(signal, signal_name, 9 if force else 15))
+                    return True
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return False
 
     def _write_stderr(self, chunks: list[str]) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -94,12 +137,49 @@ class VideoSegmenterClient:
 
     @staticmethod
     def _is_link(path: Path) -> bool:
-        if path.is_symlink():
-            return True
+        return has_reparse_component(path)
+
+    def _cleanup_process(
+        self,
+        process: Any,
+        threads: tuple[threading.Thread | None, threading.Thread | None],
+        stderr_chunks: list[str],
+    ) -> None:
+        truncated = False
         try:
-            return bool(path.lstat().st_file_attributes & 0x400)
-        except (AttributeError, OSError):
-            return False
+            if process.poll() is None:
+                self._stop(process)
+        except BaseException as exc:
+            truncated = True
+            stderr_chunks.append(f"\n[segmentation cleanup error: {exc}]\n")
+        live = [thread for thread in threads if thread is not None]
+        for thread in live:
+            thread.join(timeout=1.0)
+        if any(thread.is_alive() for thread in live):
+            truncated = True
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+            for thread in live:
+                thread.join(timeout=0.5)
+        else:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+        if any(thread.is_alive() for thread in live):
+            truncated = True
+        if truncated:
+            stderr_chunks.append("\n[segmentation worker 日志截断：继承的管道句柄未及时关闭]\n")
+        try:
+            self._write_stderr(stderr_chunks)
+        except OSError:
+            return
 
     @staticmethod
     def _overlaps(first: Path, second: Path) -> bool:
@@ -180,11 +260,7 @@ class VideoSegmenterClient:
             try:
                 return cast(int, process.wait(timeout=0.05))
             except subprocess.TimeoutExpired:
-                try:
-                    token.raise_if_cancelled()
-                except CancelledError:
-                    self._stop(process)
-                    raise
+                token.raise_if_cancelled()
 
     @staticmethod
     def _parse_event(line: str) -> dict[str, object]:
@@ -206,7 +282,7 @@ class VideoSegmenterClient:
 
     @staticmethod
     def _validate_result(
-        event: dict[str, object], output_dir: Path, expected_names: tuple[str, ...]
+        event: dict[str, object], output_dir: Path, expected_sizes: dict[str, tuple[int, int]]
     ) -> MaskSequence:
         mask_dir_value = event["mask_dir"]
         frames_value = event["frames"]
@@ -220,7 +296,7 @@ class VideoSegmenterClient:
         actual = advertised if advertised.is_absolute() else output_dir.parent / advertised
         if actual.resolve() != output_dir.resolve():
             raise GsVideoError("segmentation worker result 路径越界")
-        if frames_value != len(expected_names):
+        if frames_value != len(expected_sizes):
             raise GsVideoError("segmentation worker mask 数量不匹配")
         if not output_dir.is_dir() or VideoSegmenterClient._is_link(output_dir):
             raise GsVideoError("segmentation worker mask 输出目录无效")
@@ -232,15 +308,22 @@ class VideoSegmenterClient:
             for path in entries
         ):
             raise GsVideoError("segmentation worker mask 文件无效")
-        try:
-            for path in entries:
-                with path.open("rb") as stream:
-                    stream.read(1)
-        except OSError as exc:
-            raise GsVideoError("segmentation worker mask 文件不可读") from exc
         actual_names = tuple(sorted(path.name for path in entries))
+        expected_names = tuple(sorted(expected_sizes))
         if actual_names != expected_names:
             raise GsVideoError("segmentation worker mask 文件缺失或命名错误")
+        try:
+            for path in entries:
+                with Image.open(path) as image:
+                    image.load()
+                    if (
+                        image.format != "PNG"
+                        or image.mode != "L"
+                        or image.size != expected_sizes[path.name]
+                    ):
+                        raise GsVideoError("segmentation worker mask PNG 格式、模式或尺寸无效")
+        except (OSError, ValueError) as exc:
+            raise GsVideoError("segmentation worker mask PNG 不可读") from exc
         return MaskSequence(mask_dir=output_dir, frame_count=frames_value)
 
     def segment(
@@ -266,18 +349,16 @@ class VideoSegmenterClient:
         try:
             if process.stdout is None or process.stderr is None:
                 raise GsVideoError("segmentation worker 管道不可用")
-            stdout_thread = threading.Thread(target=self._reader, args=(process.stdout, lines))
+            stdout_thread = threading.Thread(
+                target=self._reader, args=(process.stdout, lines), daemon=True
+            )
             stderr_thread = threading.Thread(
-                target=self._stderr_reader, args=(process.stderr, stderr_chunks)
+                target=self._stderr_reader, args=(process.stderr, stderr_chunks), daemon=True
             )
             stdout_thread.start()
             stderr_thread.start()
             while True:
-                try:
-                    token.raise_if_cancelled()
-                except CancelledError:
-                    self._stop(process)
-                    raise
+                token.raise_if_cancelled()
                 try:
                     line = lines.get(timeout=0.05)
                 except queue.Empty:
@@ -327,18 +408,15 @@ class VideoSegmenterClient:
                 raise GsVideoError("segmentation worker result/exit 状态不匹配")
             if last_current != len(ordered):
                 raise GsVideoError("segmentation worker result 前 progress 未完成")
-            expected = tuple(sorted(f"{path.stem}.png" for path in ordered))
-            return self._validate_result(terminal, output_dir, expected)
+            expected_sizes: dict[str, tuple[int, int]] = {}
+            for path in ordered:
+                with Image.open(path) as image:
+                    expected_sizes[f"{path.stem}.png"] = image.size
+            return self._validate_result(terminal, output_dir, expected_sizes)
         finally:
-            if process.poll() is None:
-                self._stop(process)
-            if stdout_thread is not None:
-                stdout_thread.join()
-            if stderr_thread is not None:
-                stderr_thread.join()
-            elif process.stderr is not None:
-                stderr_chunks.append(process.stderr.read())
-            for stream in (process.stdout, process.stderr):
-                if stream is not None:
-                    stream.close()
-            self._write_stderr(stderr_chunks)
+            if stderr_thread is None and process.stderr is not None:
+                try:
+                    stderr_chunks.append(process.stderr.read())
+                except (OSError, ValueError):
+                    pass
+            self._cleanup_process(process, (stdout_thread, stderr_thread), stderr_chunks)

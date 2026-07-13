@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import subprocess
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,10 @@ def _frames(tmp_path: Path, names: tuple[str, ...] = ("000002.jpg", "000010.png"
     return result
 
 
+def _write_mask(path: Path, *, mode: str = "L", size: tuple[int, int] = (32, 32)) -> None:
+    Image.new(mode, size).save(path, format="PNG")
+
+
 def _client(tmp_path: Path, process: FakeProcess, **kwargs: Any) -> VideoSegmenterClient:
     config = tmp_path / "model.yaml"
     checkpoint = tmp_path / "model.pt"
@@ -73,7 +78,7 @@ def test_client_constructs_native_command_without_shell_and_parses_result(tmp_pa
     output = tmp_path / "masks"
     output.mkdir()
     for name in ("000002.png", "000010.png"):
-        (output / name).write_bytes(b"mask")
+        _write_mask(output / name)
     process = FakeProcess(
         [
             '{"type":"progress","current":1,"total":2}\n',
@@ -110,10 +115,11 @@ def test_client_preserves_wsl_prefix(tmp_path: Path) -> None:
     ])
     output = tmp_path / "masks"
     output.mkdir()
-    (output / "000001.png").write_bytes(b"mask")
+    _write_mask(output / "000001.png")
     calls: list[list[str]] = []
     client = _client(tmp_path, process)
-    client.worker_prefix = ("wsl.exe", "-d", "Ubuntu", "--", "/opt/edgetam/bin/python")
+    prefix = ("wsl.exe", "-d", "Ubuntu", "--", "/opt/edgetam/bin/python")
+    client.worker_prefix = prefix
     client._process_factory = lambda command, **_: (calls.append(command), process)[1]
     frames = _frames(tmp_path, ("000001.jpg",))
     client.segment(frames, Prompt(0, 1, 1), output, lambda *_: None, CancellationToken())
@@ -122,10 +128,14 @@ def test_client_preserves_wsl_prefix(tmp_path: Path) -> None:
         "wsl.exe", "-d", "Ubuntu", "--", "/opt/edgetam/bin/python", "-m",
         "gs_video.segmentation.worker",
     ]
-    assert command[command.index("--frames") + 1].startswith("/mnt/c/")
-    assert command[command.index("--output") + 1].startswith("/mnt/c/")
-    assert command[command.index("--config") + 1].startswith("/mnt/c/")
-    assert command[command.index("--checkpoint") + 1].startswith("/mnt/c/")
+    expected_paths = {
+        "--frames": worker_path(frames[0].parent, prefix),
+        "--output": worker_path(output, prefix),
+        "--config": worker_path(client.model_config, prefix),
+        "--checkpoint": worker_path(client.checkpoint, prefix),
+    }
+    for option, expected in expected_paths.items():
+        assert command[command.index(option) + 1] == expected
     assert "\\" not in " ".join(command)
 
 
@@ -153,7 +163,7 @@ def test_wsl_path_translation_rejects_relative_and_unc_paths() -> None:
 def test_client_rejects_malformed_protocol(tmp_path: Path, lines: list[str]) -> None:
     output = tmp_path / "masks"
     output.mkdir()
-    (output / "000001.png").write_bytes(b"mask")
+    _write_mask(output / "000001.png")
     with pytest.raises(GsVideoError, match="worker"):
         _client(tmp_path, FakeProcess(lines)).segment(
             _frames(tmp_path, ("000001.jpg",)), Prompt(0, 1, 1), output,
@@ -352,9 +362,114 @@ def test_client_rejects_terminal_exit_or_progress_mismatch(
 ) -> None:
     output = tmp_path / "masks"
     output.mkdir()
-    (output / "000001.png").write_bytes(b"mask")
+    _write_mask(output / "000001.png")
     with pytest.raises(GsVideoError):
         _client(tmp_path, FakeProcess(lines, returncode=returncode)).segment(
             _frames(tmp_path, ("000001.jpg",)), Prompt(0, 1, 1), output,
             lambda *_: None, CancellationToken(),
         )
+
+
+def test_client_rejects_corrupt_rgb_or_wrong_size_masks(tmp_path: Path) -> None:
+    frames = _frames(tmp_path, ("000001.jpg",))
+    variants: tuple[tuple[str, Callable[[Path], None]], ...] = (
+        ("corrupt", lambda path: path.write_bytes(b"not-png")),
+        ("rgb", lambda path: _write_mask(path, mode="RGB")),
+        ("wrong-size", lambda path: _write_mask(path, size=(16, 16))),
+    )
+    for name, write in variants:
+        output = tmp_path / name
+        output.mkdir()
+        write(output / "000001.png")
+        process = FakeProcess([
+            '{"type":"progress","current":1,"total":1}\n',
+            f'{{"type":"result","mask_dir":"{name}","frames":1}}\n',
+        ])
+        with pytest.raises(GsVideoError, match="mask"):
+            _client(tmp_path, process).segment(
+                frames, Prompt(0, 1, 1), output, lambda *_: None, CancellationToken()
+            )
+
+
+def test_client_rejects_symlinked_frame_ancestor_when_supported(tmp_path: Path) -> None:
+    real_frames = tmp_path / "real-frames"
+    real_frames.mkdir()
+    Image.new("RGB", (32, 32)).save(real_frames / "000001.jpg")
+    linked_frames = tmp_path / "linked-frames"
+    try:
+        linked_frames.symlink_to(real_frames, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are not available")
+    with pytest.raises(GsVideoError, match="链接"):
+        _client(tmp_path, FakeProcess([])).segment(
+            [linked_frames / "000001.jpg"], Prompt(0, 1, 1), tmp_path / "masks",
+            lambda *_: None, CancellationToken(),
+        )
+
+
+def test_client_cancellation_does_not_deadlock_on_inherited_pipe_handles(tmp_path: Path) -> None:
+    class HangingStream:
+        def __init__(self) -> None:
+            self.released = threading.Event()
+
+        def __iter__(self) -> "HangingStream":
+            return self
+
+        def __next__(self) -> str:
+            self.released.wait()
+            raise StopIteration
+
+        def read(self) -> str:
+            self.released.wait()
+            return ""
+
+        def close(self) -> None:
+            self.released.set()
+
+    process = FakeProcess([])
+    process.stdout = HangingStream()  # type: ignore[assignment]
+    process.stderr = HangingStream()  # type: ignore[assignment]
+    token = CancellationToken()
+    errors: list[BaseException] = []
+
+    def invoke() -> None:
+        try:
+            _client(tmp_path, process).segment(
+                _frames(tmp_path, ("000001.jpg",)), Prompt(0, 1, 1), tmp_path / "masks",
+                lambda *_: None, token,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=invoke, daemon=True)
+    thread.start()
+    token.cancel()
+    thread.join(timeout=3)
+    stuck = thread.is_alive()
+    process.stdout.close()
+    process.stderr.close()
+    thread.join(timeout=1)
+
+    assert not stuck
+    assert errors and isinstance(errors[0], CancelledError)
+    assert "截断" in (tmp_path / "logs" / "segmentation-worker.log").read_text(encoding="utf-8")
+
+
+def test_client_terminates_process_tree_before_parent_exits(tmp_path: Path) -> None:
+    process = FakeProcess([])
+    process.pid = 1234  # type: ignore[attr-defined]
+    client = _client(tmp_path, process)
+    tree_calls: list[bool] = []
+    client._terminate_process_tree = (  # type: ignore[method-assign]
+        lambda actual_process, *, force: tree_calls.append(force) or True
+    )
+    token = CancellationToken()
+    token.cancel()
+
+    with pytest.raises(CancelledError):
+        client.segment(
+            _frames(tmp_path, ("000001.jpg",)), Prompt(0, 1, 1), tmp_path / "masks",
+            lambda *_: None, token,
+        )
+
+    assert tree_calls == [False]
