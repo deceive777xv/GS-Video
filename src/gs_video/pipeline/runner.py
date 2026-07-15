@@ -10,6 +10,42 @@ from gs_video.pipeline.events import ProgressEmitter, discard_progress
 SaveProject = Callable[[Project], None]
 
 
+def _validated_dependencies(
+    stages: Mapping[StageName, Stage],
+    dependencies: Mapping[StageName, tuple[StageName, ...]] | None,
+) -> dict[StageName, tuple[StageName, ...]]:
+    graph = {} if dependencies is None else dict(dependencies)
+    registered = set(stages)
+
+    for name, required in graph.items():
+        for referenced in (name, *required):
+            if referenced not in registered:
+                raise ValueError(
+                    f"dependency graph references unregistered stage: {referenced.value}"
+                )
+
+    visiting: list[StageName] = []
+    visited: set[StageName] = set()
+
+    def visit(name: StageName) -> None:
+        if name in visiting:
+            start = visiting.index(name)
+            cycle = (*visiting[start:], name)
+            description = " -> ".join(stage.value for stage in cycle)
+            raise ValueError(f"dependency graph contains a cycle: {description}")
+        if name in visited:
+            return
+        visiting.append(name)
+        for dependency in graph.get(name, ()):
+            visit(dependency)
+        visiting.pop()
+        visited.add(name)
+
+    for name in stages:
+        visit(name)
+    return graph
+
+
 class PipelineRunner:
     def __init__(
         self,
@@ -20,14 +56,17 @@ class PipelineRunner:
         dependencies: Mapping[StageName, tuple[StageName, ...]] | None = None,
         reuse_succeeded: bool = False,
     ) -> None:
+        validated_dependencies = _validated_dependencies(stages, dependencies)
         self.project = project
-        self.stages = stages
+        self.stages = dict(stages)
         self.save = save
         self.emit = emit
-        self.dependencies = {} if dependencies is None else dependencies
+        self.dependencies = validated_dependencies
         self.reuse_succeeded = reuse_succeeded
 
     def run(self, name: StageName, token: CancellationToken) -> StageState:
+        if name not in self.stages:
+            raise ValueError(f"unregistered target stage: {name.value}")
         state = self.project.stages.setdefault(name, StageState())
         if self.reuse_succeeded and state.status is StageStatus.SUCCEEDED:
             return state

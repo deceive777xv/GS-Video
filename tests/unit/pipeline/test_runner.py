@@ -232,3 +232,85 @@ def test_runner_clears_stale_error_on_retry_and_success() -> None:
     assert state.status is StageStatus.SUCCEEDED
     assert state.error_code is None
     assert state.output_paths == [str(Path("renders/final.png"))]
+
+
+def test_runner_rejects_unregistered_target_without_mutating_or_saving() -> None:
+    project = project_with_prior_output()
+    before = project.model_dump_json()
+    saved, save = snapshots()
+    runner = PipelineRunner(
+        project,
+        {
+            StageName.RENDER: RecordingStage(
+                lambda project, token: StageResult((Path("renders/frame.png"),), "render-key")
+            )
+        },
+        save=save,
+    )
+
+    with pytest.raises(ValueError, match="unregistered target stage.*export"):
+        runner.run(StageName.EXPORT, CancellationToken())
+
+    assert saved == []
+    assert project.model_dump_json() == before
+
+
+@pytest.mark.parametrize(
+    "dependencies",
+    [
+        {StageName.EXPORT: (StageName.RENDER,)},
+        {StageName.RENDER: (StageName.EXPORT,)},
+    ],
+    ids=["unregistered-key", "unregistered-edge"],
+)
+def test_runner_rejects_dependency_reference_to_unregistered_stage_without_side_effects(
+    dependencies: dict[StageName, tuple[StageName, ...]],
+) -> None:
+    project = project_with_prior_output()
+    before = project.model_dump_json()
+    saved, save = snapshots()
+
+    with pytest.raises(ValueError, match="dependency graph.*unregistered stage.*export"):
+        PipelineRunner(
+            project,
+            {
+                StageName.RENDER: RecordingStage(
+                    lambda project, token: StageResult(
+                        (Path("renders/frame.png"),), "render-key"
+                    )
+                )
+            },
+            save=save,
+            dependencies=dependencies,
+        )
+
+    assert saved == []
+    assert project.model_dump_json() == before
+
+
+def test_runner_rejects_dependency_cycle_without_mutating_or_saving() -> None:
+    project = project_with_prior_output()
+    before = project.model_dump_json()
+    saved, save = snapshots()
+    stages = {
+        StageName.RENDER: RecordingStage(
+            lambda project, token: StageResult((Path("renders/frame.png"),), "render-key")
+        ),
+        StageName.EXPORT: RecordingStage(
+            lambda project, token: StageResult((Path("exports/video.mp4"),), "export-key")
+        ),
+    }
+
+    with pytest.raises(ValueError, match="dependency graph contains a cycle"):
+        PipelineRunner(
+            project,
+            stages,
+            save=save,
+            dependencies={
+                StageName.RENDER: (StageName.EXPORT,),
+                StageName.EXPORT: (StageName.RENDER,),
+            },
+        )
+
+    assert saved == []
+    assert project.model_dump_json() == before

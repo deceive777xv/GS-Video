@@ -136,10 +136,26 @@ def test_mvp_workflow_uses_final_render_cache_namespace() -> None:
     assert workflow.RenderCacheNamespace.FINAL != workflow.RenderCacheNamespace.PREVIEW
 
 
+def test_render_stage_passes_preview_cache_namespace_to_renderer() -> None:
+    calls: list[str] = []
+    namespaces: list[object] = []
+    stage = workflow.RenderStage(
+        RecordingRenderer(calls, namespaces),
+        workflow.RenderCacheNamespace.PREVIEW,
+    )
+
+    result = stage.execute(Project(name="preview"), CancellationToken(), lambda *_: None)
+
+    assert result.cache_key == "render-key"
+    assert calls == ["render"]
+    assert namespaces == [workflow.RenderCacheNamespace.PREVIEW]
+
+
 @pytest.mark.parametrize("cancel_solver", [False, True], ids=["failure", "cancellation"])
 def test_dependency_terminal_state_stops_downstream_stages(cancel_solver: bool) -> None:
     calls: list[str] = []
     project = Project(name="demo")
+    saved: list[Project] = []
     runner = workflow.build_mvp_workflow(
         fake_services(
             calls,
@@ -147,6 +163,7 @@ def test_dependency_terminal_state_stops_downstream_stages(cancel_solver: bool) 
             cancel_solver=cancel_solver,
         ),
         project,
+        save=lambda value: saved.append(value.model_copy(deep=True)),
     )
 
     result = runner.run(StageName.EXPORT, CancellationToken())
@@ -158,3 +175,20 @@ def test_dependency_terminal_state_stops_downstream_stages(cancel_solver: bool) 
     assert result.status is StageStatus.PENDING
     assert project.stages[StageName.MAP_TRAJECTORY].status is StageStatus.PENDING
     assert project.stages[StageName.RENDER].status is StageStatus.PENDING
+    assert saved
+    for snapshot in saved:
+        for name in (
+            StageName.MAP_TRAJECTORY,
+            StageName.RENDER,
+            StageName.COMPOSITE,
+            StageName.EXPORT,
+        ):
+            if name in snapshot.stages:
+                assert snapshot.stages[name].status is StageStatus.PENDING
+    for name in (
+        StageName.MAP_TRAJECTORY,
+        StageName.RENDER,
+        StageName.COMPOSITE,
+        StageName.EXPORT,
+    ):
+        assert saved[-1].stages[name].status is StageStatus.PENDING
