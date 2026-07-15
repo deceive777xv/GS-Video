@@ -2,23 +2,27 @@ from __future__ import annotations
 
 import json
 import os
-import re
+import stat
 import subprocess
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Mapping, NoReturn
+from typing import Any, Mapping, NoReturn, TextIO
 
 from PIL import Image, UnidentifiedImageError
 
 from gs_video.domain.errors import GsVideoError, RepairableError
+from gs_video.media.toolchain import MediaTools, resolve_media_tools
 from gs_video.segmentation.paths import has_reparse_component
 
 
 _PROBE_TIMEOUT_SECONDS = 30
 _EXPORT_TIMEOUT_SECONDS = 300
+_OWNERSHIP_ATTEMPTS = 8
+
+FileIdentity = tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,124 @@ class _OutputProbe:
     frame_count: int
     duration: Fraction
     has_audio: bool
+
+
+def _identity_from_stat(stat: os.stat_result) -> FileIdentity:
+    identity = (int(stat.st_dev), int(stat.st_ino))
+    if identity == (0, 0):
+        raise GsVideoError("文件系统未提供可验证的文件身份")
+    return identity
+
+
+def _path_identity(path: Path) -> FileIdentity:
+    try:
+        return _identity_from_stat(path.stat())
+    except OSError as exc:
+        raise GsVideoError(f"无法读取文件身份: {path}") from exc
+
+
+@dataclass
+class _LogSink:
+    path: Path
+    handle: TextIO
+    directory: Path
+    directory_identity: FileIdentity
+    file_identity: FileIdentity
+    closed: bool = False
+
+    def write(self, label: str, stderr: object) -> None:
+        if self.closed:
+            raise GsVideoError("导出诊断日志已关闭")
+        if isinstance(stderr, bytes):
+            text = stderr.decode("utf-8", errors="replace")
+        elif isinstance(stderr, str):
+            text = stderr
+        elif stderr is None:
+            text = ""
+        else:
+            text = str(stderr)
+        try:
+            self.handle.write(f"[{label}]\n{text}\n")
+            self.handle.flush()
+        except (OSError, ValueError) as exc:
+            raise GsVideoError("无法写入导出诊断日志") from exc
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        failure: OSError | ValueError | None = None
+        try:
+            self.handle.flush()
+            os.fsync(self.handle.fileno())
+        except (OSError, ValueError) as exc:
+            failure = exc
+        try:
+            self.handle.close()
+        except (OSError, ValueError) as exc:
+            if failure is None:
+                failure = exc
+        self.closed = True
+        if failure is not None:
+            raise GsVideoError("无法持久化导出诊断日志") from failure
+
+
+@dataclass
+class _OwnedStaging:
+    directory: Path
+    directory_identity: FileIdentity
+    file: Path
+    file_identity: FileIdentity | None = None
+
+    def verify_directory(self) -> None:
+        if (
+            has_reparse_component(self.directory)
+            or not self.directory.is_dir()
+            or _path_identity(self.directory) != self.directory_identity
+        ):
+            raise GsVideoError("暂存目录身份发生变化")
+
+    def record_file(self, protected: set[FileIdentity]) -> None:
+        self.verify_directory()
+        if has_reparse_component(self.file) or not self.file.is_file():
+            raise GsVideoError("ffmpeg 未生成普通的暂存 MP4 文件")
+        identity = _path_identity(self.file)
+        if identity in protected:
+            raise GsVideoError("暂存 MP4 与受保护输入或输出身份重叠")
+        self.file_identity = identity
+
+    def verify_file(self) -> None:
+        self.verify_directory()
+        if (
+            self.file_identity is None
+            or has_reparse_component(self.file)
+            or not self.file.is_file()
+            or _path_identity(self.file) != self.file_identity
+        ):
+            raise GsVideoError("暂存 MP4 身份发生变化")
+
+    def cleanup(self) -> None:
+        try:
+            self.verify_directory()
+        except GsVideoError:
+            return
+        if self.file.exists() or self.file.is_symlink():
+            if self.file_identity is None:
+                return
+            try:
+                if (
+                    has_reparse_component(self.file)
+                    or not self.file.is_file()
+                    or _path_identity(self.file) != self.file_identity
+                ):
+                    return
+                self.file.unlink()
+            except (GsVideoError, OSError):
+                return
+        try:
+            self.verify_directory()
+            self.directory.rmdir()
+        except (GsVideoError, OSError):
+            return
 
 
 def _validate_numbers(fps: object, frame_count: object) -> tuple[Fraction, int]:
@@ -72,8 +194,14 @@ def _validate_inventory(frames_dir: Path, frame_count: int) -> tuple[Path, tuple
         frame = directory / f"{index:06d}.png"
         if has_reparse_component(frame):
             raise RepairableError("帧文件不能是链接或重解析点")
-        if not frame.is_file():
+        try:
+            frame_stat = frame.stat()
+        except OSError as exc:
+            raise RepairableError(f"无法读取帧 {frame.name} 的文件状态") from exc
+        if not stat.S_ISREG(frame_stat.st_mode):
             raise RepairableError("帧清单只能包含普通 PNG 文件")
+        if frame_stat.st_nlink != 1:
+            raise RepairableError(f"帧 {frame.name} 不能是硬链接")
         try:
             with Image.open(frame) as image:
                 if image.format != "PNG":
@@ -96,7 +224,7 @@ def _validate_inventory(frames_dir: Path, frame_count: int) -> tuple[Path, tuple
     return directory, expected_size
 
 
-def _prepare_output(output: Path) -> tuple[Path, Path]:
+def _prepare_output(output: Path) -> Path:
     absolute = output.absolute()
     if not absolute.name or absolute == absolute.parent:
         raise RepairableError("输出路径无效")
@@ -110,32 +238,117 @@ def _prepare_output(output: Path) -> tuple[Path, Path]:
         raise RepairableError("输出路径不能包含链接或重解析点")
     if not absolute.parent.is_dir() or (absolute.exists() and not absolute.is_file()):
         raise RepairableError("输出必须是普通文件路径")
-    log_path = absolute.parent / f".{absolute.name}.export.log"
-    if has_reparse_component(log_path) or (log_path.exists() and not log_path.is_file()):
-        raise RepairableError("导出日志路径不能是链接或非普通文件")
-    return absolute, log_path
+    return absolute
 
 
-def _append_log(log_path: Path, label: str, stderr: object) -> None:
-    if has_reparse_component(log_path) or (log_path.exists() and not log_path.is_file()):
-        raise GsVideoError("导出日志路径变成了链接或非普通文件")
-    if isinstance(stderr, bytes):
-        text = stderr.decode("utf-8", errors="replace")
-    elif isinstance(stderr, str):
-        text = stderr
-    elif stderr is None:
-        text = ""
-    else:
-        text = str(stderr)
+def _protected_identities(
+    frames_dir: Path, source: Path, output: Path, frame_count: int
+) -> set[FileIdentity]:
+    paths = [source, *(frames_dir / f"{index:06d}.png" for index in range(1, frame_count + 1))]
+    if output.exists():
+        paths.append(output)
+    return {_path_identity(path) for path in paths}
+
+
+def _verify_owned_directory(path: Path, identity: FileIdentity, label: str) -> None:
+    if has_reparse_component(path) or not path.is_dir() or _path_identity(path) != identity:
+        raise GsVideoError(f"{label}身份发生变化")
+
+
+def _create_log_sink(output: Path, protected: set[FileIdentity]) -> _LogSink:
+    logs_dir = output.parent / ".gs-video-logs"
+    if has_reparse_component(output.parent) or has_reparse_component(logs_dir):
+        raise RepairableError("导出日志目录不能包含链接或重解析点")
     try:
-        with log_path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(f"[{label}]\n{text}\n")
+        logs_dir.mkdir(mode=0o700, exist_ok=False)
+    except FileExistsError:
+        if has_reparse_component(logs_dir) or not logs_dir.is_dir():
+            raise RepairableError("导出日志目录必须是普通目录")
     except OSError as exc:
-        raise GsVideoError("无法写入导出诊断日志") from exc
+        raise GsVideoError("无法创建导出日志目录") from exc
+    directory_identity = _path_identity(logs_dir)
+    _verify_owned_directory(logs_dir, directory_identity, "导出日志目录")
+
+    for _attempt in range(_OWNERSHIP_ATTEMPTS):
+        _verify_owned_directory(logs_dir, directory_identity, "导出日志目录")
+        path = logs_dir / f"export-{uuid.uuid4().hex}.log"
+        try:
+            handle = path.open("x", encoding="utf-8", newline="\n")
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise GsVideoError("无法独占创建导出日志") from exc
+        try:
+            file_identity: FileIdentity | None = None
+            file_identity = _identity_from_stat(os.fstat(handle.fileno()))
+            _verify_owned_directory(logs_dir, directory_identity, "导出日志目录")
+            if (
+                has_reparse_component(path)
+                or not path.is_file()
+                or _path_identity(path) != file_identity
+                or file_identity in protected
+            ):
+                raise GsVideoError("新建导出日志与受保护文件身份重叠或已被替换")
+            return _LogSink(
+                path=path,
+                handle=handle,
+                directory=logs_dir,
+                directory_identity=directory_identity,
+                file_identity=file_identity,
+            )
+        except BaseException:
+            handle.close()
+            try:
+                if (
+                    not has_reparse_component(path)
+                    and path.is_file()
+                    and file_identity is not None
+                    and _path_identity(path) == file_identity
+                    and file_identity not in protected
+                ):
+                    path.unlink()
+            except (GsVideoError, OSError):
+                pass
+            raise
+    raise GsVideoError("导出日志 UUID 冲突，无法独占创建日志")
+
+
+def _create_owned_staging(output: Path) -> _OwnedStaging:
+    prefix = f".{output.name}.staging-"
+    for _attempt in range(_OWNERSHIP_ATTEMPTS):
+        if has_reparse_component(output.parent) or not output.parent.is_dir():
+            raise GsVideoError("输出父目录在创建暂存目录前变得不安全")
+        directory = output.parent / f"{prefix}{uuid.uuid4().hex}"
+        try:
+            directory.mkdir(mode=0o700, exist_ok=False)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise GsVideoError("无法独占创建暂存目录") from exc
+        identity = _path_identity(directory)
+        try:
+            _verify_owned_directory(directory, identity, "暂存目录")
+        except BaseException:
+            try:
+                if directory.is_dir() and _path_identity(directory) == identity:
+                    directory.rmdir()
+            except (GsVideoError, OSError):
+                pass
+            raise
+        return _OwnedStaging(
+            directory=directory,
+            directory_identity=identity,
+            file=directory / "staging.mp4",
+        )
+    raise GsVideoError("暂存目录 UUID 冲突，无法独占创建 staging")
+
+
+def _append_log(log_sink: _LogSink, label: str, stderr: object) -> None:
+    log_sink.write(label, stderr)
 
 
 def _run_command(
-    command: list[str], *, timeout: int, label: str, log_path: Path
+    command: list[str], *, timeout: int, label: str, log_sink: _LogSink
 ) -> subprocess.CompletedProcess[str]:
     try:
         if os.name == "nt":
@@ -159,13 +372,17 @@ def _run_command(
             )
     except subprocess.TimeoutExpired as exc:
         _raise_command_error(
-            GsVideoError(f"{label} 超时"), exc, log_path=log_path, label=label, stderr=exc.stderr
+            GsVideoError(f"{label} 超时"),
+            exc,
+            log_sink=log_sink,
+            label=label,
+            stderr=exc.stderr,
         )
     except subprocess.CalledProcessError as exc:
         _raise_command_error(
             GsVideoError(f"{label} 执行失败"),
             exc,
-            log_path=log_path,
+            log_sink=log_sink,
             label=label,
             stderr=exc.stderr,
         )
@@ -173,11 +390,11 @@ def _run_command(
         _raise_command_error(
             GsVideoError(f"{label} 无法启动"),
             exc,
-            log_path=log_path,
+            log_sink=log_sink,
             label=label,
             stderr=str(exc),
         )
-    _append_log(log_path, label, completed.stderr)
+    _append_log(log_sink, label, completed.stderr)
     return completed
 
 
@@ -185,12 +402,12 @@ def _raise_command_error(
     error: GsVideoError,
     cause: BaseException,
     *,
-    log_path: Path,
+    log_sink: _LogSink,
     label: str,
     stderr: object,
 ) -> NoReturn:
     try:
-        _append_log(log_path, label, stderr)
+        _append_log(log_sink, label, stderr)
     except GsVideoError as log_error:
         error.add_note(f"diagnostic log write also failed: {log_error}")
     raise error from cause
@@ -215,9 +432,9 @@ def _streams(payload: Mapping[str, Any], *, label: str) -> list[Mapping[str, Any
     return raw_streams
 
 
-def _probe_source_audio(source: Path, log_path: Path) -> bool:
+def _probe_source_audio(source: Path, log_sink: _LogSink, tools: MediaTools) -> bool:
     command = [
-        "ffprobe",
+        str(tools.ffprobe),
         "-v",
         "error",
         "-show_entries",
@@ -227,7 +444,7 @@ def _probe_source_audio(source: Path, log_path: Path) -> bool:
         str(source),
     ]
     completed = _run_command(
-        command, timeout=_PROBE_TIMEOUT_SECONDS, label="ffprobe(source)", log_path=log_path
+        command, timeout=_PROBE_TIMEOUT_SECONDS, label="ffprobe(source)", log_sink=log_sink
     )
     streams = _streams(_load_probe_json(completed, label="源视频"), label="源视频")
     if not any(stream.get("codec_type") == "video" for stream in streams):
@@ -295,9 +512,9 @@ def _parse_output_probe(payload: Mapping[str, Any]) -> _OutputProbe:
     )
 
 
-def _probe_output(path: Path, log_path: Path) -> _OutputProbe:
+def _probe_output(path: Path, log_sink: _LogSink, tools: MediaTools) -> _OutputProbe:
     command = [
-        "ffprobe",
+        str(tools.ffprobe),
         "-v",
         "error",
         "-count_frames",
@@ -308,7 +525,7 @@ def _probe_output(path: Path, log_path: Path) -> _OutputProbe:
         str(path),
     ]
     completed = _run_command(
-        command, timeout=_PROBE_TIMEOUT_SECONDS, label="ffprobe(output)", log_path=log_path
+        command, timeout=_PROBE_TIMEOUT_SECONDS, label="ffprobe(output)", log_sink=log_sink
     )
     return _parse_output_probe(_load_probe_json(completed, label="导出文件"))
 
@@ -321,6 +538,7 @@ def _duration_argument(duration: Fraction) -> str:
 
 
 def _ffmpeg_command(
+    tools: MediaTools,
     frames_dir: Path,
     source_video: Path,
     fps: Fraction,
@@ -331,7 +549,7 @@ def _ffmpeg_command(
     rate = f"{fps.numerator}/{fps.denominator}"
     duration = _duration_argument(Fraction(frame_count, 1) / fps)
     command = [
-        "ffmpeg",
+        str(tools.ffmpeg),
         "-nostdin",
         "-y",
         "-framerate",
@@ -380,19 +598,6 @@ def _validate_output_overlap(frames_dir: Path, source_video: Path, output: Path)
         raise RepairableError("输出不能位于帧目录内部或等于帧目录")
 
 
-def _cleanup_staging(staging: Path, output: Path) -> None:
-    prefix = f".{output.name}.staging-"
-    if (
-        staging.parent != output.parent
-        or re.fullmatch(rf"{re.escape(prefix)}[0-9a-f]{{32}}\.mp4", staging.name) is None
-    ):
-        return
-    try:
-        staging.unlink(missing_ok=True)
-    except OSError:
-        return
-
-
 def export_mp4(
     frames_dir: Path,
     source_video: Path,
@@ -407,24 +612,41 @@ def export_mp4(
         raise RepairableError("libx264 yuv420p 要求 PNG 帧的宽度和高度都是偶数")
     source = _require_ordinary(Path(source_video), kind="源视频")
     _validate_output_overlap(frames, source, Path(output))
-    destination, log_path = _prepare_output(Path(output))
-    staging = destination.parent / (
-        f".{destination.name}.staging-{uuid.uuid4().hex}.mp4"
-    )
+    destination = _prepare_output(Path(output))
+    tools = resolve_media_tools()
+    protected = _protected_identities(frames, source, destination, frame_count)
+    log_sink = _create_log_sink(destination, protected)
+    staging: _OwnedStaging | None = None
+    primary_error: BaseException | None = None
     expected_duration = Fraction(frame_count, 1) / fps
     try:
-        has_audio = _probe_source_audio(source, log_path)
+        staging = _create_owned_staging(destination)
+        staging.verify_directory()
+        has_audio = _probe_source_audio(source, log_sink, tools)
+        staging.verify_directory()
         # Recheck the inventory after probing and immediately before FFmpeg opens the inputs.
         _validate_inventory(frames, frame_count)
-        _run_command(
-            _ffmpeg_command(frames, source, fps, frame_count, has_audio, staging),
-            timeout=_EXPORT_TIMEOUT_SECONDS,
-            label="ffmpeg",
-            log_path=log_path,
-        )
-        if has_reparse_component(staging) or not staging.is_file():
-            raise GsVideoError("ffmpeg 未生成普通的暂存 MP4 文件")
-        probe = _probe_output(staging, log_path)
+        staging.verify_directory()
+        try:
+            _run_command(
+                _ffmpeg_command(
+                    tools, frames, source, fps, frame_count, has_audio, staging.file
+                ),
+                timeout=_EXPORT_TIMEOUT_SECONDS,
+                label="ffmpeg",
+                log_sink=log_sink,
+            )
+        except BaseException as exc:
+            if staging.file.exists() or staging.file.is_symlink():
+                try:
+                    staging.record_file(protected | {log_sink.file_identity})
+                except GsVideoError as ownership_error:
+                    exc.add_note(f"staging ownership check also failed: {ownership_error}")
+            raise
+        staging.record_file(protected | {log_sink.file_identity})
+        staging.verify_file()
+        probe = _probe_output(staging.file, log_sink, tools)
+        staging.verify_file()
         if probe.frame_count != frame_count:
             raise GsVideoError(
                 f"导出视频帧数不匹配: expected {frame_count}, got {probe.frame_count}"
@@ -436,15 +658,29 @@ def export_mp4(
         if probe.has_audio != has_audio:
             raise GsVideoError("导出文件音轨存在性与源视频不一致")
         _assert_output_safe(destination)
-        if has_reparse_component(staging) or not staging.is_file():
-            raise GsVideoError("暂存 MP4 在发布前变得不安全")
+        staging.verify_file()
+        # Persist and close the sole log handle before publication. A log fsync/close
+        # failure therefore cannot leave a newly published output reported as failed.
+        log_sink.close()
+        _assert_output_safe(destination)
+        staging.verify_file()
         try:
-            os.replace(staging, destination)
+            os.replace(staging.file, destination)
         except OSError as exc:
             raise GsVideoError("无法原子发布已验证的 MP4") from exc
-    except BaseException:
-        _cleanup_staging(staging, destination)
+    except BaseException as exc:
+        primary_error = exc
         raise
+    finally:
+        if staging is not None:
+            staging.cleanup()
+        try:
+            log_sink.close()
+        except GsVideoError as log_error:
+            if primary_error is not None:
+                primary_error.add_note(f"diagnostic log close also failed: {log_error}")
+            else:
+                raise
     return ExportResult(
         output=destination,
         fps=fps,
