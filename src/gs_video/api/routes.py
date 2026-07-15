@@ -201,11 +201,12 @@ def build_router() -> APIRouter:
     @protected.get("/api/v1/bootstrap", response_model=BootstrapResponse)
     async def bootstrap(request: Request) -> BootstrapResponse:
         services = _services(request)
+        environment = await asyncio.to_thread(services.environment_doctor.check)
         return BootstrapResponse(
             api_version=API_VERSION,
             capabilities=("projects", "assets", "uploads", "tasks", "events"),
             project=_load_project(services.project_repository),
-            environment=services.environment_doctor.check(),
+            environment=environment,
         )
 
     @protected.get("/api/v1/projects/current", response_model=Project)

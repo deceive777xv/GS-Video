@@ -171,17 +171,25 @@ class LocalSecurityBoundary:
             ),
         )
 
-    @staticmethod
     async def _reject(
+        self,
         scope: Scope,
         receive: Receive,
         send: Send,
         status_code: int,
         envelope: ErrorEnvelope,
     ) -> None:
+        origin = Headers(scope=scope).get("origin")
+        response_headers: dict[str, str] = {}
+        if origin in self._settings.allowed_origins:
+            response_headers = {
+                "Access-Control-Allow-Origin": str(origin),
+                "Vary": "Origin",
+            }
         response = JSONResponse(
             status_code=status_code,
             content=envelope.model_dump(mode="json"),
+            headers=response_headers,
         )
         await response(scope, receive, send)
 

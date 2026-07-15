@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import secrets
 import tempfile
 from collections.abc import AsyncIterator
@@ -45,12 +46,17 @@ def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        await app.state.task_service.start()
         try:
+            await app.state.task_service.start()
             yield
         finally:
-            await app.state.task_service.cancel_all()
-            await app.state.services.worker_registry.terminate_all()
+            try:
+                await app.state.task_service.cancel_all()
+            finally:
+                try:
+                    await app.state.services.worker_registry.terminate_all()
+                finally:
+                    await asyncio.to_thread(app.state.upload_manager.close)
 
     app = FastAPI(
         title="GS Video local API",
@@ -147,13 +153,16 @@ def run_api(host: str, port: int) -> int:
             worker_registry=_NoopWorkerRegistry(),
         )
         app = create_app(settings, services)
-        uvicorn.run(
-            app,
-            host=settings.bind_host,
-            port=settings.port,
-            access_log=False,
-            log_config=None,
-        )
+        try:
+            uvicorn.run(
+                app,
+                host=settings.bind_host,
+                port=settings.port,
+                access_log=False,
+                log_config=None,
+            )
+        finally:
+            app.state.upload_manager.close()
     return 0
 
 

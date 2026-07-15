@@ -1,5 +1,7 @@
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
+from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
@@ -19,6 +21,17 @@ ORIGIN = "http://127.0.0.1:5173"
 
 class StaticDoctor:
     def check(self) -> EnvironmentReport:
+        return EnvironmentReport(ready=True, vram_mb=8192, issues=[])
+
+
+class BlockingDoctor:
+    def __init__(self) -> None:
+        self.started = Event()
+        self.release = Event()
+
+    def check(self) -> EnvironmentReport:
+        self.started.set()
+        assert self.release.wait(2)
         return EnvironmentReport(ready=True, vram_mb=8192, issues=[])
 
 
@@ -132,3 +145,43 @@ def test_local_asset_import_copies_into_project_source(
     assert not Path(body["path"]).is_absolute()
     project = api_client.get("/api/v1/projects/current", headers=auth_headers).json()
     assert project["source_video"] == body["path"]
+
+
+def test_blocked_environment_probe_does_not_stall_other_rest_requests(
+    tmp_path: Path,
+) -> None:
+    repository = ProjectRepository(tmp_path / "concurrent-project")
+    repository.save(repository.create("concurrent"))
+    doctor = BlockingDoctor()
+    services = ApiServices(
+        project_repository=repository,
+        environment_doctor=doctor,
+        pipeline_runner=SucceedingRunner(),
+        worker_registry=RecordingWorkerRegistry(),
+    )
+    settings = ApiSettings(
+        bind_host="127.0.0.1",
+        port=0,
+        session_token=TOKEN,
+        allowed_origins=(ORIGIN,),
+    )
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+
+    with TestClient(create_app(settings, services)) as client:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            bootstrap = executor.submit(
+                client.get, "/api/v1/bootstrap", headers=headers
+            )
+            assert doctor.started.wait(1)
+            health = executor.submit(client.get, "/healthz", headers=headers)
+            try:
+                health_response = health.result(timeout=0.5)
+            except FuturesTimeoutError:
+                health_response = None
+            finally:
+                doctor.release.set()
+            bootstrap_response = bootstrap.result(timeout=2)
+
+    assert health_response is not None
+    assert health_response.status_code == 200
+    assert bootstrap_response.status_code == 200
