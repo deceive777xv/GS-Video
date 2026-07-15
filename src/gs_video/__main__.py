@@ -1,8 +1,29 @@
 from __future__ import annotations
 
 import argparse
+from ipaddress import ip_address
 
 from gs_video.environment.doctor import EnvironmentDoctor
+
+
+def _loopback_host(value: str) -> str:
+    try:
+        address = ip_address(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("host must be an IP loopback address") from error
+    if not address.is_loopback:
+        raise argparse.ArgumentTypeError("host must be an IP loopback address")
+    return value
+
+
+def _port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("port must be an integer") from error
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 0 and 65535")
+    return port
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -10,8 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--doctor", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--serve", action="store_true")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", default=0, type=int)
+    parser.add_argument("--host", default="127.0.0.1", type=_loopback_host)
+    parser.add_argument("--port", default=0, type=_port)
     return parser
 
 
