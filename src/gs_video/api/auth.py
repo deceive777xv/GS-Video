@@ -12,6 +12,19 @@ from gs_video.api.schemas import ApiError, ApiSettings
 _bearer = HTTPBearer(auto_error=False)
 
 
+def valid_bearer_header(authorization: str | None, settings: ApiSettings) -> bool:
+    scheme, separator, credential = (authorization or "").partition(" ")
+    return (
+        separator == " "
+        and scheme.lower() == "bearer"
+        and bool(credential)
+        and secrets.compare_digest(
+            credential,
+            settings.session_token.get_secret_value(),
+        )
+    )
+
+
 def get_settings(request: Request) -> ApiSettings:
     return cast(ApiSettings, request.app.state.settings)
 
@@ -27,7 +40,10 @@ def require_session(
     valid = (
         credentials is not None
         and credentials.scheme.lower() == "bearer"
-        and secrets.compare_digest(credentials.credentials, settings.session_token)
+        and secrets.compare_digest(
+            credentials.credentials,
+            settings.session_token.get_secret_value(),
+        )
     )
     if not valid:
         raise ApiError(

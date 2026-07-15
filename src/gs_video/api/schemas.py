@@ -5,7 +5,7 @@ from ipaddress import ip_address
 from pathlib import Path, PurePath, PureWindowsPath
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from gs_video.domain.models import Project, StageName
 from gs_video.environment.doctor import EnvironmentReport
@@ -21,7 +21,7 @@ class StrictModel(BaseModel):
 class ApiSettings(StrictModel):
     bind_host: str
     port: int = Field(ge=0, le=65535)
-    session_token: str = Field(min_length=1)
+    session_token: SecretStr = Field(min_length=1, exclude=True, repr=False)
     allowed_origins: tuple[str, ...]
     event_window: int = Field(default=256, ge=1, le=4096)
     max_tasks: int = Field(default=128, ge=1, le=1024)
@@ -30,6 +30,8 @@ class ApiSettings(StrictModel):
     websocket_auth_timeout: float = Field(default=3.0, gt=0, le=3.0)
     shutdown_timeout: float = Field(default=5.0, gt=0, le=30.0)
     max_upload_size: int = Field(default=4 * 1024 * 1024 * 1024, ge=0)
+    max_json_body_size: int = Field(default=64 * 1024, ge=1024, le=1024 * 1024)
+    max_chunk_body_size: int = Field(default=1024 * 1024, ge=1024, le=16 * 1024 * 1024)
 
     @field_validator("bind_host")
     @classmethod

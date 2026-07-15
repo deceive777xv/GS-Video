@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import errno
 import hashlib
 import os
@@ -150,6 +151,45 @@ def _copy_bounded(source: Path, destination: Path, limit: int) -> tuple[int, str
     return size, digest.hexdigest()
 
 
+def _import_asset_sync(
+    services: ApiServices,
+    settings: ApiSettings,
+    asset: AssetImportRequest,
+) -> AssetResponse:
+    try:
+        source = Path(asset.path).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise ApiError(
+            400,
+            code="asset_unavailable",
+            category="filesystem",
+            message="The selected asset is unavailable.",
+        ) from error
+    if not source.is_file():
+        raise ApiError(
+            400,
+            code="asset_unavailable",
+            category="filesystem",
+            message="The selected asset is unavailable.",
+        )
+    destination = _confined_destination(
+        services.project_repository.root, "source", source.name
+    )
+    size, sha256 = _copy_bounded(source, destination, settings.max_upload_size)
+    relative = destination.relative_to(
+        services.project_repository.root.resolve()
+    ).as_posix()
+    project = _load_project(services.project_repository)
+    if asset.kind == AssetKind.SOURCE_VIDEO.value:
+        project.source_video = relative
+    else:
+        project.scene_ply = relative
+    services.project_repository.save(project)
+    return AssetResponse(
+        kind=asset.kind, path=relative, size=size, sha256=sha256
+    )
+
+
 def build_router() -> APIRouter:
     router = APIRouter()
     protected = APIRouter(dependencies=[Depends(require_session)])
@@ -189,34 +229,9 @@ def build_router() -> APIRouter:
     async def import_asset(request: Request, asset: AssetImportRequest) -> AssetResponse:
         services = _services(request)
         settings = _settings(request)
-        try:
-            source = Path(asset.path).expanduser().resolve(strict=True)
-        except OSError as error:
-            raise ApiError(
-                400,
-                code="asset_unavailable",
-                category="filesystem",
-                message="The selected asset is unavailable.",
-            ) from error
-        if not source.is_file():
-            raise ApiError(
-                400,
-                code="asset_unavailable",
-                category="filesystem",
-                message="The selected asset is unavailable.",
-            )
-        destination = _confined_destination(
-            services.project_repository.root, "source", source.name
+        return await asyncio.to_thread(
+            _import_asset_sync, services, settings, asset
         )
-        size, sha256 = _copy_bounded(source, destination, settings.max_upload_size)
-        relative = destination.relative_to(services.project_repository.root.resolve()).as_posix()
-        project = _load_project(services.project_repository)
-        if asset.kind == AssetKind.SOURCE_VIDEO.value:
-            project.source_video = relative
-        else:
-            project.scene_ply = relative
-        services.project_repository.save(project)
-        return AssetResponse(kind=asset.kind, path=relative, size=size, sha256=sha256)
 
     @protected.post(
         "/api/v1/tasks",
@@ -244,11 +259,11 @@ def build_router() -> APIRouter:
         status_code=status.HTTP_201_CREATED,
     )
     async def create_upload(request: Request, upload: UploadCreateRequest) -> UploadCreated:
-        return _upload_manager(request).create(upload)
+        return await asyncio.to_thread(_upload_manager(request).create, upload)
 
     @protected.get("/api/v1/uploads/{upload_id}", response_model=UploadStatus)
     async def get_upload(request: Request, upload_id: str) -> UploadStatus:
-        return _upload_manager(request).status(upload_id)
+        return await asyncio.to_thread(_upload_manager(request).status, upload_id)
 
     @protected.put("/api/v1/uploads/{upload_id}")
     async def reject_normalized_chunk_traversal(upload_id: str) -> None:
@@ -275,7 +290,9 @@ def build_router() -> APIRouter:
                 message="The upload chunk index is invalid.",
             )
         content = await read_bounded_body(request)
-        _upload_manager(request).put_chunk(upload_id, int(index), content)
+        await asyncio.to_thread(
+            _upload_manager(request).put_chunk, upload_id, int(index), content
+        )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @protected.post(
@@ -284,19 +301,23 @@ def build_router() -> APIRouter:
         status_code=status.HTTP_201_CREATED,
     )
     async def complete_upload(request: Request, upload_id: str) -> UploadComplete:
-        completed = _upload_manager(request).complete(upload_id)
         services = _services(request)
-        project = _load_project(services.project_repository)
-        project.source_video = completed.path
-        services.project_repository.save(project)
-        return completed
+
+        def persist(completed: UploadComplete) -> None:
+            project = _load_project(services.project_repository)
+            project.source_video = completed.path
+            services.project_repository.save(project)
+
+        return await asyncio.to_thread(
+            _upload_manager(request).complete, upload_id, persist
+        )
 
     @protected.delete(
         "/api/v1/uploads/{upload_id}",
         status_code=status.HTTP_204_NO_CONTENT,
     )
     async def cancel_upload(request: Request, upload_id: str) -> Response:
-        _upload_manager(request).cancel(upload_id)
+        await asyncio.to_thread(_upload_manager(request).cancel, upload_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @router.websocket("/api/v1/events")

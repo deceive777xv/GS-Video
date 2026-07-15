@@ -11,9 +11,11 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import SecretStr
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from gs_video.api.events import EventBus, TaskService
+from gs_video.api.middleware import LocalSecurityBoundary
 from gs_video.api.routes import ApiServices, build_router
 from gs_video.api.schemas import ApiError, ApiSettings, ErrorEnvelope
 from gs_video.api.uploads import UploadManager
@@ -70,6 +72,7 @@ def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         allow_headers=["Authorization", "Content-Type"],
     )
+    app.add_middleware(LocalSecurityBoundary, settings=settings)
 
     @app.exception_handler(ApiError)
     async def api_error_handler(request: Request, error: ApiError) -> JSONResponse:
@@ -130,7 +133,7 @@ def run_api(host: str, port: int) -> int:
     settings = ApiSettings(
         bind_host=host,
         port=port,
-        session_token=secrets.token_urlsafe(32),
+        session_token=SecretStr(secrets.token_urlsafe(32)),
         allowed_origins=(),
     )
     with tempfile.TemporaryDirectory(prefix="gs-video-api-") as temporary:
