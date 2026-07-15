@@ -17,14 +17,26 @@ class PipelineRunner:
         stages: Mapping[StageName, Stage],
         save: SaveProject,
         emit: ProgressEmitter = discard_progress,
+        dependencies: Mapping[StageName, tuple[StageName, ...]] | None = None,
+        reuse_succeeded: bool = False,
     ) -> None:
         self.project = project
         self.stages = stages
         self.save = save
         self.emit = emit
+        self.dependencies = {} if dependencies is None else dependencies
+        self.reuse_succeeded = reuse_succeeded
 
     def run(self, name: StageName, token: CancellationToken) -> StageState:
         state = self.project.stages.setdefault(name, StageState())
+        if self.reuse_succeeded and state.status is StageStatus.SUCCEEDED:
+            return state
+
+        for dependency in self.dependencies.get(name, ()):
+            dependency_state = self.run(dependency, token)
+            if dependency_state.status is not StageStatus.SUCCEEDED:
+                return state
+
         state.status = StageStatus.RUNNING
         state.cache_key = None
         state.error_code = None
