@@ -8,3 +8,7 @@ __pycache__/
 tests/.assets/
 *.partial
 acceptance-report.json
+node_modules/
+/apps/web/dist/
+/apps/web/coverage/
+/apps/web/.vite/

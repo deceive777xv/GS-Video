@@ -1,0 +1,18 @@
+{
+  "name": "gs-video",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "npm@11.12.1",
+  "engines": {
+    "node": ">=24.14.0 <25",
+    "npm": ">=11.12.1 <12"
+  },
+  "workspaces": [
+    "apps/web"
+  ],
+  "scripts": {
+    "build:web": "npm run build --workspace @gs-video/web",
+    "test:web": "vitest run --config apps/web/vitest.config.ts",
+    "typecheck:web": "npm run typecheck --workspace @gs-video/web"
+  }
+}

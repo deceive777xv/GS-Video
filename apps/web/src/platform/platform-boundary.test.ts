@@ -1,0 +1,177 @@
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { readdir, readFile } from 'node:fs/promises'
+import path from 'node:path'
+import { createElement } from 'react'
+import { describe, expect, it, vi } from 'vitest'
+
+import {
+  BrowserCompositionRoot,
+  TauriCompositionRoot,
+} from '../composition-root'
+import type { BackendClient } from '../api/backend-client'
+import { BrowserPlatformBridge } from './browser-platform-bridge'
+import { TauriPlatformBridge } from './tauri-platform-bridge'
+
+const fakeClient = (): BackendClient => ({
+  bootstrap: vi.fn().mockResolvedValue({}),
+  importLocalPath: vi.fn().mockResolvedValue({
+    kind: 'source_video',
+    path: 'source/video.mp4',
+    size: 42,
+    sha256: 'a'.repeat(64),
+  }),
+  createUpload: vi.fn(),
+  putUploadChunk: vi.fn(),
+  getProject: vi.fn(),
+  updateProject: vi.fn(),
+  startTask: vi.fn(),
+  getTask: vi.fn(),
+  cancelTask: vi.fn(),
+})
+
+async function findImports(
+  directory: URL,
+  forbidden: RegExp,
+): Promise<string[]> {
+  const root = path.normalize(directory.pathname.replace(/^\/(\w:)/, '$1'))
+  const matches: string[] = []
+  const visit = async (current: string): Promise<void> => {
+    let entries
+    try {
+      entries = await readdir(current, { withFileTypes: true })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+      throw error
+    }
+    await Promise.all(
+      entries.map(async (entry) => {
+        const target = path.join(current, entry.name)
+        if (entry.isDirectory()) return visit(target)
+        if (!/\.[cm]?[jt]sx?$/.test(entry.name)) return
+        const contents = await readFile(target, 'utf8')
+        for (const match of contents.matchAll(/(?:from\s+|import\s*\()(['"])([^'"]+)\1/g)) {
+          if (forbidden.test(match[2] ?? '')) matches.push(target)
+          forbidden.lastIndex = 0
+        }
+      }),
+    )
+  }
+  await visit(root)
+  return matches
+}
+
+describe('platform boundary', () => {
+  it('keeps tauri imports outside business features', async () => {
+    const forbidden = await findImports(
+      new URL('../features', import.meta.url),
+      /^@tauri-apps\//,
+    )
+    expect(forbidden).toEqual([])
+  })
+
+  it('imports a selected desktop path through BackendClient', async () => {
+    const client = fakeClient()
+    const bridge = new TauriPlatformBridge(client, {
+      loadDialog: async () => ({
+        open: vi.fn().mockResolvedValue('C:\\media\\clip.mp4'),
+        save: vi.fn(),
+      }),
+      loadOpener: async () => ({ openUrl: vi.fn(), revealItemInDir: vi.fn() }),
+    })
+
+    const picked = await bridge.pickInputFile({
+      kind: 'source_video',
+      extensions: ['mp4'],
+    })
+
+    expect(client.importLocalPath).toHaveBeenCalledWith(
+      'source_video',
+      'C:\\media\\clip.mp4',
+    )
+    expect(picked).toMatchObject({ kind: 'local-asset' })
+  })
+
+  it('downloads browser exports with a temporary object URL', async () => {
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, 'click')
+      .mockImplementation(() => undefined)
+    const createObjectURL = vi
+      .spyOn(URL, 'createObjectURL')
+      .mockReturnValue('blob:export')
+    const revokeObjectURL = vi
+      .spyOn(URL, 'revokeObjectURL')
+      .mockImplementation(() => undefined)
+    const bridge = new BrowserPlatformBridge()
+
+    await bridge.saveExport('result.mp4', {
+      kind: 'browser-download',
+      blob: new Blob(['video']),
+    })
+
+    expect(createObjectURL).toHaveBeenCalledOnce()
+    expect(click).toHaveBeenCalledOnce()
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:export')
+  })
+})
+
+describe('browser and Tauri composition roots', () => {
+  it('connects from a browser page and clears the session token input', async () => {
+    const client = fakeClient()
+    const createClient = vi.fn(() => client)
+    const user = userEvent.setup()
+    const storage = vi.spyOn(Storage.prototype, 'setItem')
+
+    render(createElement(BrowserCompositionRoot, { createClient }))
+    const port = screen.getByRole('textbox', { name: 'Local API port' })
+    const token = screen.getByLabelText('Session token') as HTMLInputElement
+    await user.type(port, '49152')
+    await user.type(token, 'one-time-secret')
+    await user.click(screen.getByRole('button', { name: 'Connect' }))
+
+    await screen.findByText('Connected to local service')
+    expect(createClient).toHaveBeenCalledWith({
+      origin: 'http://127.0.0.1:49152',
+      token: 'one-time-secret',
+    })
+    expect(token.value).toBe('')
+    expect(storage).not.toHaveBeenCalled()
+  })
+
+  it('keeps the connection page visible when bootstrap fails', async () => {
+    const client = fakeClient()
+    vi.mocked(client.bootstrap).mockRejectedValue(new Error('offline'))
+
+    render(createElement(BrowserCompositionRoot, { createClient: () => client }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Local API port' }), {
+      target: { value: '49152' },
+    })
+    fireEvent.change(screen.getByLabelText('Session token'), {
+      target: { value: 'secret' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+
+    await screen.findByRole('alert')
+    expect(screen.getByRole('button', { name: 'Connect' })).toBeEnabled()
+  })
+
+  it('uses injected in-memory configuration without showing the connection page', async () => {
+    const client = fakeClient()
+    const createClient = vi.fn(() => client)
+
+    render(
+      createElement(TauriCompositionRoot, {
+        session: {
+          origin: 'http://127.0.0.1:49152',
+          token: 'injected-secret',
+        },
+        createClient,
+      }),
+    )
+
+    await waitFor(() => expect(client.bootstrap).toHaveBeenCalledOnce())
+    expect(screen.queryByRole('button', { name: 'Connect' })).toBeNull()
+    expect(screen.queryByText('injected-secret')).toBeNull()
+    expect(await screen.findByText('Connected to local service')).toBeVisible()
+  })
+})
