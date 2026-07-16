@@ -31,7 +31,95 @@ export interface ProjectDto {
   source_video: string | null
   scene_ply: string | null
   stages: Partial<Record<StageName, StageStateDto>>
+  workflow: WorkflowDto
 }
+
+export interface VideoSummaryDto {
+  filename: string
+  size: number
+  sha256: string
+  width: number
+  height: number
+  duration_seconds: number
+  fps: string
+  has_audio: boolean
+  frame_count: number | null
+}
+
+export interface SceneSummaryDto {
+  filename: string
+  size: number
+  sha256: string
+  gaussian_count: number
+  estimated_vram_mb: number
+}
+
+export interface SubjectPromptDto {
+  frame_index: number
+  x: number
+  y: number
+}
+
+export interface CameraInput {
+  target: [number, number, number]
+  distance: number
+  yaw: number
+  pitch: number
+  fov_y_degrees: number
+}
+
+export interface CameraDto extends CameraInput {
+  revision: number
+}
+
+export interface FootPointDto {
+  image: [number, number]
+  world: [number, number, number]
+  camera_revision: number
+  pick_buffer_revision: number
+}
+
+export interface PreviewDto {
+  artifact_id: string
+  artifact_size: number
+  artifact_sha256: string
+  generation: number
+  width: number
+  height: number
+  camera_revision: number
+  pick_buffer_revision: number
+}
+
+export interface ExportResultDto {
+  artifact_id: string
+  filename: string
+  size: number
+  sha256: string
+  duration_seconds: number
+  fps: string
+  frame_count: number
+  has_audio: boolean
+  verified: boolean
+}
+
+export interface WorkflowDto {
+  source_summary: VideoSummaryDto | null
+  scene_summary: SceneSummaryDto | null
+  subject_prompt: SubjectPromptDto | null
+  target_camera: CameraDto | null
+  confirmed_camera_revision: number | null
+  foot_point: FootPointDto | null
+  motion_scale: number
+  preview_height: number
+  active_task_id: string | null
+  preview: PreviewDto | null
+  export_result: ExportResultDto | null
+}
+
+export type VerifiedExportDto = Omit<
+  ExportResultDto,
+  'sha256'
+>
 
 export interface EnvironmentIssueDto {
   code: string
@@ -54,6 +142,9 @@ export interface BootstrapDto {
 
 export interface ProjectPatch {
   name?: string
+  subject_prompt?: SubjectPromptDto | null
+  motion_scale?: number
+  preview_height?: number
 }
 
 export interface AssetDto {
@@ -64,6 +155,7 @@ export interface AssetDto {
 }
 
 export interface UploadInit {
+  kind: AssetKind
   filename: string
   mime_type: string
   total_size: number
@@ -73,6 +165,43 @@ export interface UploadInit {
 export interface UploadSessionDto {
   id: string
   chunk_size: number
+}
+
+export interface UploadStatusDto extends UploadSessionDto {
+  kind: AssetKind
+  filename: string
+  total_size: number
+  uploaded_chunks: number[]
+}
+
+export interface UploadCompleteDto {
+  path: string
+  kind: AssetKind
+  size: number
+  sha256: string
+}
+
+export interface PreviewRequest {
+  generation: number
+  width: number
+  height: number
+  camera: CameraInput
+}
+
+export interface PreviewFrameDto {
+  artifact_id: string
+  generation: number
+  width: number
+  height: number
+  camera_revision: number
+  pick_buffer_revision: number
+}
+
+export interface PickRequest {
+  x: number
+  y: number
+  camera_revision: number
+  pick_buffer_revision: number
 }
 
 export interface TaskDto {

@@ -5,7 +5,13 @@ import pytest
 
 from gs_video.domain.contracts import StageResult
 from gs_video.domain.errors import GsVideoError, RepairableError, UnsupportedMaterialError
-from gs_video.domain.models import Project, StageName, StageState, StageStatus
+from gs_video.domain.models import (
+    Project,
+    StageName,
+    StageState,
+    StageStatus,
+    SubjectPromptState,
+)
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
 from gs_video.pipeline.runner import PipelineRunner
@@ -155,6 +161,36 @@ def test_runner_registers_outputs_only_after_stage_returns_successfully() -> Non
     assert state.cache_key == "render-key"
     assert state.output_paths == [str(Path("renders/a.png")), str(Path("renders/b.png"))]
     assert state.error_code is None
+
+
+def test_stage_persistence_merges_into_latest_project_authority() -> None:
+    stale_runner_project = project_with_prior_output()
+    authoritative = stale_runner_project.model_copy(deep=True)
+
+    def persist_stage(name: StageName, state: StageState) -> Project:
+        authoritative.stages[name] = state.model_copy(deep=True)
+        return authoritative.model_copy(deep=True)
+
+    def patch_while_running(project: Project, token: CancellationToken) -> StageResult:
+        del project, token
+        authoritative.workflow.subject_prompt = SubjectPromptState(
+            frame_index=4, x=100, y=120
+        )
+        return StageResult((Path("renders/final.png"),), "render-key")
+
+    runner = PipelineRunner(
+        stale_runner_project,
+        {StageName.RENDER: RecordingStage(patch_while_running)},
+        save=lambda project: None,
+        persist_stage=persist_stage,
+    )
+
+    runner.run(StageName.RENDER, CancellationToken())
+
+    assert authoritative.workflow.subject_prompt == SubjectPromptState(
+        frame_index=4, x=100, y=120
+    )
+    assert authoritative.stages[StageName.RENDER].status is StageStatus.SUCCEEDED
 
 
 @pytest.mark.parametrize(

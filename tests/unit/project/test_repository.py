@@ -5,7 +5,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from gs_video.domain.models import Project, StageName, StageState
+from gs_video.domain.models import (
+    CameraPose,
+    Project,
+    StageName,
+    StageState,
+    SubjectPromptState,
+)
 from gs_video.project.repository import ProjectRepository
 
 
@@ -41,7 +47,7 @@ def test_repository_round_trips_project(tmp_path: Path) -> None:
 
     assert loaded == project
     assert loaded.project_id == project.project_id
-    assert loaded.schema_version == 1
+    assert loaded.schema_version == 2
     assert (tmp_path / "project.json").exists()
 
 
@@ -90,3 +96,25 @@ def test_save_replaces_project_with_complete_valid_json(
     assert observations == [(tmp_path / "project.json.tmp", tmp_path / "project.json")]
     assert json.loads(repo.path.read_text(encoding="utf-8"))["name"] == "replacement"
     assert not (tmp_path / "project.json.tmp").exists()
+
+
+def test_repository_round_trips_workflow_authority(tmp_path: Path) -> None:
+    repo = ProjectRepository(tmp_path)
+    project = repo.create("workflow")
+    project.workflow.subject_prompt = SubjectPromptState(
+        frame_index=12, x=100, y=120
+    )
+    project.workflow.target_camera = CameraPose(
+        target=(0.0, 0.0, 0.0),
+        distance=4.0,
+        yaw=20.0,
+        pitch=-5.0,
+        fov_y_degrees=48.0,
+        revision=3,
+    )
+
+    repo.save(project)
+
+    loaded = repo.load()
+    assert loaded.workflow.subject_prompt == project.workflow.subject_prompt
+    assert loaded.workflow.target_camera == project.workflow.target_camera

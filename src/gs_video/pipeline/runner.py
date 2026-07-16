@@ -8,6 +8,7 @@ from gs_video.pipeline.events import ProgressEmitter, discard_progress
 
 
 SaveProject = Callable[[Project], None]
+PersistStage = Callable[[StageName, StageState], Project]
 
 
 def _validated_dependencies(
@@ -55,6 +56,7 @@ class PipelineRunner:
         emit: ProgressEmitter = discard_progress,
         dependencies: Mapping[StageName, tuple[StageName, ...]] | None = None,
         reuse_succeeded: bool = False,
+        persist_stage: PersistStage | None = None,
     ) -> None:
         validated_dependencies = _validated_dependencies(stages, dependencies)
         self.project = project
@@ -63,6 +65,14 @@ class PipelineRunner:
         self.emit = emit
         self.dependencies = validated_dependencies
         self.reuse_succeeded = reuse_succeeded
+        self.persist_stage = persist_stage
+
+    def _persist(self, name: StageName, state: StageState) -> StageState:
+        if self.persist_stage is None:
+            self.save(self.project)
+            return state
+        self.project = self.persist_stage(name, state)
+        return self.project.stages[name]
 
     def run(self, name: StageName, token: CancellationToken) -> StageState:
         if name not in self.stages:
@@ -79,7 +89,7 @@ class PipelineRunner:
         state.status = StageStatus.RUNNING
         state.cache_key = None
         state.error_code = None
-        self.save(self.project)
+        state = self._persist(name, state)
 
         try:
             token.raise_if_cancelled()
@@ -94,5 +104,5 @@ class PipelineRunner:
             state.status = StageStatus.FAILED
             state.error_code = error.code
 
-        self.save(self.project)
+        state = self._persist(name, state)
         return state

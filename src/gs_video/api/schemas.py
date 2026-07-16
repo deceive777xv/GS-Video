@@ -30,6 +30,9 @@ class ApiSettings(StrictModel):
     websocket_auth_timeout: float = Field(default=3.0, gt=0, le=3.0)
     shutdown_timeout: float = Field(default=5.0, gt=0, le=30.0)
     max_upload_size: int = Field(default=4 * 1024 * 1024 * 1024, ge=0)
+    max_artifact_response_size: int = Field(
+        default=512 * 1024 * 1024, ge=1024, le=1024 * 1024 * 1024
+    )
     max_json_body_size: int = Field(default=64 * 1024, ge=1024, le=1024 * 1024)
     max_chunk_body_size: int = Field(default=1024 * 1024, ge=1024, le=16 * 1024 * 1024)
 
@@ -92,8 +95,81 @@ class BootstrapResponse(StrictModel):
     environment: EnvironmentReport
 
 
+class SubjectPromptInput(StrictModel):
+    frame_index: int = Field(ge=0)
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+
+
 class ProjectPatch(StrictModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
+    subject_prompt: SubjectPromptInput | None = None
+    motion_scale: float | None = Field(default=None, ge=0.1, le=4.0)
+    preview_height: int | None = Field(default=None, ge=180, le=540)
+
+
+class CameraInput(StrictModel):
+    target: list[float] = Field(min_length=3, max_length=3)
+    distance: float = Field(gt=0, allow_inf_nan=False)
+    yaw: float = Field(allow_inf_nan=False)
+    pitch: float = Field(gt=-90, lt=90, allow_inf_nan=False)
+    fov_y_degrees: float = Field(gt=1, lt=179, allow_inf_nan=False)
+
+    @field_validator("target")
+    @classmethod
+    def validate_target(
+        cls, value: list[float]
+    ) -> list[float]:
+        import math
+
+        if not all(math.isfinite(component) for component in value):
+            raise ValueError("target must contain finite values")
+        return value
+
+
+class PreviewFrameRequest(StrictModel):
+    generation: int = Field(ge=1)
+    width: int = Field(gt=0, le=960)
+    height: int = Field(gt=0, le=540)
+    camera: CameraInput
+
+
+class PreviewFrameResponse(StrictModel):
+    artifact_id: str
+    generation: int
+    width: int
+    height: int
+    camera_revision: int
+    pick_buffer_revision: int
+
+
+class PickRequest(StrictModel):
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+    camera_revision: int = Field(ge=1)
+    pick_buffer_revision: int = Field(ge=1)
+
+
+class PickResponse(StrictModel):
+    image: tuple[int, int]
+    world: tuple[float, float, float]
+    camera_revision: int
+    pick_buffer_revision: int
+
+
+class CameraConfirmationRequest(StrictModel):
+    camera_revision: int = Field(ge=1)
+
+
+class VerifiedExportResponse(StrictModel):
+    artifact_id: str
+    filename: str
+    size: int
+    duration_seconds: float
+    fps: str
+    frame_count: int
+    has_audio: bool
+    verified: bool
 
 
 class AssetKind(StrEnum):
@@ -159,10 +235,19 @@ class TaskEvent(StrictModel):
 
 
 class UploadCreateRequest(StrictModel):
+    kind: str = AssetKind.SOURCE_VIDEO.value
     filename: str = Field(min_length=1, max_length=255)
     mime_type: str = Field(min_length=1, max_length=255)
     total_size: int = Field(ge=0)
     sha256: str
+
+    @field_validator("kind")
+    @classmethod
+    def validate_kind(cls, value: str) -> str:
+        try:
+            return AssetKind(value).value
+        except ValueError as error:
+            raise ValueError("unsupported asset kind") from error
 
     @field_validator("filename")
     @classmethod
@@ -189,6 +274,7 @@ class UploadCreated(StrictModel):
 
 class UploadStatus(StrictModel):
     id: str
+    kind: str
     filename: str
     total_size: int
     chunk_size: int
@@ -197,3 +283,6 @@ class UploadStatus(StrictModel):
 
 class UploadComplete(StrictModel):
     path: str
+    kind: str = AssetKind.SOURCE_VIDEO.value
+    size: int = Field(default=0, ge=0)
+    sha256: str = "0" * 64

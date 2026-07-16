@@ -1,8 +1,9 @@
 from datetime import datetime, timezone
 from enum import StrEnum
+from math import isfinite
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class StageName(StrEnum):
@@ -33,13 +34,118 @@ class StageState(BaseModel):
     error_code: str | None = None
 
 
+class VideoSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    filename: str
+    size: int = Field(ge=0)
+    sha256: str
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    duration_seconds: float = Field(gt=0, allow_inf_nan=False)
+    fps: str
+    has_audio: bool
+    frame_count: int | None = Field(default=None, gt=0)
+
+
+class SceneSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    filename: str
+    size: int = Field(ge=0)
+    sha256: str
+    gaussian_count: int = Field(gt=0)
+    estimated_vram_mb: int = Field(gt=0)
+
+
+class SubjectPromptState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    frame_index: int = Field(ge=0)
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+
+
+class CameraPose(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target: tuple[float, float, float]
+    distance: float = Field(gt=0, allow_inf_nan=False)
+    yaw: float = Field(allow_inf_nan=False)
+    pitch: float = Field(gt=-90, lt=90, allow_inf_nan=False)
+    fov_y_degrees: float = Field(gt=1, lt=179, allow_inf_nan=False)
+    revision: int = Field(default=0, ge=0)
+
+    @field_validator("target")
+    @classmethod
+    def validate_target(
+        cls, value: tuple[float, float, float]
+    ) -> tuple[float, float, float]:
+        if not all(isfinite(component) for component in value):
+            raise ValueError("target must contain finite values")
+        return value
+
+
+class FootPointState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    image: tuple[int, int]
+    world: tuple[float, float, float]
+    camera_revision: int = Field(ge=1)
+    pick_buffer_revision: int = Field(ge=1)
+
+
+class PreviewState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: str
+    artifact_size: int = Field(ge=0)
+    artifact_sha256: str
+    generation: int = Field(ge=1)
+    width: int = Field(gt=0, le=960)
+    height: int = Field(gt=0, le=540)
+    camera_revision: int = Field(ge=1)
+    pick_buffer_revision: int = Field(ge=1)
+
+
+class ExportResultState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: str
+    filename: str
+    size: int = Field(ge=0)
+    sha256: str
+    duration_seconds: float = Field(gt=0, allow_inf_nan=False)
+    fps: str
+    frame_count: int = Field(gt=0)
+    has_audio: bool
+    verified: bool = True
+
+
+class WorkflowState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_summary: VideoSummary | None = None
+    scene_summary: SceneSummary | None = None
+    subject_prompt: SubjectPromptState | None = None
+    target_camera: CameraPose | None = None
+    confirmed_camera_revision: int | None = Field(default=None, ge=1)
+    foot_point: FootPointState | None = None
+    motion_scale: float = Field(default=1.0, ge=0.1, le=4.0)
+    preview_height: int = Field(default=540, ge=180, le=540)
+    active_task_id: str | None = None
+    preview: PreviewState | None = None
+    export_result: ExportResultState | None = None
+
+
 class Project(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 1
+    schema_version: int = 2
     project_id: str = Field(default_factory=lambda: str(uuid4()))
     name: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     source_video: str | None = None
     scene_ply: str | None = None
     stages: dict[StageName, StageState] = Field(default_factory=dict)
+    workflow: WorkflowState = Field(default_factory=WorkflowState)

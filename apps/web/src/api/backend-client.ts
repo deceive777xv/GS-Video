@@ -4,10 +4,17 @@ import type {
   BootstrapDto,
   ProjectDto,
   ProjectPatch,
+  PreviewFrameDto,
+  PreviewRequest,
+  PickRequest,
+  FootPointDto,
   StageName,
   TaskDto,
   UploadInit,
   UploadSessionDto,
+  UploadStatusDto,
+  UploadCompleteDto,
+  VerifiedExportDto,
 } from './types'
 
 export interface BackendClient {
@@ -20,8 +27,20 @@ export interface BackendClient {
     data: Blob,
     signal?: AbortSignal,
   ): Promise<void>
+  getUpload(id: string): Promise<UploadStatusDto>
+  completeUpload(id: string): Promise<UploadCompleteDto>
+  cancelUpload(id: string): Promise<void>
   getProject(): Promise<ProjectDto>
   updateProject(patch: ProjectPatch): Promise<ProjectDto>
+  renderPreview(
+    input: PreviewRequest,
+    signal?: AbortSignal,
+  ): Promise<PreviewFrameDto>
+  fetchPreviewArtifact(id: string, signal?: AbortSignal): Promise<Blob>
+  pickFootPoint(input: PickRequest): Promise<FootPointDto>
+  confirmCamera(cameraRevision: number): Promise<ProjectDto>
+  getVerifiedExport(): Promise<VerifiedExportDto>
+  fetchExportArtifact(id: string, signal?: AbortSignal): Promise<Blob>
   startTask(targetStage: StageName): Promise<TaskDto>
   getTask(id: string): Promise<TaskDto>
   cancelTask(id: string): Promise<TaskDto>

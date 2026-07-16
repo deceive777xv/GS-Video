@@ -6,7 +6,7 @@ from gs_video.domain.contracts import Stage, StageResult
 from gs_video.domain.models import Project, StageName, StageStatus
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
-from gs_video.pipeline.runner import PipelineRunner, SaveProject
+from gs_video.pipeline.runner import PersistStage, PipelineRunner, SaveProject
 
 
 DEPENDENCIES: dict[StageName, tuple[StageName, ...]] = {
@@ -130,6 +130,7 @@ def build_mvp_workflow(
     services: WorkflowServices,
     project: Project,
     save: SaveProject = discard_project,
+    persist_stage: PersistStage | None = None,
 ) -> PipelineRunner:
     stages: dict[StageName, Stage] = {
         StageName.INGEST: IngestStage(services.media_ingest),
@@ -146,6 +147,7 @@ def build_mvp_workflow(
         save=save,
         dependencies=DEPENDENCIES,
         reuse_succeeded=True,
+        persist_stage=persist_stage,
     )
 
 

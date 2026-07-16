@@ -414,6 +414,7 @@ class _UploadState(StrEnum):
 @dataclass
 class _UploadRecord:
     id: str
+    kind: str
     filename: str
     mime_type: str
     total_size: int
@@ -778,9 +779,15 @@ class UploadManager:
             assert spool is not None
             assert destination is not None
             assert directory_identity is not None
-            completed = UploadComplete(path=f"source/{destination.name}")
+            completed = UploadComplete(
+                path=f"source/{destination.name}",
+                kind=request.kind,
+                size=request.total_size,
+                sha256=request.sha256,
+            )
             self._records[upload_id] = _UploadRecord(
                 id=upload_id,
+                kind=request.kind,
                 filename=request.filename,
                 mime_type=request.mime_type,
                 total_size=request.total_size,
@@ -863,6 +870,7 @@ class UploadManager:
             self._require_record(record)
             return UploadStatus(
                 id=record.id,
+                kind=record.kind,
                 filename=record.filename,
                 total_size=record.total_size,
                 chunk_size=CHUNK_LIMIT,

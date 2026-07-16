@@ -16,10 +16,15 @@ from pydantic import SecretStr
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from gs_video.api.events import EventBus, TaskService
+from gs_video.api.assets import AssetInspector, ExportInspector
 from gs_video.api.middleware import LocalSecurityBoundary
 from gs_video.api.routes import ApiServices, build_router
 from gs_video.api.schemas import ApiError, ApiSettings, ErrorEnvelope
 from gs_video.api.uploads import UploadManager
+from gs_video.api.workflow import (
+    GsplatPreviewService,
+    PreviewArtifactStore,
+)
 from gs_video.environment.doctor import EnvironmentDoctor
 from gs_video.pipeline.runner import PipelineRunner
 from gs_video.project.repository import ProjectRepository
@@ -71,6 +76,11 @@ def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
     app.state.event_bus = event_bus
     app.state.task_service = task_service
     app.state.upload_manager = upload_manager
+    app.state.preview_service = services.preview_service or GsplatPreviewService()
+    app.state.preview_artifacts = PreviewArtifactStore(
+        services.project_repository.root
+    )
+    app.state.export_inspector = services.export_inspector or ExportInspector()
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.allowed_origins),
@@ -149,8 +159,14 @@ def run_api(host: str, port: int) -> int:
         services = ApiServices(
             project_repository=repository,
             environment_doctor=EnvironmentDoctor(),
-            pipeline_runner=PipelineRunner(project, {}, save=repository.save),
+            pipeline_runner=PipelineRunner(
+                project,
+                {},
+                save=repository.save,
+                persist_stage=repository.update_stage,
+            ),
             worker_registry=_NoopWorkerRegistry(),
+            asset_inspector=AssetInspector(),
         )
         app = create_app(settings, services)
         try:

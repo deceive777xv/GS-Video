@@ -27,8 +27,17 @@ const fakeBackendClient = (currentTask = task()): BackendClient => ({
   importLocalPath: vi.fn(),
   createUpload: vi.fn(),
   putUploadChunk: vi.fn(),
+  getUpload: vi.fn(),
+  completeUpload: vi.fn(),
+  cancelUpload: vi.fn(),
   getProject: vi.fn(),
   updateProject: vi.fn(),
+  renderPreview: vi.fn(),
+  fetchPreviewArtifact: vi.fn(),
+  pickFootPoint: vi.fn(),
+  confirmCamera: vi.fn(),
+  getVerifiedExport: vi.fn(),
+  fetchExportArtifact: vi.fn(),
   startTask: vi.fn(),
   getTask: vi.fn().mockResolvedValue(currentTask),
   cancelTask: vi.fn(),
@@ -202,6 +211,179 @@ describe('HttpBackendClient', () => {
       category: 'transport',
       retryable: false,
     })
+  })
+
+  it('completes and can cancel the browser upload protocol', async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: 'upload-1',
+            filename: 'clip.mp4',
+            total_size: 4,
+            chunk_size: 2,
+            uploaded_chunks: [0, 1],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ path: 'source/clip.mp4' }), {
+          status: 201,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152',
+      token: 'secret',
+      fetchImpl,
+    })
+
+    await expect(client.getUpload('upload-1')).resolves.toMatchObject({
+      uploaded_chunks: [0, 1],
+    })
+    await expect(client.completeUpload('upload-1')).resolves.toEqual({
+      path: 'source/clip.mp4',
+    })
+    await expect(client.cancelUpload('upload-1')).resolves.toBeUndefined()
+
+    expect(
+      fetchImpl.mock.calls.map(([url, init]) => [
+        url,
+        init?.method ?? 'GET',
+      ]),
+    ).toEqual([
+      ['http://127.0.0.1:49152/api/v1/uploads/upload-1', 'GET'],
+      ['http://127.0.0.1:49152/api/v1/uploads/upload-1/complete', 'POST'],
+      ['http://127.0.0.1:49152/api/v1/uploads/upload-1', 'DELETE'],
+    ])
+  })
+
+  it('renders and fetches a preview through authenticated client methods', async () => {
+    const descriptor = {
+      artifact_id: 'preview-1',
+      generation: 3,
+      width: 960,
+      height: 540,
+      camera_revision: 2,
+      pick_buffer_revision: 2,
+    }
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(descriptor), {
+          status: 201,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(new Blob(['png'], { type: 'image/png' }), {
+          status: 200,
+          headers: { 'Content-Type': 'image/png' },
+        }),
+      )
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152',
+      token: 'secret',
+      fetchImpl,
+    })
+    const controller = new AbortController()
+
+    await expect(
+      client.renderPreview(
+        {
+          generation: 3,
+          width: 960,
+          height: 540,
+          camera: {
+            target: [0, 0, 0],
+            distance: 4,
+            yaw: 0,
+            pitch: 0,
+            fov_y_degrees: 55,
+          },
+        },
+        controller.signal,
+      ),
+    ).resolves.toEqual(descriptor)
+    const blob = await client.fetchPreviewArtifact('preview-1')
+    expect(blob.type).toBe('image/png')
+    const authorization = fetchImpl.mock.calls.map(([, init]) =>
+      new Headers(init?.headers).get('Authorization'),
+    )
+    expect(authorization).toEqual(['Bearer secret', 'Bearer secret'])
+    expect(String(fetchImpl.mock.calls[1]?.[0])).not.toContain('secret')
+  })
+
+  it('retrieves only a verified opaque export and its authenticated Blob', async () => {
+    const result = {
+      artifact_id: 'export-1',
+      filename: 'final.mp4',
+      size: 14,
+      duration_seconds: 10,
+      fps: '30',
+      frame_count: 300,
+      has_audio: true,
+      verified: true,
+    }
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(result), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(new Blob(['video'], { type: 'video/mp4' }), {
+          status: 200,
+          headers: { 'Content-Type': 'video/mp4' },
+        }),
+      )
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152',
+      token: 'secret',
+      fetchImpl,
+    })
+
+    await expect(client.getVerifiedExport()).resolves.toEqual(result)
+    await expect(client.fetchExportArtifact('export-1')).resolves.toBeInstanceOf(
+      Blob,
+    )
+    expect(String(fetchImpl.mock.calls[1]?.[0])).not.toContain('secret')
+  })
+
+  it('confirms exactly the rendered camera revision through the project API', async () => {
+    const project = {
+      schema_version: 2,
+      project_id: 'p1',
+      name: 'demo',
+      created_at: '2026-07-16T00:00:00Z',
+      source_video: null,
+      scene_ply: null,
+      stages: {},
+      workflow: { confirmed_camera_revision: 4 },
+    }
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(project), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152',
+      token: 'secret',
+      fetchImpl,
+    })
+
+    await client.confirmCamera(4)
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'http://127.0.0.1:49152/api/v1/projects/current/camera/confirm',
+      expect.objectContaining({ method: 'POST', body: '{"camera_revision":4}' }),
+    )
   })
 })
 

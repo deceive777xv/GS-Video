@@ -6,11 +6,18 @@ import type {
   ErrorEnvelopeDto,
   ProjectDto,
   ProjectPatch,
+  PreviewFrameDto,
+  PreviewRequest,
+  PickRequest,
+  FootPointDto,
   SessionConfig,
   StageName,
   TaskDto,
   UploadInit,
   UploadSessionDto,
+  UploadStatusDto,
+  UploadCompleteDto,
+  VerifiedExportDto,
 } from './types'
 
 const API_PREFIX = '/api/v1'
@@ -42,6 +49,7 @@ interface RequestOptions {
   json?: unknown
   body?: BodyInit
   signal?: AbortSignal
+  response?: 'json' | 'blob'
 }
 
 export function normalizeLocalApiOrigin(value: string): string {
@@ -157,6 +165,7 @@ export class HttpBackendClient implements BackendClient {
         })
       }
       if (response.status === 204) return undefined as T
+      if (options.response === 'blob') return (await response.blob()) as T
       return (await response.json()) as T
     } catch (error) {
       if (error instanceof BackendClientError) throw error
@@ -200,12 +209,73 @@ export class HttpBackendClient implements BackendClient {
     )
   }
 
+  getUpload(id: string): Promise<UploadStatusDto> {
+    return this.#request(`/uploads/${encodeURIComponent(id)}`)
+  }
+
+  completeUpload(id: string): Promise<UploadCompleteDto> {
+    return this.#request(`/uploads/${encodeURIComponent(id)}/complete`, {
+      method: 'POST',
+    })
+  }
+
+  cancelUpload(id: string): Promise<void> {
+    return this.#request(`/uploads/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    })
+  }
+
   getProject(): Promise<ProjectDto> {
     return this.#request('/projects/current')
   }
 
   updateProject(patch: ProjectPatch): Promise<ProjectDto> {
     return this.#request('/projects/current', { method: 'PATCH', json: patch })
+  }
+
+  renderPreview(
+    input: PreviewRequest,
+    signal?: AbortSignal,
+  ): Promise<PreviewFrameDto> {
+    const options: RequestOptions = { method: 'POST', json: input }
+    if (signal !== undefined) options.signal = signal
+    return this.#request('/projects/current/preview', options)
+  }
+
+  fetchPreviewArtifact(id: string, signal?: AbortSignal): Promise<Blob> {
+    const options: RequestOptions = { response: 'blob' }
+    if (signal !== undefined) options.signal = signal
+    return this.#request(
+      `/projects/current/previews/${encodeURIComponent(id)}`,
+      options,
+    )
+  }
+
+  pickFootPoint(input: PickRequest): Promise<FootPointDto> {
+    return this.#request('/projects/current/pick', {
+      method: 'POST',
+      json: input,
+    })
+  }
+
+  confirmCamera(cameraRevision: number): Promise<ProjectDto> {
+    return this.#request('/projects/current/camera/confirm', {
+      method: 'POST',
+      json: { camera_revision: cameraRevision },
+    })
+  }
+
+  getVerifiedExport(): Promise<VerifiedExportDto> {
+    return this.#request('/projects/current/export')
+  }
+
+  fetchExportArtifact(id: string, signal?: AbortSignal): Promise<Blob> {
+    const options: RequestOptions = { response: 'blob' }
+    if (signal !== undefined) options.signal = signal
+    return this.#request(
+      `/projects/current/exports/${encodeURIComponent(id)}`,
+      options,
+    )
   }
 
   startTask(targetStage: StageName): Promise<TaskDto> {

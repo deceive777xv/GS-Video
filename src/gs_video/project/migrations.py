@@ -1,4 +1,4 @@
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 def migrate_project_dict(raw: dict[str, object]) -> dict[str, object]:
@@ -10,6 +10,10 @@ def migrate_project_dict(raw: dict[str, object]) -> dict[str, object]:
             data.setdefault("stages", {})
             data["schema_version"] = 1
             version = 1
+        elif version == 1:
+            data.setdefault("workflow", {})
+            data["schema_version"] = 2
+            version = 2
         else:
             raise ValueError(f"不支持的项目版本: {version}")
 
