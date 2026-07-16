@@ -11,6 +11,7 @@ import {
   createTaskStore,
   useTaskEventSource,
 } from './task-events'
+import type { TaskEventSource, TaskEventSubscription } from './task-events'
 import type { TaskDto } from './types'
 
 const task = (revision = 9): TaskDto => ({
@@ -278,7 +279,7 @@ describe('WebSocketTaskEventSource', () => {
     sockets[0]?.message({
       type: 'task_event',
       task_id: 't1',
-      revision: 5,
+      revision: 4,
       stage: 'segment',
       progress: 0.5,
       error: null,
@@ -288,10 +289,10 @@ describe('WebSocketTaskEventSource', () => {
 
     expect(sockets).toHaveLength(2)
     sockets[1]?.emit('open')
-    sockets[1]?.message({ type: 'authenticated', revision: 5 })
+    sockets[1]?.message({ type: 'authenticated', revision: 4 })
     expect(sockets[1]?.sent.map((payload) => JSON.parse(payload))).toEqual([
       { type: 'authenticate', token: 'memory-only-secret' },
-      { type: 'resume', after_revision: 5 },
+      { type: 'resume', after_revision: 4 },
     ])
 
     unsubscribe()
@@ -301,6 +302,130 @@ describe('WebSocketTaskEventSource', () => {
 })
 
 describe('recoverable task store', () => {
+  it('converges through REST when the live event source observes a revision jump', async () => {
+    vi.useFakeTimers()
+    const sockets: FakeWebSocket[] = []
+    const client = fakeBackendClient(task(3))
+    const store = createTaskStore(client, { retryDelayMs: 50 })
+    const source = new WebSocketTaskEventSource({
+      origin: 'http://127.0.0.1:49152',
+      token: 'memory-only-secret',
+      reconnectDelayMs: 100,
+      createWebSocket: (url) => {
+        const socket = new FakeWebSocket(url)
+        sockets.push(socket)
+        return socket
+      },
+    })
+    const unsubscribe = source.subscribe({
+      afterRevision: 0,
+      getResumeRevision: () => store.snapshot().revision,
+      onEvent: store.onEvent,
+      onConnectionChange: store.onConnectionChange,
+    })
+
+    sockets[0]?.emit('open')
+    sockets[0]?.message({ type: 'authenticated', revision: 3 })
+    sockets[0]?.message({
+      type: 'task_event',
+      task_id: 't1',
+      revision: 1,
+      stage: 'segment',
+      progress: 0.1,
+      error: null,
+    })
+    sockets[0]?.message({
+      type: 'task_event',
+      task_id: 'other-task',
+      revision: 3,
+      stage: 'segment',
+      progress: 0.5,
+      error: null,
+    })
+    await store.whenIdle()
+
+    expect(client.getTask).toHaveBeenCalledOnce()
+    expect(client.getTask).toHaveBeenCalledWith('t1')
+    expect(store.snapshot()).toMatchObject({
+      revision: 3,
+      task: task(3),
+      pendingResyncRevision: null,
+      latestEvent: {
+        type: 'resync_required',
+        task_id: 'other-task',
+        revision: 3,
+      },
+    })
+    expect(sockets[0]?.close).toHaveBeenCalledOnce()
+
+    unsubscribe()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('retries one backend-shaped resync without acknowledging it before REST succeeds', async () => {
+    vi.useFakeTimers()
+    const sockets: FakeWebSocket[] = []
+    const client = fakeBackendClient(task(9))
+    vi.mocked(client.getTask)
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce(task(9))
+    const store = createTaskStore(client, { retryDelayMs: 50 })
+    const source = new WebSocketTaskEventSource({
+      origin: 'http://127.0.0.1:49152',
+      token: 'memory-only-secret',
+      reconnectDelayMs: 10,
+      createWebSocket: (url) => {
+        const socket = new FakeWebSocket(url)
+        sockets.push(socket)
+        return socket
+      },
+    })
+    const unsubscribe = source.subscribe({
+      afterRevision: 0,
+      getResumeRevision: () => store.snapshot().revision,
+      onEvent: store.onEvent,
+      onConnectionChange: store.onConnectionChange,
+    })
+
+    sockets[0]?.emit('open')
+    sockets[0]?.message({ type: 'authenticated', revision: 9 })
+    sockets[0]?.message({
+      type: 'task_event',
+      task_id: 't1',
+      revision: 1,
+      stage: 'segment',
+      progress: 0.1,
+      error: null,
+    })
+    sockets[0]?.message({ type: 'resync_required', revision: 9 })
+    await vi.waitFor(() => expect(client.getTask).toHaveBeenCalledOnce())
+
+    expect(store.snapshot()).toMatchObject({
+      revision: 1,
+      pendingResyncRevision: 9,
+    })
+    sockets[0]?.emit('close')
+    await vi.advanceTimersByTimeAsync(10)
+    sockets[1]?.emit('open')
+    sockets[1]?.message({ type: 'authenticated', revision: 9 })
+    expect(sockets[1]?.sent.map((payload) => JSON.parse(payload))).toEqual([
+      { type: 'authenticate', token: 'memory-only-secret' },
+      { type: 'resume', after_revision: 1 },
+    ])
+
+    await vi.advanceTimersByTimeAsync(40)
+    await store.whenIdle()
+    expect(client.getTask).toHaveBeenCalledTimes(2)
+    expect(store.snapshot()).toMatchObject({
+      revision: 9,
+      task: task(9),
+      pendingResyncRevision: null,
+    })
+
+    unsubscribe()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it('resyncs authoritative task state after an event gap', async () => {
     const client = fakeBackendClient(task(9))
     const store = createTaskStore(client)
@@ -361,15 +486,15 @@ describe('recoverable task store', () => {
   })
 
   it('can retry REST convergence after a transient resync failure', async () => {
+    vi.useFakeTimers()
     const client = fakeBackendClient(task(10))
     vi.mocked(client.getTask)
       .mockRejectedValueOnce(new Error('offline'))
       .mockResolvedValueOnce(task(10))
-    const store = createTaskStore(client)
+    const store = createTaskStore(client, { retryDelayMs: 25 })
 
     store.onEvent({ type: 'resync_required', taskId: 't1', revision: 9 })
-    await store.whenIdle()
-    store.onEvent({ type: 'resync_required', taskId: 't1', revision: 10 })
+    await vi.advanceTimersByTimeAsync(25)
     await store.whenIdle()
 
     expect(client.getTask).toHaveBeenCalledTimes(2)
@@ -378,11 +503,14 @@ describe('recoverable task store', () => {
 
   it('closes the event subscription from React effect cleanup', () => {
     const close = vi.fn()
-    const source = { subscribe: vi.fn(() => close) }
+    const subscribe = vi.fn((_subscription: TaskEventSubscription) => close)
+    const source: TaskEventSource = { subscribe }
     const store = createTaskStore(fakeBackendClient())
+    store.replaceFromRest(task(9))
 
     const { unmount } = renderHook(() => useTaskEventSource(source, store))
-    expect(source.subscribe).toHaveBeenCalledOnce()
+    expect(subscribe).toHaveBeenCalledOnce()
+    expect(subscribe.mock.calls[0]?.[0].getResumeRevision?.()).toBe(9)
 
     act(() => unmount())
     expect(close).toHaveBeenCalledOnce()

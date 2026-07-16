@@ -12,6 +12,7 @@ export type TaskEventConnection =
 
 export interface TaskEventSubscription {
   afterRevision: number
+  getResumeRevision?: () => number
   onEvent(event: TaskEvent): void
   onConnectionChange(state: TaskEventConnection): void
 }
@@ -46,7 +47,17 @@ function taskEvent(value: unknown): TaskEvent | null {
     Number.isSafeInteger(candidate.revision) &&
     (candidate.revision as number) >= 0
   ) {
-    return { type: 'resync_required', revision: candidate.revision as number }
+    const identifier =
+      typeof candidate.taskId === 'string'
+        ? { taskId: candidate.taskId }
+        : typeof candidate.task_id === 'string'
+          ? { task_id: candidate.task_id }
+          : {}
+    return {
+      type: 'resync_required',
+      revision: candidate.revision as number,
+      ...identifier,
+    }
   }
   if (
     candidate.type === 'task_event' &&
@@ -88,6 +99,8 @@ export class WebSocketTaskEventSource implements TaskEventSource {
       socket = current
       let authenticated = false
       let disconnected = false
+      let observedRevision =
+        subscription.getResumeRevision?.() ?? afterRevision
 
       const onOpen = (): void => {
         subscription.onConnectionChange('authenticating')
@@ -111,8 +124,13 @@ export class WebSocketTaskEventSource implements TaskEventSource {
           (message as Record<string, unknown>).type === 'authenticated'
         ) {
           authenticated = true
+          observedRevision =
+            subscription.getResumeRevision?.() ?? afterRevision
           current.send(
-            JSON.stringify({ type: 'resume', after_revision: afterRevision }),
+            JSON.stringify({
+              type: 'resume',
+              after_revision: observedRevision,
+            }),
           )
           subscription.onConnectionChange('connected')
           return
@@ -120,7 +138,25 @@ export class WebSocketTaskEventSource implements TaskEventSource {
         if (!authenticated) return
         const parsed = taskEvent(message)
         if (parsed !== null) {
-          afterRevision = Math.max(afterRevision, parsed.revision)
+          if (parsed.type === 'resync_required') {
+            subscription.onEvent(parsed)
+            return
+          }
+          if (parsed.revision <= observedRevision) return
+          if (parsed.revision !== observedRevision + 1) {
+            subscription.onEvent({
+              type: 'resync_required',
+              revision: parsed.revision,
+              task_id: parsed.task_id,
+            })
+            onDisconnected()
+            current.close()
+            return
+          }
+          observedRevision = parsed.revision
+          if (subscription.getResumeRevision === undefined) {
+            afterRevision = parsed.revision
+          }
           subscription.onEvent(parsed)
         }
       }
@@ -163,6 +199,7 @@ export class WebSocketTaskEventSource implements TaskEventSource {
 export interface TaskStoreSnapshot {
   readonly task: TaskDto | null
   readonly revision: number
+  readonly pendingResyncRevision: number | null
   readonly connection: TaskEventConnection
   readonly latestEvent: TaskEvent | null
 }
@@ -176,42 +213,91 @@ export interface TaskStore {
   readonly whenIdle: () => Promise<void>
 }
 
-export function createTaskStore(client: BackendClient): TaskStore {
+export interface TaskStoreOptions {
+  retryDelayMs?: number
+}
+
+export function createTaskStore(
+  client: BackendClient,
+  options: TaskStoreOptions = {},
+): TaskStore {
   const listeners = new Set<() => void>()
+  const retryDelayMs = options.retryDelayMs ?? 1_000
   let state: TaskStoreSnapshot = Object.freeze({
     task: null,
     revision: 0,
+    pendingResyncRevision: null,
     connection: 'disconnected',
     latestEvent: null,
   })
-  let idle = Promise.resolve()
+  let trackedTaskId: string | undefined
+  let recovery: Promise<void> | null = null
 
   const publish = (next: TaskStoreSnapshot): void => {
     state = Object.freeze(next)
     for (const listener of listeners) listener()
   }
   const replaceFromRest = (task: TaskDto): void => {
+    trackedTaskId = task.id
     publish({
       ...state,
       task,
       revision: Math.max(state.revision, task.revision),
     })
   }
+  const retryDelay = (): Promise<void> =>
+    new Promise((resolve) => setTimeout(resolve, retryDelayMs))
+  const recover = async (): Promise<void> => {
+    while (
+      state.pendingResyncRevision !== null &&
+      trackedTaskId !== undefined
+    ) {
+      const recoveringRevision = state.pendingResyncRevision
+      try {
+        const task = await client.getTask(trackedTaskId)
+        const stillPending =
+          state.pendingResyncRevision > recoveringRevision
+            ? state.pendingResyncRevision
+            : null
+        publish({
+          ...state,
+          task,
+          revision: Math.max(
+            state.revision,
+            task.revision,
+            recoveringRevision,
+          ),
+          pendingResyncRevision: stillPending,
+        })
+      } catch {
+        await retryDelay()
+      }
+    }
+  }
+  const startRecovery = (): void => {
+    if (recovery !== null || trackedTaskId === undefined) return
+    recovery = recover().finally(() => {
+      recovery = null
+      if (state.pendingResyncRevision !== null) startRecovery()
+    })
+  }
   const onEvent = (event: TaskEvent): void => {
     if (event.type === 'resync_required') {
-      const taskId = event.taskId ?? event.task_id ?? state.task?.id
-      if (taskId === undefined) return
-      if (event.revision > state.revision) {
-        publish({ ...state, revision: event.revision, latestEvent: event })
-      }
-      idle = idle
-        .then(async () => {
-          replaceFromRest(await client.getTask(taskId))
-        })
-        .catch(() => undefined)
+      trackedTaskId =
+        state.task?.id ??
+        trackedTaskId ??
+        event.taskId ??
+        event.task_id
+      const pendingResyncRevision = Math.max(
+        state.pendingResyncRevision ?? 0,
+        event.revision,
+      )
+      publish({ ...state, pendingResyncRevision, latestEvent: event })
+      startRecovery()
       return
     }
     if (event.revision <= state.revision) return
+    trackedTaskId ??= event.task_id
     publish({ ...state, revision: event.revision, latestEvent: event })
   }
 
@@ -226,7 +312,7 @@ export function createTaskStore(client: BackendClient): TaskStore {
       if (connection !== state.connection) publish({ ...state, connection })
     },
     replaceFromRest,
-    whenIdle: () => idle,
+    whenIdle: () => recovery ?? Promise.resolve(),
   }
 }
 
@@ -242,6 +328,7 @@ export function useTaskEventSource(
     () =>
       source.subscribe({
         afterRevision: store.snapshot().revision,
+        getResumeRevision: () => store.snapshot().revision,
         onEvent: store.onEvent,
         onConnectionChange: store.onConnectionChange,
       }),

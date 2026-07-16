@@ -31,23 +31,22 @@ const fakeClient = (): BackendClient => ({
 })
 
 async function findImports(
-  directory: URL,
+  directory: string,
   forbidden: RegExp,
+  excludedFiles: readonly string[] = [],
 ): Promise<string[]> {
-  const root = path.normalize(directory.pathname.replace(/^\/(\w:)/, '$1'))
+  const root = path.resolve(directory)
+  const excluded = new Set(
+    excludedFiles.map((file) => path.resolve(file)),
+  )
   const matches: string[] = []
   const visit = async (current: string): Promise<void> => {
-    let entries
-    try {
-      entries = await readdir(current, { withFileTypes: true })
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
-      throw error
-    }
+    const entries = await readdir(current, { withFileTypes: true })
     await Promise.all(
       entries.map(async (entry) => {
         const target = path.join(current, entry.name)
         if (entry.isDirectory()) return visit(target)
+        if (excluded.has(path.normalize(target))) return
         if (!/\.[cm]?[jt]sx?$/.test(entry.name)) return
         const contents = await readFile(target, 'utf8')
         for (const match of contents.matchAll(/(?:from\s+|import\s*\()(['"])([^'"]+)\1/g)) {
@@ -62,10 +61,25 @@ async function findImports(
 }
 
 describe('platform boundary', () => {
-  it('keeps tauri imports outside business features', async () => {
+  const workingDirectory = process.cwd()
+  const webRoot = workingDirectory.endsWith(path.join('apps', 'web'))
+    ? workingDirectory
+    : path.join(workingDirectory, 'apps', 'web')
+
+  it('fails closed when the import scan root does not exist', async () => {
+    await expect(
+      findImports(
+        path.join(webRoot, 'src', 'missing-import-scan-root'),
+        /^@tauri-apps\//,
+      ),
+    ).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('keeps tauri imports inside the dedicated platform adapter', async () => {
     const forbidden = await findImports(
-      new URL('../features', import.meta.url),
+      path.join(webRoot, 'src'),
       /^@tauri-apps\//,
+      [path.join(webRoot, 'src', 'platform', 'tauri-platform-bridge.ts')],
     )
     expect(forbidden).toEqual([])
   })
