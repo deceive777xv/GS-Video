@@ -211,6 +211,7 @@ export interface TaskStore {
   readonly onConnectionChange: (state: TaskEventConnection) => void
   readonly replaceFromRest: (task: TaskDto) => void
   readonly whenIdle: () => Promise<void>
+  readonly dispose: () => void
 }
 
 export interface TaskStoreOptions {
@@ -232,12 +233,21 @@ export function createTaskStore(
   })
   let trackedTaskId: string | undefined
   let recovery: Promise<void> | null = null
+  let disposed = false
+  let retryTimer: ReturnType<typeof setTimeout> | null = null
+  let settleRetryDelay: (() => void) | null = null
+  let signalDisposal: (() => void) | null = null
+  const disposal = new Promise<void>((resolve) => {
+    signalDisposal = resolve
+  })
 
   const publish = (next: TaskStoreSnapshot): void => {
+    if (disposed) return
     state = Object.freeze(next)
     for (const listener of listeners) listener()
   }
   const replaceFromRest = (task: TaskDto): void => {
+    if (disposed) return
     trackedTaskId = task.id
     publish({
       ...state,
@@ -246,42 +256,63 @@ export function createTaskStore(
     })
   }
   const retryDelay = (): Promise<void> =>
-    new Promise((resolve) => setTimeout(resolve, retryDelayMs))
+    new Promise((resolve) => {
+      let settled = false
+      const finish = (): void => {
+        if (settled) return
+        settled = true
+        if (retryTimer !== null) clearTimeout(retryTimer)
+        retryTimer = null
+        settleRetryDelay = null
+        resolve()
+      }
+      settleRetryDelay = finish
+      retryTimer = setTimeout(finish, retryDelayMs)
+    })
   const recover = async (): Promise<void> => {
     while (
+      !disposed &&
       state.pendingResyncRevision !== null &&
       trackedTaskId !== undefined
     ) {
       const recoveringRevision = state.pendingResyncRevision
-      try {
-        const task = await client.getTask(trackedTaskId)
-        const stillPending =
-          state.pendingResyncRevision > recoveringRevision
-            ? state.pendingResyncRevision
-            : null
-        publish({
-          ...state,
-          task,
-          revision: Math.max(
-            state.revision,
-            task.revision,
-            recoveringRevision,
-          ),
-          pendingResyncRevision: stillPending,
-        })
-      } catch {
+      const result = await Promise.race([
+        client.getTask(trackedTaskId).then(
+          (task) => ({ kind: 'task' as const, task }),
+          () => ({ kind: 'failed' as const }),
+        ),
+        disposal.then(() => ({ kind: 'disposed' as const })),
+      ])
+      if (disposed || result.kind === 'disposed') return
+      if (result.kind === 'failed') {
         await retryDelay()
+        continue
       }
+      const stillPending =
+        state.pendingResyncRevision > recoveringRevision
+          ? state.pendingResyncRevision
+          : null
+      publish({
+        ...state,
+        task: result.task,
+        revision: Math.max(
+          state.revision,
+          result.task.revision,
+          recoveringRevision,
+        ),
+        pendingResyncRevision: stillPending,
+      })
     }
   }
   const startRecovery = (): void => {
-    if (recovery !== null || trackedTaskId === undefined) return
+    if (disposed || recovery !== null || trackedTaskId === undefined) return
     recovery = recover().finally(() => {
       recovery = null
-      if (state.pendingResyncRevision !== null) startRecovery()
+      if (!disposed && state.pendingResyncRevision !== null) startRecovery()
     })
   }
   const onEvent = (event: TaskEvent): void => {
+    if (disposed) return
     if (event.type === 'resync_required') {
       trackedTaskId =
         state.task?.id ??
@@ -303,16 +334,27 @@ export function createTaskStore(
 
   return {
     subscribe: (listener) => {
+      if (disposed) return () => undefined
       listeners.add(listener)
       return () => listeners.delete(listener)
     },
     snapshot: () => state,
     onEvent,
     onConnectionChange: (connection) => {
+      if (disposed) return
       if (connection !== state.connection) publish({ ...state, connection })
     },
     replaceFromRest,
     whenIdle: () => recovery ?? Promise.resolve(),
+    dispose: () => {
+      if (disposed) return
+      disposed = true
+      listeners.clear()
+      if (retryTimer !== null) clearTimeout(retryTimer)
+      settleRetryDelay?.()
+      signalDisposal?.()
+      signalDisposal = null
+    },
   }
 }
 

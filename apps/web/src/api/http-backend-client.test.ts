@@ -501,11 +501,63 @@ describe('recoverable task store', () => {
     expect(store.snapshot().task).toEqual(task(10))
   })
 
+  it('stops persistent REST recovery when its owner disposes the store', async () => {
+    vi.useFakeTimers()
+    const client = fakeBackendClient()
+    vi.mocked(client.getTask).mockRejectedValue(new Error('offline'))
+    const store = createTaskStore(client, { retryDelayMs: 25 })
+
+    store.onEvent({ type: 'resync_required', taskId: 't1', revision: 9 })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(client.getTask).toHaveBeenCalledOnce()
+    expect(vi.getTimerCount()).toBe(1)
+    const pendingRecovery = store.whenIdle()
+
+    store.dispose()
+    store.dispose()
+    expect(vi.getTimerCount()).toBe(0)
+    await pendingRecovery
+    await store.whenIdle()
+
+    store.onEvent({ type: 'resync_required', taskId: 't1', revision: 10 })
+    await vi.advanceTimersByTimeAsync(250)
+    expect(client.getTask).toHaveBeenCalledOnce()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('ignores a late in-flight REST result after disposal', async () => {
+    let resolveTask: ((value: TaskDto) => void) | undefined
+    const client = fakeBackendClient()
+    vi.mocked(client.getTask).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveTask = resolve
+        }),
+    )
+    const store = createTaskStore(client)
+
+    store.onEvent({ type: 'resync_required', taskId: 't1', revision: 9 })
+    const snapshotAtDisposal = store.snapshot()
+    const pendingRecovery = store.whenIdle()
+    store.dispose()
+    await pendingRecovery
+
+    resolveTask?.(task(9))
+    await Promise.resolve()
+    expect(store.snapshot()).toBe(snapshotAtDisposal)
+    expect(store.snapshot()).toMatchObject({
+      revision: 0,
+      task: null,
+      pendingResyncRevision: 9,
+    })
+  })
+
   it('closes the event subscription from React effect cleanup', () => {
     const close = vi.fn()
     const subscribe = vi.fn((_subscription: TaskEventSubscription) => close)
     const source: TaskEventSource = { subscribe }
     const store = createTaskStore(fakeBackendClient())
+    const dispose = vi.spyOn(store, 'dispose')
     store.replaceFromRest(task(9))
 
     const { unmount } = renderHook(() => useTaskEventSource(source, store))
@@ -514,5 +566,6 @@ describe('recoverable task store', () => {
 
     act(() => unmount())
     expect(close).toHaveBeenCalledOnce()
+    expect(dispose).not.toHaveBeenCalled()
   })
 })
