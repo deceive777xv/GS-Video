@@ -18,6 +18,8 @@ import type {
   UploadStatusDto,
   UploadCompleteDto,
   VerifiedExportDto,
+  SubjectMediaDto,
+  SubjectMediaRole,
 } from './types'
 
 const API_PREFIX = '/api/v1'
@@ -274,6 +276,32 @@ export class HttpBackendClient implements BackendClient {
     if (signal !== undefined) options.signal = signal
     return this.#request(
       `/projects/current/exports/${encodeURIComponent(id)}`,
+      options,
+    )
+  }
+
+  copyVerifiedExport(id: string, destination: string): Promise<void> {
+    return this.#request(
+      `/projects/current/exports/${encodeURIComponent(id)}/copy`,
+      { method: 'POST', json: { destination } },
+    )
+  }
+
+  getSubjectMedia(role: SubjectMediaRole): Promise<SubjectMediaDto> {
+    return this.#request(
+      `/projects/current/subject-media/${encodeURIComponent(role)}`,
+    )
+  }
+
+  fetchSubjectMediaArtifact(
+    role: SubjectMediaRole,
+    id: string,
+    signal?: AbortSignal,
+  ): Promise<Blob> {
+    const options: RequestOptions = { response: 'blob' }
+    if (signal !== undefined) options.signal = signal
+    return this.#request(
+      `/projects/current/subject-media/${encodeURIComponent(role)}/${encodeURIComponent(id)}`,
       options,
     )
   }

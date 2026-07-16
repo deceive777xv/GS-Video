@@ -4,12 +4,19 @@ from pathlib import Path
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from gs_video.api.routes import ApiServices
 from gs_video.api.schemas import ApiSettings
 from gs_video.app import create_app
 from gs_video.domain.contracts import PickBuffer
-from gs_video.domain.models import StageName, StageState, StageStatus
+from gs_video.domain.models import (
+    ArtifactRole,
+    StageName,
+    StageState,
+    StageStatus,
+    SubjectPromptState,
+)
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.media.ffmpeg import VideoMetadata
 from gs_video.pipeline.cancellation import CancellationToken
@@ -76,10 +83,31 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
     project.source_video = "source/video.mp4"
     project.scene_ply = "source/scene.ply"
     (repository.root / "exports" / "final.mp4").write_bytes(b"verified-video")
+    for index in range(1, 6):
+        Image.new("RGB", (16, 9), (20, 40, 60)).save(
+            repository.root / "proxies" / f"{index:06d}.jpg"
+        )
+        Image.new("L", (16, 9), 255).save(
+            repository.root / "masks" / f"{index:06d}.png"
+        )
+    project.workflow.subject_prompt = SubjectPromptState(
+        frame_index=4, x=8, y=4
+    )
+    project.stages[StageName.INGEST] = StageState(
+        status=StageStatus.SUCCEEDED,
+        cache_key="ingest-key",
+        artifacts={ArtifactRole.PROXY_FRAMES: "proxies"},
+    )
+    project.stages[StageName.SEGMENT] = StageState(
+        status=StageStatus.SUCCEEDED,
+        cache_key="segment-key",
+        artifacts={ArtifactRole.SUBJECT_MASKS: "masks"},
+    )
     project.stages[StageName.EXPORT] = StageState(
         status=StageStatus.SUCCEEDED,
         cache_key="export-key",
         output_paths=["exports/final.mp4"],
+        artifacts={ArtifactRole.EXPORT_VIDEO: "exports/final.mp4"},
     )
     repository.save(project)
     services = ApiServices(
@@ -292,3 +320,252 @@ def test_export_result_is_ffprobe_verified_persisted_and_opaque(
     assert persisted["workflow"]["export_result"]["artifact_id"] == result[
         "artifact_id"
     ]
+
+
+def test_verified_export_can_be_safely_copied_to_caller_destination(
+    workflow_client: TestClient,
+    auth_headers: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    verified = workflow_client.get(
+        "/api/v1/projects/current/export", headers=auth_headers
+    ).json()
+    destination = tmp_path / "chosen" / "copied.mp4"
+
+    copied = workflow_client.post(
+        f"/api/v1/projects/current/exports/{verified['artifact_id']}/copy",
+        json={"destination": str(destination)},
+        headers=auth_headers,
+    )
+
+    assert copied.status_code == 204
+    assert copied.content == b""
+    assert destination.read_bytes() == b"verified-video"
+
+    stale = workflow_client.post(
+        "/api/v1/projects/current/exports/not-current/copy",
+        json={"destination": str(tmp_path / "stale.mp4")},
+        headers=auth_headers,
+    )
+    assert stale.status_code == 404
+    assert not (tmp_path / "stale.mp4").exists()
+
+
+@pytest.mark.parametrize(
+    "relative_destination",
+    ["project.json", "source/clobber.mp4"],
+)
+def test_verified_export_copy_cannot_write_inside_project_root(
+    workflow_client: TestClient,
+    auth_headers: dict[str, str],
+    tmp_path: Path,
+    relative_destination: str,
+) -> None:
+    verified = workflow_client.get(
+        "/api/v1/projects/current/export", headers=auth_headers
+    ).json()
+    project_root = tmp_path / "project"
+    project_before = (project_root / "project.json").read_bytes()
+    destination = project_root / relative_destination
+
+    response = workflow_client.post(
+        f"/api/v1/projects/current/exports/{verified['artifact_id']}/copy",
+        json={"destination": str(destination)},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_export_destination"
+    assert (project_root / "project.json").read_bytes() == project_before
+    if relative_destination != "project.json":
+        assert not destination.exists()
+
+
+def test_verified_export_copy_requires_an_absolute_external_destination(
+    workflow_client: TestClient,
+    auth_headers: dict[str, str],
+) -> None:
+    verified = workflow_client.get(
+        "/api/v1/projects/current/export", headers=auth_headers
+    ).json()
+
+    response = workflow_client.post(
+        f"/api/v1/projects/current/exports/{verified['artifact_id']}/copy",
+        json={"destination": "relative/result.mp4"},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_export_destination"
+
+
+@pytest.mark.parametrize(
+    "stage_mutation",
+    [
+        {"cache_key": None},
+        {"cache_key": "replacement-export-key"},
+        {"artifacts": {}},
+        {"artifacts": {ArtifactRole.EXPORT_VIDEO: "source/video.mp4"}},
+    ],
+)
+def test_verified_export_copy_requires_the_typed_authoritative_export(
+    workflow_client: TestClient,
+    auth_headers: dict[str, str],
+    tmp_path: Path,
+    stage_mutation: dict[str, object],
+) -> None:
+    verified = workflow_client.get(
+        "/api/v1/projects/current/export", headers=auth_headers
+    ).json()
+    repository = workflow_client.app.state.services.project_repository
+
+    def mutate(project: object) -> None:
+        stage = project.stages[StageName.EXPORT]  # type: ignore[attr-defined]
+        for name, value in stage_mutation.items():
+            setattr(stage, name, value)
+
+    repository.update(mutate)
+    destination = tmp_path / "typed-authority.mp4"
+
+    response = workflow_client.post(
+        f"/api/v1/projects/current/exports/{verified['artifact_id']}/copy",
+        json={"destination": str(destination)},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 409
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    ("role", "content_type"),
+    [("proxy", "image/jpeg"), ("alpha", "image/png")],
+)
+def test_subject_media_is_derived_from_typed_stage_artifacts(
+    workflow_client: TestClient,
+    auth_headers: dict[str, str],
+    role: str,
+    content_type: str,
+) -> None:
+    descriptor = workflow_client.get(
+        f"/api/v1/projects/current/subject-media/{role}", headers=auth_headers
+    )
+
+    assert descriptor.status_code == 200
+    body = descriptor.json()
+    assert body["role"] == role
+    assert body["frame_index"] == 4
+    assert body["width"] == 16
+    assert body["height"] == 9
+    assert "path" not in body
+
+    artifact = workflow_client.get(
+        f"/api/v1/projects/current/subject-media/{role}/{body['artifact_id']}",
+        headers=auth_headers,
+    )
+    assert artifact.status_code == 200
+    assert artifact.headers["content-type"] == content_type
+    assert artifact.headers["cache-control"] == "no-store"
+
+
+def test_subject_proxy_defaults_to_zero_based_frame_zero_before_prompt(
+    workflow_client: TestClient,
+    auth_headers: dict[str, str],
+) -> None:
+    repository = workflow_client.app.state.services.project_repository
+    repository.update(lambda project: setattr(project.workflow, "subject_prompt", None))
+
+    descriptor = workflow_client.get(
+        "/api/v1/projects/current/subject-media/proxy", headers=auth_headers
+    )
+
+    assert descriptor.status_code == 200
+    assert descriptor.json()["frame_index"] == 0
+
+
+def test_subject_alpha_requires_a_successful_prompt_bound_segment(
+    workflow_client: TestClient,
+    auth_headers: dict[str, str],
+) -> None:
+    repository = workflow_client.app.state.services.project_repository
+    repository.update(lambda project: setattr(project.workflow, "subject_prompt", None))
+
+    response = workflow_client.get(
+        "/api/v1/projects/current/subject-media/alpha", headers=auth_headers
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "subject_media_not_ready"
+
+
+@pytest.mark.parametrize(
+    "stage_mutation",
+    [
+        {"cache_key": None},
+        {"artifacts": {ArtifactRole.PROXY_FRAMES: "./proxies"}},
+    ],
+)
+def test_subject_proxy_requires_exact_typed_stage_authority(
+    workflow_client: TestClient,
+    auth_headers: dict[str, str],
+    stage_mutation: dict[str, object],
+) -> None:
+    repository = workflow_client.app.state.services.project_repository
+
+    def mutate(project: object) -> None:
+        stage = project.stages[StageName.INGEST]  # type: ignore[attr-defined]
+        for name, value in stage_mutation.items():
+            setattr(stage, name, value)
+
+    repository.update(mutate)
+
+    response = workflow_client.get(
+        "/api/v1/projects/current/subject-media/proxy", headers=auth_headers
+    )
+
+    assert response.status_code == 409
+
+
+def test_subject_media_rejects_noncanonical_inventory_and_dimensions(
+    workflow_client: TestClient,
+    auth_headers: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "project"
+    (project_root / "proxies" / "extra.jpg").write_bytes(b"not a frame")
+
+    invalid_inventory = workflow_client.get(
+        "/api/v1/projects/current/subject-media/proxy", headers=auth_headers
+    )
+    assert invalid_inventory.status_code == 409
+    assert invalid_inventory.json()["code"] == "subject_media_changed"
+
+    (project_root / "proxies" / "extra.jpg").unlink()
+    Image.new("L", (8, 8), 255).save(project_root / "masks" / "000005.png")
+    invalid_dimensions = workflow_client.get(
+        "/api/v1/projects/current/subject-media/alpha", headers=auth_headers
+    )
+    assert invalid_dimensions.status_code == 409
+    assert invalid_dimensions.json()["code"] == "subject_media_invalid"
+
+
+def test_subject_media_descriptor_becomes_stale_when_bytes_change(
+    workflow_client: TestClient,
+    auth_headers: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    descriptor = workflow_client.get(
+        "/api/v1/projects/current/subject-media/proxy", headers=auth_headers
+    ).json()
+    Image.new("RGB", (16, 9), (200, 10, 30)).save(
+        tmp_path / "project" / "proxies" / "000005.jpg"
+    )
+
+    stale = workflow_client.get(
+        "/api/v1/projects/current/subject-media/proxy/"
+        f"{descriptor['artifact_id']}",
+        headers=auth_headers,
+    )
+
+    assert stale.status_code == 404
+    assert stale.json()["code"] == "subject_media_unavailable"

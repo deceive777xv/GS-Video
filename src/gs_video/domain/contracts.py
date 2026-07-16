@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Protocol
 import numpy as np
 import numpy.typing as npt
 
-from gs_video.domain.models import Project, StageName
+from gs_video.domain.models import ArtifactRole, Project, StageName
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
 
@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 class StageResult:
     output_paths: tuple[Path, ...]
     cache_key: str
+    artifacts: dict[ArtifactRole, Path] = field(default_factory=dict)
 
 
 class SegmentationBackend(StrEnum):

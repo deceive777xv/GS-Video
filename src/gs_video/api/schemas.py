@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import StrEnum
 from ipaddress import ip_address
 from pathlib import Path, PurePath, PureWindowsPath
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
@@ -170,6 +170,25 @@ class VerifiedExportResponse(StrictModel):
     frame_count: int
     has_audio: bool
     verified: bool
+
+
+class ExportCopyRequest(StrictModel):
+    destination: str = Field(min_length=1, max_length=32767)
+
+
+class SubjectMediaRole(StrEnum):
+    PROXY = "proxy"
+    ALPHA = "alpha"
+
+
+class SubjectMediaResponse(StrictModel):
+    role: SubjectMediaRole
+    artifact_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    frame_index: int = Field(ge=0)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    size: int = Field(gt=0, le=16 * 1024 * 1024)
+    mime_type: Literal["image/jpeg", "image/png"]
 
 
 class AssetKind(StrEnum):

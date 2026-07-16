@@ -6,6 +6,7 @@ import pytest
 from gs_video.domain.contracts import StageResult
 from gs_video.domain.errors import GsVideoError, RepairableError, UnsupportedMaterialError
 from gs_video.domain.models import (
+    ArtifactRole,
     Project,
     StageName,
     StageState,
@@ -161,6 +162,22 @@ def test_runner_registers_outputs_only_after_stage_returns_successfully() -> Non
     assert state.cache_key == "render-key"
     assert state.output_paths == [str(Path("renders/a.png")), str(Path("renders/b.png"))]
     assert state.error_code is None
+
+
+def test_runner_persists_typed_stage_artifact_roots() -> None:
+    project = project_with_prior_output()
+    stage = RecordingStage(
+        lambda project, token: StageResult(
+            (Path("proxies"),),
+            "ingest-key",
+            artifacts={ArtifactRole.PROXY_FRAMES: Path("proxies")},
+        )
+    )
+    runner = PipelineRunner(project, {StageName.RENDER: stage}, save=lambda project: None)
+
+    state = runner.run(StageName.RENDER, CancellationToken())
+
+    assert state.artifacts == {ArtifactRole.PROXY_FRAMES: "proxies"}
 
 
 def test_stage_persistence_merges_into_latest_project_authority() -> None:

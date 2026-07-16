@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
 import subprocess
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
 from fractions import Fraction
@@ -120,9 +122,36 @@ class _OwnedStaging:
         self.verify_directory()
         if has_reparse_component(self.file) or not self.file.is_file():
             raise GsVideoError("ffmpeg 未生成普通的暂存 MP4 文件")
-        identity = _path_identity(self.file)
+        try:
+            file_stat = self.file.stat()
+        except OSError as exc:
+            raise GsVideoError("无法读取暂存 MP4 文件状态") from exc
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+            raise GsVideoError("暂存 MP4 必须是非硬链接的普通文件")
+        identity = _identity_from_stat(file_stat)
         if identity in protected:
             raise GsVideoError("暂存 MP4 与受保护输入或输出身份重叠")
+        self.file_identity = identity
+
+    def record_open_file(
+        self, handle: Any, protected: set[FileIdentity]
+    ) -> None:
+        self.verify_directory()
+        try:
+            handle_stat = os.fstat(handle.fileno())
+            path_stat = self.file.stat()
+        except OSError as exc:
+            raise GsVideoError("无法验证新建暂存 MP4 文件") from exc
+        identity = _identity_from_stat(handle_stat)
+        if (
+            has_reparse_component(self.file)
+            or not stat.S_ISREG(handle_stat.st_mode)
+            or handle_stat.st_nlink != 1
+            or _identity_from_stat(path_stat) != identity
+            or path_stat.st_nlink != 1
+            or identity in protected
+        ):
+            raise GsVideoError("新建暂存 MP4 与受保护文件重叠或已被替换")
         self.file_identity = identity
 
     def verify_file(self) -> None:
@@ -131,6 +160,7 @@ class _OwnedStaging:
             self.file_identity is None
             or has_reparse_component(self.file)
             or not self.file.is_file()
+            or self.file.stat().st_nlink != 1
             or _path_identity(self.file) != self.file_identity
         ):
             raise GsVideoError("暂存 MP4 身份发生变化")
@@ -147,6 +177,7 @@ class _OwnedStaging:
                 if (
                     has_reparse_component(self.file)
                     or not self.file.is_file()
+                    or self.file.stat().st_nlink != 1
                     or _path_identity(self.file) != self.file_identity
                 ):
                     return
@@ -596,6 +627,207 @@ def _validate_output_overlap(frames_dir: Path, source_video: Path, output: Path)
         raise RepairableError("输出不能覆盖只读源视频")
     if destination == frames_dir or frames_dir in destination.parents:
         raise RepairableError("输出不能位于帧目录内部或等于帧目录")
+
+
+def _stat_fingerprint(
+    value: os.stat_result,
+) -> tuple[FileIdentity, int, int, int, int]:
+    return (
+        _identity_from_stat(value),
+        int(value.st_size),
+        int(value.st_nlink),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _validated_export_source(
+    source: Path, *, expected_size: int, expected_sha256: str
+) -> tuple[Path, os.stat_result]:
+    if (
+        isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or expected_size <= 0
+    ):
+        raise RepairableError("已验证导出的大小必须是正整数")
+    if (
+        len(expected_sha256) != 64
+        or expected_sha256 != expected_sha256.lower()
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise RepairableError("已验证导出的 SHA-256 无效")
+    path = _require_ordinary(source, kind="权威导出")
+    try:
+        source_stat = path.stat()
+    except OSError as exc:
+        raise GsVideoError("无法读取权威导出状态") from exc
+    if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_nlink != 1:
+        raise RepairableError("权威导出必须是非硬链接的普通文件")
+    if source_stat.st_size != expected_size:
+        raise GsVideoError("权威导出验证失败：文件大小已变化")
+    _identity_from_stat(source_stat)
+    return path, source_stat
+
+
+def _verify_open_export_source(
+    source_path: Path,
+    source_handle: Any,
+    expected_fingerprint: tuple[FileIdentity, int, int, int, int],
+) -> None:
+    try:
+        handle_stat = os.fstat(source_handle.fileno())
+        path_stat = source_path.stat()
+    except OSError as exc:
+        raise GsVideoError("权威导出验证失败：文件状态不可用") from exc
+    if (
+        not stat.S_ISREG(handle_stat.st_mode)
+        or handle_stat.st_nlink != 1
+        or _stat_fingerprint(handle_stat) != expected_fingerprint
+        or _stat_fingerprint(path_stat) != expected_fingerprint
+    ):
+        raise GsVideoError("权威导出验证失败：文件身份已变化")
+
+
+def _hash_export_source(
+    source_handle: Any, *, expected_size: int, expected_sha256: str
+) -> None:
+    digest = hashlib.sha256()
+    size = 0
+    for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
+        size += len(chunk)
+        if size > expected_size:
+            raise GsVideoError("权威导出验证失败：文件大小已变化")
+        digest.update(chunk)
+    if size != expected_size or digest.hexdigest() != expected_sha256:
+        raise GsVideoError("权威导出验证失败：文件内容已变化")
+
+
+def _verify_copy_destination(
+    destination: Path, expected_identity: FileIdentity | None
+) -> None:
+    _assert_output_safe(destination)
+    if expected_identity is None:
+        if destination.exists() or destination.is_symlink():
+            raise GsVideoError("导出副本目标在发布前被占用")
+        return
+    try:
+        destination_stat = destination.stat()
+    except OSError as exc:
+        raise GsVideoError("导出副本目标身份已变化") from exc
+    if (
+        not stat.S_ISREG(destination_stat.st_mode)
+        or destination_stat.st_nlink != 1
+        or _identity_from_stat(destination_stat) != expected_identity
+    ):
+        raise GsVideoError("导出副本目标身份已变化")
+
+
+def copy_verified_export(
+    source: Path,
+    destination: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+    before_publish: Callable[[], None] | None = None,
+) -> Path:
+    """Copy an authoritative export to a caller path through owned staging.
+
+    The source is verified before and during the copy, and the destination is
+    only replaced after the staged bytes have been persisted and reverified.
+    """
+    source_path, source_stat = _validated_export_source(
+        Path(source),
+        expected_size=expected_size,
+        expected_sha256=expected_sha256,
+    )
+    requested_destination = Path(destination).absolute()
+    if requested_destination == source_path:
+        raise RepairableError("导出副本不能覆盖权威导出")
+
+    try:
+        source_handle = source_path.open("rb")
+    except OSError as exc:
+        raise GsVideoError("无法打开权威导出") from exc
+
+    staging: _OwnedStaging | None = None
+    try:
+        opened_stat = os.fstat(source_handle.fileno())
+        source_fingerprint = _stat_fingerprint(source_stat)
+        if _stat_fingerprint(opened_stat) != source_fingerprint:
+            raise GsVideoError("权威导出验证失败：文件身份已变化")
+        source_identity = source_fingerprint[0]
+        _verify_open_export_source(
+            source_path, source_handle, source_fingerprint
+        )
+
+        _hash_export_source(
+            source_handle,
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+        )
+        _verify_open_export_source(
+            source_path, source_handle, source_fingerprint
+        )
+
+        destination_path = _prepare_output(requested_destination)
+        destination_identity: FileIdentity | None = None
+        if destination_path.exists():
+            destination_stat = destination_path.stat()
+            if (
+                not stat.S_ISREG(destination_stat.st_mode)
+                or destination_stat.st_nlink != 1
+            ):
+                raise RepairableError("导出副本目标必须是非硬链接的普通文件")
+            if _identity_from_stat(destination_stat) == source_identity:
+                raise RepairableError("导出副本不能覆盖权威导出")
+            destination_identity = _identity_from_stat(destination_stat)
+
+        protected = {source_identity}
+        if destination_identity is not None:
+            protected.add(destination_identity)
+        staging = _create_owned_staging(destination_path)
+        staging.verify_directory()
+        source_handle.seek(0)
+        copied_digest = hashlib.sha256()
+        copied_size = 0
+        try:
+            with staging.file.open("xb") as staging_handle:
+                staging.record_open_file(staging_handle, protected)
+                for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
+                    copied_size += len(chunk)
+                    if copied_size > expected_size:
+                        raise GsVideoError(
+                            "权威导出验证失败：复制期间文件大小已变化"
+                        )
+                    staging_handle.write(chunk)
+                    copied_digest.update(chunk)
+                staging_handle.flush()
+                os.fsync(staging_handle.fileno())
+        except OSError as exc:
+            raise GsVideoError("无法持久化导出副本暂存文件") from exc
+        staging.record_file(protected)
+
+        if copied_size != expected_size or copied_digest.hexdigest() != expected_sha256:
+            raise GsVideoError("权威导出验证失败：复制期间内容已变化")
+        _verify_open_export_source(
+            source_path, source_handle, source_fingerprint
+        )
+        if before_publish is not None:
+            before_publish()
+        _verify_open_export_source(
+            source_path, source_handle, source_fingerprint
+        )
+        _verify_copy_destination(destination_path, destination_identity)
+        staging.verify_file()
+        try:
+            os.replace(staging.file, destination_path)
+        except OSError as exc:
+            raise GsVideoError("无法原子发布导出副本") from exc
+        return destination_path
+    finally:
+        source_handle.close()
+        if staging is not None:
+            staging.cleanup()
 
 
 def export_mp4(

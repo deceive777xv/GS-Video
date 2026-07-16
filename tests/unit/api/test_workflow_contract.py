@@ -1,11 +1,88 @@
+import stat
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 from pydantic import ValidationError
 
 from gs_video.api.schemas import ApiError, CameraInput
+from gs_video.api.routes import _read_stable_artifact
 from gs_video.api.workflow import validate_pick_buffer
 from gs_video.domain.contracts import PickBuffer
 from gs_video.domain.models import CameraPose, VideoSummary
+
+
+class _FakeArtifactHandle:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+        self._read = False
+
+    def __enter__(self) -> "_FakeArtifactHandle":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def fileno(self) -> int:
+        return 42
+
+    def read(self, size: int) -> bytes:
+        del size
+        if self._read:
+            return b""
+        self._read = True
+        return self._payload
+
+
+class _FakeArtifactPath:
+    def __init__(self, payload: bytes, path_stat: object) -> None:
+        self._payload = payload
+        self._path_stat = path_stat
+
+    def open(self, mode: str) -> _FakeArtifactHandle:
+        assert mode == "rb"
+        return _FakeArtifactHandle(self._payload)
+
+    def stat(self) -> object:
+        return self._path_stat
+
+
+def _artifact_stat(*, inode: int = 10, size: int = 4) -> object:
+    return SimpleNamespace(
+        st_dev=1,
+        st_ino=inode,
+        st_size=size,
+        st_nlink=1,
+        st_mtime_ns=100,
+        st_ctime_ns=100,
+        st_mode=stat.S_IFREG,
+    )
+
+
+def test_stable_artifact_reader_rejects_path_identity_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = _artifact_stat()
+    path = _FakeArtifactPath(b"test", _artifact_stat(inode=11))
+    monkeypatch.setattr("gs_video.api.routes.os.fstat", lambda _fd: expected)
+
+    with pytest.raises(ApiError) as caught:
+        _read_stable_artifact(path, expected, limit=4)  # type: ignore[arg-type]
+
+    assert caught.value.envelope.code == "artifact_changed"
+
+
+def test_stable_artifact_reader_stops_at_the_captured_size_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = _artifact_stat()
+    path = _FakeArtifactPath(b"oversized", expected)
+    monkeypatch.setattr("gs_video.api.routes.os.fstat", lambda _fd: expected)
+
+    with pytest.raises(ApiError) as caught:
+        _read_stable_artifact(path, expected, limit=4)  # type: ignore[arg-type]
+
+    assert caught.value.envelope.code == "artifact_changed"
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])

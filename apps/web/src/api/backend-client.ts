@@ -15,6 +15,8 @@ import type {
   UploadStatusDto,
   UploadCompleteDto,
   VerifiedExportDto,
+  SubjectMediaDto,
+  SubjectMediaRole,
 } from './types'
 
 export interface BackendClient {
@@ -41,6 +43,13 @@ export interface BackendClient {
   confirmCamera(cameraRevision: number): Promise<ProjectDto>
   getVerifiedExport(): Promise<VerifiedExportDto>
   fetchExportArtifact(id: string, signal?: AbortSignal): Promise<Blob>
+  copyVerifiedExport(id: string, destination: string): Promise<void>
+  getSubjectMedia(role: SubjectMediaRole): Promise<SubjectMediaDto>
+  fetchSubjectMediaArtifact(
+    role: SubjectMediaRole,
+    id: string,
+    signal?: AbortSignal,
+  ): Promise<Blob>
   startTask(targetStage: StageName): Promise<TaskDto>
   getTask(id: string): Promise<TaskDto>
   cancelTask(id: string): Promise<TaskDto>

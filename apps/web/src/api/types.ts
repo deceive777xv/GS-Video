@@ -16,11 +16,14 @@ export type TaskStatus =
   | 'failed'
   | 'cancelled'
 
+export type ArtifactRole = 'proxy_frames' | 'subject_masks' | 'export_video'
+
 export interface StageStateDto {
   status: 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'stale'
   cache_key: string | null
   output_paths: string[]
   error_code: string | null
+  artifacts: Partial<Record<ArtifactRole, string>>
 }
 
 export interface ProjectDto {
@@ -120,6 +123,18 @@ export type VerifiedExportDto = Omit<
   ExportResultDto,
   'sha256'
 >
+
+export type SubjectMediaRole = 'proxy' | 'alpha'
+
+export interface SubjectMediaDto {
+  role: SubjectMediaRole
+  artifact_id: string
+  frame_index: number
+  width: number
+  height: number
+  size: number
+  mime_type: 'image/jpeg' | 'image/png'
+}
 
 export interface EnvironmentIssueDto {
   code: string

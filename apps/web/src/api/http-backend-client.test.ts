@@ -38,6 +38,9 @@ const fakeBackendClient = (currentTask = task()): BackendClient => ({
   confirmCamera: vi.fn(),
   getVerifiedExport: vi.fn(),
   fetchExportArtifact: vi.fn(),
+  copyVerifiedExport: vi.fn(),
+  getSubjectMedia: vi.fn(),
+  fetchSubjectMediaArtifact: vi.fn(),
   startTask: vi.fn(),
   getTask: vi.fn().mockResolvedValue(currentTask),
   cancelTask: vi.fn(),
@@ -355,6 +358,30 @@ describe('HttpBackendClient', () => {
     expect(String(fetchImpl.mock.calls[1]?.[0])).not.toContain('secret')
   })
 
+  it('requests a local copy only for the current opaque export id', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(null, { status: 204 }),
+    )
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152',
+      token: 'secret',
+      fetchImpl,
+    })
+
+    await expect(
+      client.copyVerifiedExport('export-1', 'E:\\chosen\\result.mp4'),
+    ).resolves.toBeUndefined()
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'http://127.0.0.1:49152/api/v1/projects/current/exports/export-1/copy',
+      expect.objectContaining({
+        method: 'POST',
+        body: '{"destination":"E:\\\\chosen\\\\result.mp4"}',
+      }),
+    )
+    expect(String(fetchImpl.mock.calls[0]?.[0])).not.toContain('secret')
+  })
+
   it('confirms exactly the rendered camera revision through the project API', async () => {
     const project = {
       schema_version: 2,
@@ -384,6 +411,43 @@ describe('HttpBackendClient', () => {
       'http://127.0.0.1:49152/api/v1/projects/current/camera/confirm',
       expect.objectContaining({ method: 'POST', body: '{"camera_revision":4}' }),
     )
+  })
+
+  it('fetches opaque subject proxy and Alpha artifacts with authentication', async () => {
+    const descriptor = {
+      role: 'proxy',
+      artifact_id: 'proxy-1',
+      frame_index: 4,
+      width: 960,
+      height: 540,
+      size: 42,
+      mime_type: 'image/jpeg',
+    }
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(descriptor), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(new Blob(['jpg'], { type: 'image/jpeg' }), {
+          status: 200,
+          headers: { 'Content-Type': 'image/jpeg' },
+        }),
+      )
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152',
+      token: 'secret',
+      fetchImpl,
+    })
+
+    await expect(client.getSubjectMedia('proxy')).resolves.toEqual(descriptor)
+    await expect(
+      client.fetchSubjectMediaArtifact('proxy', 'proxy-1'),
+    ).resolves.toBeInstanceOf(Blob)
+    expect(String(fetchImpl.mock.calls[1]?.[0])).not.toContain('secret')
   })
 })
 

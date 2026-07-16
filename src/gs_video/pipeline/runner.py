@@ -98,6 +98,9 @@ class PipelineRunner:
             state.status = StageStatus.SUCCEEDED
             state.cache_key = result.cache_key
             state.output_paths = [str(path) for path in result.output_paths]
+            state.artifacts = {
+                role: str(path) for role, path in result.artifacts.items()
+            }
         except CancelledError:
             state.status = StageStatus.CANCELLED
         except GsVideoError as error:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 from fractions import Fraction
@@ -13,7 +14,7 @@ import pytest
 from PIL import Image
 
 from gs_video.domain.errors import GsVideoError, RepairableError
-from gs_video.media.export import ExportResult, export_mp4
+from gs_video.media.export import ExportResult, copy_verified_export, export_mp4
 from gs_video.media.toolchain import MediaTools, resolve_media_tools
 
 
@@ -48,6 +49,164 @@ def write_rgb_frames(directory: Path, count: int, *, size: tuple[int, int] = (16
     for index in range(1, count + 1):
         pixels = np.full((height, width, 3), index * 20 % 256, np.uint8)
         Image.fromarray(pixels).save(directory / f"{index:06d}.png")
+
+
+def test_copy_verified_export_atomically_publishes_verified_bytes(tmp_path: Path) -> None:
+    source = tmp_path / "authoritative.mp4"
+    destination = tmp_path / "chosen" / "result.mp4"
+    payload = b"verified export bytes"
+    source.write_bytes(payload)
+    destination.parent.mkdir()
+    destination.write_bytes(b"previous")
+
+    result = copy_verified_export(
+        source,
+        destination,
+        expected_size=len(payload),
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+    assert result == destination.absolute()
+    assert destination.read_bytes() == payload
+    assert source.read_bytes() == payload
+    assert not staging_entries(destination)
+
+
+def test_copy_verified_export_rejects_changed_source_and_preserves_destination(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "authoritative.mp4"
+    destination = tmp_path / "result.mp4"
+    source.write_bytes(b"changed")
+    destination.write_bytes(b"previous")
+
+    with pytest.raises(GsVideoError, match="验证"):
+        copy_verified_export(
+            source,
+            destination,
+            expected_size=len(b"expected"),
+            expected_sha256=hashlib.sha256(b"expected").hexdigest(),
+        )
+
+    assert destination.read_bytes() == b"previous"
+    assert not staging_entries(destination)
+
+
+def test_copy_verified_export_rejects_source_as_destination(tmp_path: Path) -> None:
+    source = tmp_path / "authoritative.mp4"
+    source.write_bytes(b"verified")
+
+    with pytest.raises(RepairableError, match="覆盖"):
+        copy_verified_export(
+            source,
+            source,
+            expected_size=len(b"verified"),
+            expected_sha256=hashlib.sha256(b"verified").hexdigest(),
+        )
+
+    assert source.read_bytes() == b"verified"
+
+
+def test_copy_verified_export_preserves_newer_destination_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "authoritative.mp4"
+    destination = tmp_path / "result.mp4"
+    parked = tmp_path / "parked-previous.mp4"
+    payload = b"verified export bytes"
+    source.write_bytes(payload)
+    destination.write_bytes(b"previous")
+    real_fsync = os.fsync
+
+    def fsync_and_replace_destination(file_descriptor: int) -> None:
+        real_fsync(file_descriptor)
+        destination.rename(parked)
+        destination.write_bytes(b"newer external destination")
+
+    monkeypatch.setattr(os, "fsync", fsync_and_replace_destination)
+
+    with pytest.raises(GsVideoError, match="目标|身份|变化"):
+        copy_verified_export(
+            source,
+            destination,
+            expected_size=len(payload),
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+
+    assert parked.read_bytes() == b"previous"
+    assert destination.read_bytes() == b"newer external destination"
+    assert not staging_entries(destination)
+
+
+def test_copy_verified_export_publication_failure_preserves_previous_destination(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "authoritative.mp4"
+    destination = tmp_path / "result.mp4"
+    payload = b"verified export bytes"
+    source.write_bytes(payload)
+    destination.write_bytes(b"previous")
+
+    def fail_replace(source_path: Path, destination_path: Path) -> None:
+        assert source_path.name == "staging.mp4"
+        assert destination_path == destination.absolute()
+        raise OSError("publication failed")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(GsVideoError, match="发布"):
+        copy_verified_export(
+            source,
+            destination,
+            expected_size=len(payload),
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+
+    assert destination.read_bytes() == b"previous"
+    assert not staging_entries(destination)
+
+
+def test_copy_verified_export_revalidates_authority_before_publication(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "authoritative.mp4"
+    destination = tmp_path / "result.mp4"
+    payload = b"verified export bytes"
+    source.write_bytes(payload)
+    destination.write_bytes(b"previous")
+
+    def reject_stale_authority() -> None:
+        raise GsVideoError("authority changed")
+
+    with pytest.raises(GsVideoError, match="authority changed"):
+        copy_verified_export(
+            source,
+            destination,
+            expected_size=len(payload),
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+            before_publish=reject_stale_authority,
+        )
+
+    assert destination.read_bytes() == b"previous"
+    assert not staging_entries(destination)
+
+
+@pytest.mark.parametrize("invalid_size", [True, "8", 0])
+def test_copy_verified_export_requires_a_positive_integer_size(
+    tmp_path: Path, invalid_size: object
+) -> None:
+    source = tmp_path / "authoritative.mp4"
+    source.write_bytes(b"verified")
+
+    with pytest.raises(RepairableError, match="大小"):
+        copy_verified_export(
+            source,
+            tmp_path / "copy.mp4",
+            expected_size=invalid_size,  # type: ignore[arg-type]
+            expected_sha256=hashlib.sha256(b"verified").hexdigest(),
+        )
+
+    assert not (tmp_path / "copy.mp4").exists()
 
 
 def source_probe(*, has_audio: bool) -> dict[str, object]:

@@ -25,6 +25,12 @@ class StageStatus(StrEnum):
     STALE = "stale"
 
 
+class ArtifactRole(StrEnum):
+    PROXY_FRAMES = "proxy_frames"
+    SUBJECT_MASKS = "subject_masks"
+    EXPORT_VIDEO = "export_video"
+
+
 class StageState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -32,6 +38,7 @@ class StageState(BaseModel):
     cache_key: str | None = None
     output_paths: list[str] = Field(default_factory=list)
     error_code: str | None = None
+    artifacts: dict[ArtifactRole, str] = Field(default_factory=dict)
 
 
 class VideoSummary(BaseModel):
