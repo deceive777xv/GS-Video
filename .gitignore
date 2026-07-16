@@ -4,6 +4,8 @@
 *.egg-info/
 __pycache__/
 .pytest_cache/
+.pytest-*/
+.tmp/
 .cache/
 tests/.assets/
 *.partial
