@@ -35,6 +35,15 @@ MAX_PREVIEW_ARTIFACT_BYTES = 16 * 1024 * 1024
 MAX_SUBJECT_IMAGE_PIXELS = 1920 * 1080
 _PreviewResult = TypeVar("_PreviewResult")
 PreviewAuthority = tuple[str, str, str, int, int]
+PreviewRequestFingerprint = tuple[
+    tuple[float, float, float],
+    float,
+    float,
+    float,
+    float,
+    int,
+    int,
+]
 
 
 def _stale_preview_generation() -> ApiError:
@@ -46,11 +55,26 @@ def _stale_preview_generation() -> ApiError:
     )
 
 
+def _conflicting_preview_generation() -> ApiError:
+    return ApiError(
+        409,
+        code="preview_generation_conflict",
+        category="conflict",
+        message="This preview generation is already bound to a different request.",
+    )
+
+
+@dataclass(frozen=True)
+class _PreviewWorker:
+    request_fingerprint: PreviewRequestFingerprint
+    task: asyncio.Task[Any]
+
+
 @dataclass
 class _PreviewAuthorityState:
     latest_generation: int
     waiters: int
-    workers: dict[int, asyncio.Task[Any]]
+    workers: dict[int, _PreviewWorker]
 
 
 class PreviewCoordinator:
@@ -76,6 +100,7 @@ class PreviewCoordinator:
         self,
         authority: PreviewAuthority,
         generation: int,
+        request_fingerprint: PreviewRequestFingerprint,
         operation: Any,
         *args: Any,
     ) -> _PreviewResult:
@@ -89,24 +114,29 @@ class PreviewCoordinator:
             raise _stale_preview_generation()
         else:
             state.latest_generation = generation
-        state.waiters += 1
         worker = state.workers.get(generation)
         if worker is None:
-            worker = asyncio.create_task(
-                self._render_once(state, generation, operation, args)
+            worker = _PreviewWorker(
+                request_fingerprint=request_fingerprint,
+                task=asyncio.create_task(
+                    self._render_once(state, generation, operation, args)
+                ),
             )
             state.workers[generation] = worker
+        elif worker.request_fingerprint != request_fingerprint:
+            raise _conflicting_preview_generation()
+        state.waiters += 1
         try:
-            result = await asyncio.shield(worker)
+            result = await asyncio.shield(worker.task)
         except asyncio.CancelledError:
             try:
-                await asyncio.shield(worker)
+                await asyncio.shield(worker.task)
             except Exception:
                 pass
             raise
         finally:
             state.waiters -= 1
-            if worker.done() and state.workers.get(generation) is worker:
+            if worker.task.done() and state.workers.get(generation) is worker:
                 state.workers.pop(generation, None)
             if state.waiters == 0 and not state.workers:
                 if self._authority_states.get(authority) is state:

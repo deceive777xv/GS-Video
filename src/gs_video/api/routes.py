@@ -44,6 +44,7 @@ from gs_video.api.uploads import UploadManager, read_bounded_body
 from gs_video.api.workflow import (
     PreviewArtifactStore,
     PreviewCoordinator,
+    PreviewRequestFingerprint,
     PreviewServiceLike,
     validate_pick_buffer,
     validate_subject_prompt,
@@ -388,6 +389,19 @@ def build_router() -> APIRouter:
         scene_path = project.scene_ply
         scene_authority = scene_summary.model_copy(deep=True)
         preview_epoch = project.workflow.preview_epoch
+        request_fingerprint: PreviewRequestFingerprint = (
+            (
+                preview.camera.target[0],
+                preview.camera.target[1],
+                preview.camera.target[2],
+            ),
+            preview.camera.distance,
+            preview.camera.yaw,
+            preview.camera.pitch,
+            preview.camera.fov_y_degrees,
+            preview.width,
+            preview.height,
+        )
         buffer: PickBuffer = await _preview_coordinator(request).render(
             (
                 project.project_id,
@@ -397,6 +411,7 @@ def build_router() -> APIRouter:
                 preview_epoch,
             ),
             preview.generation,
+            request_fingerprint,
             _preview_service(request).render_pick,
             repository.root,
             scene_path,

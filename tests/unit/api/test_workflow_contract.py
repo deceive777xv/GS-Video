@@ -21,6 +21,12 @@ from gs_video.domain.models import CameraPose, SceneSummary, VideoSummary
 from gs_video.scene.camera import OrbitCamera
 
 
+def _preview_fingerprint(
+    *, yaw: float = 0.0, width: int = 16, height: int = 9
+) -> tuple[tuple[float, float, float], float, float, float, float, int, int]:
+    return ((0.0, 0.0, 0.0), 4.0, yaw, 0.0, 60.0, width, height)
+
+
 class _FakeArtifactHandle:
     def __init__(self, payload: bytes) -> None:
         self._payload = payload
@@ -166,10 +172,16 @@ def test_preview_coordinator_skips_obsolete_queued_generations() -> None:
             return generation
 
         authority = ("project", "source/scene.ply", "a" * 64, 123, 0)
-        first = asyncio.create_task(coordinator.render(authority, 1, render, 1))
+        first = asyncio.create_task(
+            coordinator.render(authority, 1, _preview_fingerprint(), render, 1)
+        )
         assert await asyncio.to_thread(started.wait, 1)
-        second = asyncio.create_task(coordinator.render(authority, 2, render, 2))
-        third = asyncio.create_task(coordinator.render(authority, 3, render, 3))
+        second = asyncio.create_task(
+            coordinator.render(authority, 2, _preview_fingerprint(yaw=2.0), render, 2)
+        )
+        third = asyncio.create_task(
+            coordinator.render(authority, 3, _preview_fingerprint(yaw=3.0), render, 3)
+        )
         await asyncio.sleep(0)
         release.set()
         outcomes = await asyncio.gather(first, second, third, return_exceptions=True)
@@ -199,10 +211,16 @@ def test_preview_cancellation_keeps_serialization_until_thread_finishes() -> Non
             return 2
 
         authority = ("project", "source/scene.ply", "a" * 64, 123, 0)
-        first = asyncio.create_task(coordinator.render(authority, 1, first_render))
+        first = asyncio.create_task(
+            coordinator.render(authority, 1, _preview_fingerprint(), first_render)
+        )
         assert await asyncio.to_thread(started.wait, 1)
         first.cancel()
-        second = asyncio.create_task(coordinator.render(authority, 2, second_render))
+        second = asyncio.create_task(
+            coordinator.render(
+                authority, 2, _preview_fingerprint(yaw=2.0), second_render
+            )
+        )
         await asyncio.sleep(0.05)
         assert not second_started.is_set()
         release.set()
@@ -285,9 +303,14 @@ def test_preview_coordinator_coalesces_duplicate_queued_generation() -> None:
             return label
 
         authority = ("project", "source/scene.ply", "a" * 64, 123, 0)
-        first = asyncio.create_task(coordinator.render(authority, 1, render, "first"))
+        fingerprint = _preview_fingerprint()
+        first = asyncio.create_task(
+            coordinator.render(authority, 1, fingerprint, render, "first")
+        )
         assert await asyncio.to_thread(started.wait, 1)
-        latest = asyncio.create_task(coordinator.render(authority, 1, render, "latest"))
+        latest = asyncio.create_task(
+            coordinator.render(authority, 1, fingerprint, render, "latest")
+        )
         await asyncio.sleep(0)
         release.set()
         outcomes = await asyncio.gather(first, latest, return_exceptions=True)
@@ -298,13 +321,58 @@ def test_preview_coordinator_coalesces_duplicate_queued_generation() -> None:
     asyncio.run(exercise())
 
 
+def test_preview_coordinator_rejects_conflicting_same_generation_fingerprint() -> None:
+    async def exercise() -> None:
+        coordinator = PreviewCoordinator()
+        authority = ("project", "source/scene.ply", "a" * 64, 123, 0)
+        started = Event()
+        release = Event()
+        rendered: list[str] = []
+
+        def render(label: str) -> str:
+            rendered.append(label)
+            if label == "first":
+                started.set()
+                assert release.wait(2)
+            return label
+
+        first = asyncio.create_task(
+            coordinator.render(
+                authority, 1, _preview_fingerprint(), render, "first"
+            )
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+        conflict = asyncio.create_task(
+            coordinator.render(
+                authority, 1, _preview_fingerprint(yaw=15.0), render, "conflict"
+            )
+        )
+        await asyncio.sleep(0)
+        rejected_before_release = conflict.done()
+        release.set()
+        outcomes = await asyncio.gather(first, conflict, return_exceptions=True)
+
+        assert rejected_before_release
+        assert outcomes[0] == "first"
+        assert isinstance(outcomes[1], ApiError)
+        assert outcomes[1].status_code == 409
+        assert outcomes[1].envelope.code == "preview_generation_conflict"
+        assert rendered == ["first"]
+
+    asyncio.run(exercise())
+
+
 def test_preview_coordinator_forgets_completed_generation_for_fresh_preview() -> None:
     async def exercise() -> None:
         coordinator = PreviewCoordinator()
         authority = ("project", "source/scene.ply", "a" * 64, 123, 0)
 
-        assert await coordinator.render(authority, 99, lambda: "old") == "old"
-        assert await coordinator.render(authority, 1, lambda: "fresh") == "fresh"
+        assert await coordinator.render(
+            authority, 99, _preview_fingerprint(), lambda: "old"
+        ) == "old"
+        assert await coordinator.render(
+            authority, 1, _preview_fingerprint(), lambda: "fresh"
+        ) == "fresh"
         assert coordinator._authority_states == {}
 
     asyncio.run(exercise())
@@ -319,8 +387,10 @@ def test_preview_coordinator_forgets_failed_generation_for_fresh_preview() -> No
             raise ValueError("render failed")
 
         with pytest.raises(ValueError, match="render failed"):
-            await coordinator.render(authority, 99, fail)
-        assert await coordinator.render(authority, 1, lambda: "fresh") == "fresh"
+            await coordinator.render(authority, 99, _preview_fingerprint(), fail)
+        assert await coordinator.render(
+            authority, 1, _preview_fingerprint(), lambda: "fresh"
+        ) == "fresh"
         assert coordinator._authority_states == {}
 
     asyncio.run(exercise())
@@ -339,10 +409,16 @@ def test_preview_coordinator_separates_preview_epochs_while_old_render_runs() ->
             assert release.wait(2)
             return "old"
 
-        old = asyncio.create_task(coordinator.render(old_authority, 100, old_render))
+        old = asyncio.create_task(
+            coordinator.render(
+                old_authority, 100, _preview_fingerprint(), old_render
+            )
+        )
         assert await asyncio.to_thread(started.wait, 1)
         fresh = asyncio.create_task(
-            coordinator.render(fresh_authority, 1, lambda: "fresh")
+            coordinator.render(
+                fresh_authority, 1, _preview_fingerprint(), lambda: "fresh"
+            )
         )
         await asyncio.sleep(0)
         release.set()

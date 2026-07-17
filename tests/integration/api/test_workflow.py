@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Iterator
 import hashlib
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Any
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 from PIL import Image
 
 from gs_video.api.routes import ApiServices
@@ -473,6 +475,95 @@ def test_scene_replacement_discards_preview_rendered_from_old_scene(
     assert response.status_code == 409
     assert response.json()["code"] == "scene_changed"
     assert repository.load().workflow.preview is None
+
+
+def test_cancelled_preview_cannot_share_its_buffer_with_conflicting_request(
+    workflow_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    class BlockingPreviewService(PreviewService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = Event()
+            self.release = Event()
+
+        def render_pick(
+            self,
+            project_root: Path,
+            scene_path: str,
+            scene_summary: SceneSummary,
+            camera: OrbitCamera,
+            width: int,
+            height: int,
+        ) -> PickBuffer:
+            self.started.set()
+            assert self.release.wait(2)
+            return super().render_pick(
+                project_root, scene_path, scene_summary, camera, width, height
+            )
+
+    service = BlockingPreviewService()
+    workflow_client.app.state.preview_service = service
+    repository = workflow_client.app.state.services.project_repository
+    first_request = {
+        "generation": 1,
+        "width": 16,
+        "height": 9,
+        "camera": {
+            "target": [0.0, 0.0, 0.0],
+            "distance": 4.0,
+            "yaw": 0.0,
+            "pitch": 0.0,
+            "fov_y_degrees": 60.0,
+        },
+    }
+    conflicting_request = {
+        **first_request,
+        "camera": {**first_request["camera"], "yaw": 15.0},
+    }
+
+    async def exercise() -> tuple[bool, int, str]:
+        transport = ASGITransport(app=workflow_client.app)
+        async with AsyncClient(
+            transport=transport, base_url="http://127.0.0.1"
+        ) as client:
+            first = asyncio.create_task(
+                client.post(
+                    "/api/v1/projects/current/preview",
+                    json=first_request,
+                    headers=auth_headers,
+                )
+            )
+            assert await asyncio.to_thread(service.started.wait, 1)
+            first.cancel()
+            await asyncio.sleep(0)
+            conflicting = asyncio.create_task(
+                client.post(
+                    "/api/v1/projects/current/preview",
+                    json=conflicting_request,
+                    headers=auth_headers,
+                )
+            )
+            await asyncio.sleep(0.05)
+            rejected_before_release = conflicting.done()
+            service.release.set()
+            outcomes = await asyncio.gather(
+                first, conflicting, return_exceptions=True
+            )
+
+        assert isinstance(outcomes[0], asyncio.CancelledError)
+        response = outcomes[1]
+        assert not isinstance(response, BaseException)
+        return rejected_before_release, response.status_code, response.json()["code"]
+
+    rejected_before_release, status_code, code = asyncio.run(exercise())
+
+    assert rejected_before_release
+    assert status_code == 409
+    assert code == "preview_generation_conflict"
+    assert len(service.cameras) == 1
+    assert service.cameras[0].yaw == 0.0
+    assert repository.load().workflow.preview is None
+    assert not tuple((repository.root / "previews").glob("*.png"))
 
 
 def test_subject_prompt_requires_authoritative_proxy_bounds(
