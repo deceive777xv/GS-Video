@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import stat
@@ -8,7 +9,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from threading import RLock
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol, TypeVar, cast
 from uuid import uuid4
 
 import numpy as np
@@ -16,7 +17,14 @@ from PIL import Image
 
 from gs_video.api.schemas import ApiError, SubjectMediaRole
 from gs_video.domain.contracts import PickBuffer
-from gs_video.domain.models import ArtifactRole, Project, StageName, StageStatus
+from gs_video.domain.models import (
+    ArtifactRole,
+    Project,
+    SceneSummary,
+    StageName,
+    StageStatus,
+    SubjectPromptState,
+)
 from gs_video.scene.camera import OrbitCamera
 from gs_video.scene.gsplat_renderer import GsplatRenderer
 from gs_video.scene.ply import load_gaussian_ply
@@ -25,6 +33,62 @@ from gs_video.segmentation.paths import has_reparse_component
 
 MAX_PREVIEW_ARTIFACT_BYTES = 16 * 1024 * 1024
 MAX_SUBJECT_IMAGE_PIXELS = 1920 * 1080
+_PreviewResult = TypeVar("_PreviewResult")
+
+
+def _stale_preview_generation() -> ApiError:
+    return ApiError(
+        409,
+        code="stale_preview_generation",
+        category="conflict",
+        message="A newer preview generation is already authoritative.",
+    )
+
+
+class PreviewCoordinator:
+    """Coalesce preview requests without abandoning in-flight worker threads."""
+
+    def __init__(self) -> None:
+        self._latest_generation = 0
+        self._render_lock = asyncio.Lock()
+        self._generation_tasks: dict[int, asyncio.Task[Any]] = {}
+
+    async def _render_once(
+        self, generation: int, operation: Any, args: tuple[Any, ...]
+    ) -> Any:
+        async with self._render_lock:
+            if generation < self._latest_generation:
+                raise _stale_preview_generation()
+            return await asyncio.to_thread(operation, *args)
+
+    async def render(
+        self,
+        generation: int,
+        operation: Any,
+        *args: Any,
+    ) -> _PreviewResult:
+        self._latest_generation = max(self._latest_generation, generation)
+        worker = self._generation_tasks.get(generation)
+        owns_worker = worker is None
+        if worker is None:
+            worker = asyncio.create_task(
+                self._render_once(generation, operation, args)
+            )
+            self._generation_tasks[generation] = worker
+        try:
+            result = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(worker)
+            except Exception:
+                pass
+            raise
+        finally:
+            if owns_worker and worker.done():
+                self._generation_tasks.pop(generation, None)
+        if generation < self._latest_generation:
+            raise _stale_preview_generation()
+        return cast(_PreviewResult, result)
 
 
 def validate_pick_buffer(
@@ -105,6 +169,51 @@ def _file_fingerprint(value: os.stat_result) -> tuple[int, int, int, int, int, i
         int(value.st_mtime_ns),
         int(value.st_ctime_ns),
     )
+
+
+def _stable_file_sha256(
+    path: Path,
+    expected: os.stat_result,
+    *,
+    expected_size: int,
+) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if _file_fingerprint(opened) != _file_fingerprint(expected):
+                raise OSError("file identity changed before digest")
+            remaining = expected_size
+            while remaining:
+                chunk = stream.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise OSError("file ended before expected size")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if stream.read(1):
+                raise OSError("file exceeded expected size")
+            after_handle = os.fstat(stream.fileno())
+        after_path = path.stat()
+    except OSError as error:
+        raise ApiError(
+            409,
+            code="scene_changed",
+            category="conflict",
+            message="The Gaussian scene changed while its identity was verified.",
+            retryable=True,
+        ) from error
+    if (
+        _file_fingerprint(after_handle) != _file_fingerprint(expected)
+        or _file_fingerprint(after_path) != _file_fingerprint(expected)
+    ):
+        raise ApiError(
+            409,
+            code="scene_changed",
+            category="conflict",
+            message="The Gaussian scene changed while its identity was verified.",
+            retryable=True,
+        )
+    return digest.hexdigest()
 
 
 def _subject_media_changed(message: str) -> ApiError:
@@ -320,11 +429,38 @@ def resolve_subject_media(
     )
 
 
+def validate_subject_prompt(
+    project: Project,
+    project_root: Path,
+    prompt: SubjectPromptState,
+) -> None:
+    definition = _SUBJECT_MEDIA_DEFINITIONS[SubjectMediaRole.PROXY]
+    try:
+        artifact_root, inventory = _subject_artifact_inventory(
+            project, project_root, definition
+        )
+        if prompt.frame_index >= len(inventory):
+            raise ValueError("frame is outside the proxy inventory")
+        path = artifact_root / f"{prompt.frame_index + 1:06d}{definition.suffix}"
+        _payload, _digest, width, height = _read_subject_image(path, definition)
+        if prompt.x >= width or prompt.y >= height:
+            raise ValueError("point is outside the decoded proxy frame")
+    except (ApiError, ValueError) as error:
+        raise ApiError(
+            422,
+            code="invalid_subject_prompt",
+            category="validation",
+            message="Choose a point inside an available decoded proxy frame.",
+            retryable=True,
+        ) from error
+
+
 class PreviewServiceLike(Protocol):
     def render_pick(
         self,
         project_root: Path,
         scene_path: str,
+        scene_summary: SceneSummary,
         camera: OrbitCamera,
         width: int,
         height: int,
@@ -334,18 +470,23 @@ class PreviewServiceLike(Protocol):
 class GsplatPreviewService:
     def __init__(self, renderer: GsplatRenderer | None = None) -> None:
         self._renderer = renderer or GsplatRenderer()
+        self._lock = RLock()
+        self._cached_scene_key: tuple[object, ...] | None = None
+        self._cached_scene: object | None = None
 
     def render_pick(
         self,
         project_root: Path,
         scene_path: str,
+        scene_summary: SceneSummary,
         camera: OrbitCamera,
         width: int,
         height: int,
     ) -> PickBuffer:
-        root = project_root.resolve()
+        root = project_root.resolve(strict=True)
         try:
             scene = (root / scene_path).resolve(strict=True)
+            before = scene.stat()
         except OSError as error:
             raise ApiError(
                 409,
@@ -353,11 +494,16 @@ class GsplatPreviewService:
                 category="project",
                 message="The Gaussian scene is unavailable.",
             ) from error
-        source_root = (root / "source").resolve()
+        source_root = (root / "source").resolve(strict=True)
         if (
             not scene.is_relative_to(source_root)
             or not scene.is_file()
             or has_reparse_component(scene)
+            or not stat.S_ISREG(before.st_mode)
+            or (int(before.st_dev), int(before.st_ino)) == (0, 0)
+            or before.st_nlink != 1
+            or before.st_size != scene_summary.size
+            or scene.name != scene_summary.filename
         ):
             raise ApiError(
                 409,
@@ -365,10 +511,71 @@ class GsplatPreviewService:
                 category="project",
                 message="The Gaussian scene is unavailable.",
             )
-        gaussian_scene = load_gaussian_ply(scene)
-        return self._renderer.render_pick(
-            gaussian_scene, camera, width=width, height=height
+        fingerprint = _file_fingerprint(before)
+        cache_key = (
+            scene_path,
+            scene_summary.sha256,
+            scene_summary.size,
+            fingerprint,
         )
+        with self._lock:
+            try:
+                current = scene.stat()
+            except OSError as error:
+                raise ApiError(
+                    409,
+                    code="scene_unavailable",
+                    category="project",
+                    message="The Gaussian scene is unavailable.",
+                ) from error
+            if _file_fingerprint(current) != fingerprint:
+                raise ApiError(
+                    409,
+                    code="scene_changed",
+                    category="conflict",
+                    message="The Gaussian scene changed before preview rendering.",
+                    retryable=True,
+                )
+            if self._cached_scene_key != cache_key or self._cached_scene is None:
+                self._cached_scene_key = None
+                self._cached_scene = None
+                if (
+                    _stable_file_sha256(
+                        scene, current, expected_size=scene_summary.size
+                    )
+                    != scene_summary.sha256
+                ):
+                    raise ApiError(
+                        409,
+                        code="scene_changed",
+                        category="conflict",
+                        message="The Gaussian scene no longer matches its imported summary.",
+                        retryable=True,
+                    )
+                gaussian_scene = load_gaussian_ply(scene)
+                try:
+                    after = scene.stat()
+                except OSError as error:
+                    raise ApiError(
+                        409,
+                        code="scene_changed",
+                        category="conflict",
+                        message="The Gaussian scene changed while it was loaded.",
+                        retryable=True,
+                    ) from error
+                if _file_fingerprint(after) != fingerprint:
+                    raise ApiError(
+                        409,
+                        code="scene_changed",
+                        category="conflict",
+                        message="The Gaussian scene changed while it was loaded.",
+                        retryable=True,
+                    )
+                self._cached_scene = gaussian_scene
+                self._cached_scene_key = cache_key
+            return self._renderer.render_pick(
+                self._cached_scene, camera, width=width, height=height  # type: ignore[arg-type]
+            )
 
 
 class PreviewArtifactStore:
@@ -405,7 +612,12 @@ class PreviewArtifactStore:
             )
         return payload
 
-    def publish(self, buffer: PickBuffer) -> tuple[str, int, str]:
+    def publish(
+        self,
+        buffer: PickBuffer,
+        *,
+        preserve_artifact_ids: set[str] | None = None,
+    ) -> tuple[str, int, str]:
         artifact_id = uuid4().hex
         payload = self._png_bytes(buffer)
         destination = self._preview_root / f"{artifact_id}.png"
@@ -437,11 +649,31 @@ class PreviewArtifactStore:
             ) from error
         finally:
             temporary.unlink(missing_ok=True)
+        protected = set() if preserve_artifact_ids is None else set(preserve_artifact_ids)
+        protected.add(artifact_id)
         with self._lock:
             self._buffers[artifact_id] = buffer
             self._buffers.move_to_end(artifact_id)
             while len(self._buffers) > self._buffer_limit:
-                self._buffers.popitem(last=False)
+                removable = next(
+                    (
+                        candidate
+                        for candidate in self._buffers
+                        if candidate not in protected
+                    ),
+                    None,
+                )
+                if removable is None:
+                    break
+                self._buffers.pop(removable)
+            retained = set(self._buffers) | protected
+            try:
+                paths = tuple(self._preview_root.glob("*.png"))
+            except OSError:
+                paths = ()
+            for path in paths:
+                if path.stem not in retained:
+                    path.unlink(missing_ok=True)
         return artifact_id, len(payload), hashlib.sha256(payload).hexdigest()
 
     def read(
@@ -461,7 +693,7 @@ class PreviewArtifactStore:
         expected_path = f"previews/{artifact_id}.png"
         try:
             path = (self._root / expected_path).resolve(strict=True)
-            stat = path.stat()
+            path_stat = path.stat()
         except OSError as error:
             raise ApiError(
                 404,
@@ -472,10 +704,11 @@ class PreviewArtifactStore:
         if (
             not path.is_relative_to(self._preview_root)
             or has_reparse_component(path)
-            or not path.is_file()
-            or stat.st_nlink != 1
-            or stat.st_size != expected_size
-            or stat.st_size > MAX_PREVIEW_ARTIFACT_BYTES
+            or not stat.S_ISREG(path_stat.st_mode)
+            or (int(path_stat.st_dev), int(path_stat.st_ino)) == (0, 0)
+            or path_stat.st_nlink != 1
+            or path_stat.st_size != expected_size
+            or path_stat.st_size > MAX_PREVIEW_ARTIFACT_BYTES
         ):
             raise ApiError(
                 409,
@@ -483,7 +716,32 @@ class PreviewArtifactStore:
                 category="filesystem",
                 message="The preview artifact identity changed.",
             )
-        payload = path.read_bytes()
+        try:
+            with path.open("rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if _file_fingerprint(opened) != _file_fingerprint(path_stat):
+                    raise OSError("preview identity changed before read")
+                payload = stream.read(expected_size + 1)
+                after_handle = os.fstat(stream.fileno())
+            after_path = path.stat()
+        except OSError as error:
+            raise ApiError(
+                409,
+                code="preview_artifact_changed",
+                category="filesystem",
+                message="The preview artifact identity changed.",
+            ) from error
+        if (
+            len(payload) != expected_size
+            or _file_fingerprint(after_handle) != _file_fingerprint(path_stat)
+            or _file_fingerprint(after_path) != _file_fingerprint(path_stat)
+        ):
+            raise ApiError(
+                409,
+                code="preview_artifact_changed",
+                category="filesystem",
+                message="The preview artifact identity changed.",
+            )
         if hashlib.sha256(payload).hexdigest() != expected_sha256:
             raise ApiError(
                 409,

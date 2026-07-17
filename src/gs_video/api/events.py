@@ -260,9 +260,13 @@ class TaskService:
             await self._update(task_id, stage, TaskStatus.FAILED, 1.0, "task_failed")
             return
         mapped = {
-            StageStatus.CANCELLED: TaskStatus.CANCELLED,
+            StageStatus.SUCCEEDED: TaskStatus.SUCCEEDED,
             StageStatus.FAILED: TaskStatus.FAILED,
-        }.get(result.status, TaskStatus.SUCCEEDED)
+            StageStatus.CANCELLED: TaskStatus.CANCELLED,
+            StageStatus.STALE: TaskStatus.CANCELLED,
+            StageStatus.PENDING: TaskStatus.CANCELLED,
+            StageStatus.RUNNING: TaskStatus.CANCELLED,
+        }[result.status]
         error = result.error_code if mapped is TaskStatus.FAILED else None
         await self._update(task_id, stage, mapped, 1.0, error)
 

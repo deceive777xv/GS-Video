@@ -6,7 +6,13 @@ from gs_video.domain.contracts import Stage, StageResult
 from gs_video.domain.models import Project, StageName, StageStatus
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
-from gs_video.pipeline.runner import PersistStage, PipelineRunner, SaveProject
+from gs_video.pipeline.runner import (
+    CompareAndSetStage,
+    ClaimStage,
+    PersistStage,
+    PipelineRunner,
+    SaveProject,
+)
 
 
 DEPENDENCIES: dict[StageName, tuple[StageName, ...]] = {
@@ -131,6 +137,8 @@ def build_mvp_workflow(
     project: Project,
     save: SaveProject = discard_project,
     persist_stage: PersistStage | None = None,
+    compare_and_set_stage: CompareAndSetStage | None = None,
+    claim_stage: ClaimStage | None = None,
 ) -> PipelineRunner:
     stages: dict[StageName, Stage] = {
         StageName.INGEST: IngestStage(services.media_ingest),
@@ -148,6 +156,8 @@ def build_mvp_workflow(
         dependencies=DEPENDENCIES,
         reuse_succeeded=True,
         persist_stage=persist_stage,
+        compare_and_set_stage=compare_and_set_stage,
+        claim_stage=claim_stage,
     )
 
 
@@ -175,9 +185,11 @@ def invalidate_from(project: Project, changed_stage: StageName) -> Project:
     for stage in invalidated:
         state = project.stages.get(stage)
         if state is not None:
+            state.input_generation += 1
             state.status = StageStatus.STALE
             state.cache_key = None
             state.error_code = None
+            state.run_id = None
 
     return project
 

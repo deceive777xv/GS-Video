@@ -1,5 +1,8 @@
 from collections.abc import Iterator
+import hashlib
 from pathlib import Path
+from threading import Event
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -12,10 +15,15 @@ from gs_video.app import create_app
 from gs_video.domain.contracts import PickBuffer
 from gs_video.domain.models import (
     ArtifactRole,
+    CameraPose,
+    ExportResultState,
+    FootPointState,
+    PreviewState,
     StageName,
     StageState,
     StageStatus,
     SubjectPromptState,
+    SceneSummary,
 )
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.media.ffmpeg import VideoMetadata
@@ -52,11 +60,12 @@ class PreviewService:
         self,
         project_root: Path,
         scene_path: str,
+        scene_summary: SceneSummary,
         camera: OrbitCamera,
         width: int,
         height: int,
     ) -> PickBuffer:
-        del project_root, scene_path
+        del project_root, scene_path, scene_summary
         self.cameras.append(camera)
         rgb = np.full((height, width, 3), 96, dtype=np.uint8)
         depth = np.full((height, width), 2.0, dtype=np.float32)
@@ -82,6 +91,14 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
     project = repository.create("workflow")
     project.source_video = "source/video.mp4"
     project.scene_ply = "source/scene.ply"
+    (repository.root / "source" / "scene.ply").write_bytes(b"scene-one")
+    project.workflow.scene_summary = SceneSummary(
+        filename="scene.ply",
+        size=9,
+        sha256="1" * 64,
+        gaussian_count=1,
+        estimated_vram_mb=1,
+    )
     (repository.root / "exports" / "final.mp4").write_bytes(b"verified-video")
     for index in range(1, 6):
         Image.new("RGB", (16, 9), (20, 40, 60)).save(
@@ -139,7 +156,7 @@ def test_targeted_workflow_patch_persists_and_invalidates_only_downstream(
     response = workflow_client.patch(
         "/api/v1/projects/current",
         json={
-            "subject_prompt": {"frame_index": 4, "x": 100, "y": 120},
+            "subject_prompt": {"frame_index": 4, "x": 10, "y": 5},
             "motion_scale": 0.75,
         },
         headers=auth_headers,
@@ -149,8 +166,8 @@ def test_targeted_workflow_patch_persists_and_invalidates_only_downstream(
     body = response.json()
     assert body["workflow"]["subject_prompt"] == {
         "frame_index": 4,
-        "x": 100,
-        "y": 120,
+        "x": 10,
+        "y": 5,
     }
     assert body["workflow"]["motion_scale"] == 0.75
     persisted = workflow_client.get(
@@ -210,13 +227,30 @@ def test_preview_and_pick_are_persisted_with_revision_guards(
     assert unconfirmed.status_code == 409
     assert unconfirmed.json()["code"] == "camera_not_confirmed"
 
+    second = workflow_client.post(
+        "/api/v1/projects/current/preview",
+        json={
+            "generation": 2,
+            "width": 16,
+            "height": 9,
+            "camera": {
+                "target": [0.0, 0.0, 0.0],
+                "distance": 4.0,
+                "yaw": 5.0,
+                "pitch": 0.0,
+                "fov_y_degrees": 60.0,
+            },
+        },
+        headers=auth_headers,
+    ).json()
+
     confirmed = workflow_client.post(
         "/api/v1/projects/current/camera/confirm",
-        json={"camera_revision": descriptor["camera_revision"]},
+        json={"camera_revision": second["camera_revision"]},
         headers=auth_headers,
     )
     assert confirmed.status_code == 200
-    assert confirmed.json()["workflow"]["confirmed_camera_revision"] == 1
+    assert confirmed.json()["workflow"]["confirmed_camera_revision"] == 2
 
     stale = workflow_client.post(
         "/api/v1/projects/current/pick",
@@ -224,7 +258,7 @@ def test_preview_and_pick_are_persisted_with_revision_guards(
             "x": 8,
             "y": 4,
             "camera_revision": descriptor["camera_revision"],
-            "pick_buffer_revision": descriptor["pick_buffer_revision"] - 1,
+            "pick_buffer_revision": descriptor["pick_buffer_revision"],
         },
         headers=auth_headers,
     )
@@ -236,14 +270,14 @@ def test_preview_and_pick_are_persisted_with_revision_guards(
         json={
             "x": 8,
             "y": 4,
-            "camera_revision": descriptor["camera_revision"],
-            "pick_buffer_revision": descriptor["pick_buffer_revision"],
+            "camera_revision": second["camera_revision"],
+            "pick_buffer_revision": second["pick_buffer_revision"],
         },
         headers=auth_headers,
     )
     assert picked.status_code == 200
-    assert picked.json()["camera_revision"] == 1
-    assert picked.json()["pick_buffer_revision"] == 1
+    assert picked.json()["camera_revision"] == 2
+    assert picked.json()["pick_buffer_revision"] == 2
     assert len(picked.json()["world"]) == 3
     project = workflow_client.get(
         "/api/v1/projects/current", headers=auth_headers
@@ -277,6 +311,198 @@ def test_stale_preview_generation_cannot_replace_newer_snapshot(
 
     assert stale.status_code == 409
     assert stale.json()["code"] == "stale_preview_generation"
+
+
+def test_scene_replacement_discards_preview_rendered_from_old_scene(
+    tmp_path: Path, auth_headers: dict[str, str]
+) -> None:
+    class BlockingPreviewService(PreviewService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = Event()
+            self.release = Event()
+
+        def render_pick(
+            self,
+            project_root: Path,
+            scene_path: str,
+            scene_summary: SceneSummary,
+            camera: OrbitCamera,
+            width: int,
+            height: int,
+        ) -> PickBuffer:
+            self.started.set()
+            assert self.release.wait(2)
+            return super().render_pick(
+                project_root, scene_path, scene_summary, camera, width, height
+            )
+
+    repository = ProjectRepository(tmp_path / "scene-race")
+    project = repository.create("scene-race")
+    project.scene_ply = "source/old.ply"
+    (repository.root / "source" / "old.ply").write_bytes(b"old")
+    project.workflow.scene_summary = SceneSummary(
+        filename="old.ply", size=3, sha256="a" * 64,
+        gaussian_count=1, estimated_vram_mb=1
+    )
+    repository.save(project)
+    service = BlockingPreviewService()
+    services = ApiServices(
+        project_repository=repository,
+        environment_doctor=StaticDoctor(),
+        pipeline_runner=SucceedingRunner(),
+        worker_registry=Registry(),
+        preview_service=service,
+    )
+    settings = ApiSettings(
+        bind_host="127.0.0.1", port=0, session_token=TOKEN,
+        allowed_origins=(ORIGIN,),
+    )
+    request = {
+        "generation": 1, "width": 16, "height": 9,
+        "camera": {"target": [0.0, 0.0, 0.0], "distance": 4.0,
+                   "yaw": 0.0, "pitch": 0.0, "fov_y_degrees": 60.0},
+    }
+
+    with TestClient(create_app(settings, services)) as client:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(
+                client.post, "/api/v1/projects/current/preview",
+                json=request, headers=auth_headers
+            )
+            assert service.started.wait(1)
+
+            def replace_scene(latest: object) -> None:
+                latest.scene_ply = "source/new.ply"  # type: ignore[attr-defined]
+                latest.workflow.scene_summary = SceneSummary(  # type: ignore[attr-defined]
+                    filename="new.ply", size=3, sha256="b" * 64,
+                    gaussian_count=1, estimated_vram_mb=1
+                )
+
+            (repository.root / "source" / "new.ply").write_bytes(b"new")
+            repository.update(replace_scene)
+            service.release.set()
+            response = pending.result(timeout=2)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "scene_changed"
+    assert repository.load().workflow.preview is None
+
+
+def test_subject_prompt_requires_authoritative_proxy_bounds(
+    workflow_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    before = workflow_client.get(
+        "/api/v1/projects/current", headers=auth_headers
+    ).json()["workflow"]["subject_prompt"]
+
+    invalid_frame = workflow_client.patch(
+        "/api/v1/projects/current",
+        json={"subject_prompt": {"frame_index": 5, "x": 0, "y": 0}},
+        headers=auth_headers,
+    )
+    invalid_point = workflow_client.patch(
+        "/api/v1/projects/current",
+        json={"subject_prompt": {"frame_index": 4, "x": 16, "y": 9}},
+        headers=auth_headers,
+    )
+
+    assert invalid_frame.status_code == 422
+    assert invalid_frame.json()["code"] == "invalid_subject_prompt"
+    assert invalid_point.status_code == 422
+    assert invalid_point.json()["code"] == "invalid_subject_prompt"
+    assert workflow_client.get(
+        "/api/v1/projects/current", headers=auth_headers
+    ).json()["workflow"]["subject_prompt"] == before
+
+
+def test_subject_prompt_can_be_cleared_without_proxy_validation(
+    workflow_client: TestClient, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    for proxy in (tmp_path / "project" / "proxies").glob("*.jpg"):
+        proxy.unlink()
+
+    response = workflow_client.patch(
+        "/api/v1/projects/current",
+        json={"subject_prompt": None},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["workflow"]["subject_prompt"] is None
+
+
+@pytest.mark.parametrize("replacement_path", ["local", "upload"])
+def test_replacing_source_video_clears_all_source_derived_authority(
+    workflow_client: TestClient,
+    auth_headers: dict[str, str],
+    tmp_path: Path,
+    replacement_path: str,
+) -> None:
+    repository = workflow_client.app.state.services.project_repository
+
+    def seed_authority(project: object) -> None:
+        workflow = project.workflow  # type: ignore[attr-defined]
+        workflow.target_camera = CameraPose(
+            target=(0.0, 0.0, 0.0), distance=4.0, yaw=0.0,
+            pitch=0.0, fov_y_degrees=60.0, revision=3
+        )
+        workflow.confirmed_camera_revision = 3
+        workflow.foot_point = FootPointState(
+            image=(8, 4), world=(0.0, 0.0, 2.0),
+            camera_revision=3, pick_buffer_revision=3
+        )
+        workflow.preview = PreviewState(
+            artifact_id="f" * 32, artifact_size=10,
+            artifact_sha256="e" * 64, generation=3, width=16, height=9,
+            camera_revision=3, pick_buffer_revision=3
+        )
+        workflow.export_result = ExportResultState(
+            artifact_id="d" * 32, filename="final.mp4", size=10,
+            sha256="c" * 64, duration_seconds=1.0, fps="30",
+            frame_count=30, has_audio=False
+        )
+        workflow.active_task_id = "obsolete-task"
+
+    repository.update(seed_authority)
+    payload = b"replacement-video"
+    if replacement_path == "local":
+        selected = tmp_path / "replacement.mp4"
+        selected.write_bytes(payload)
+        response = workflow_client.post(
+            "/api/v1/assets/import",
+            json={"path": str(selected), "kind": "source_video"},
+            headers=auth_headers,
+        )
+    else:
+        created = workflow_client.post(
+            "/api/v1/uploads",
+            json={
+                "kind": "source_video", "filename": "replacement.mp4",
+                "mime_type": "video/mp4", "total_size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            },
+            headers=auth_headers,
+        ).json()
+        assert workflow_client.put(
+            f"/api/v1/uploads/{created['id']}/chunks/0",
+            content=payload, headers=auth_headers
+        ).status_code == 204
+        response = workflow_client.post(
+            f"/api/v1/uploads/{created['id']}/complete", headers=auth_headers
+        )
+
+    assert response.status_code == 201
+    project = repository.load()
+    assert project.workflow.subject_prompt is None
+    assert project.workflow.confirmed_camera_revision is None
+    assert project.workflow.foot_point is None
+    assert project.workflow.preview is None
+    assert project.workflow.export_result is None
+    assert project.workflow.active_task_id is None
+    for name in (StageName.INGEST, StageName.SEGMENT, StageName.EXPORT):
+        assert project.stages[name].status is StageStatus.STALE
+        assert project.stages[name].input_generation == 1
 
 
 def test_started_task_id_is_recoverable_from_project_snapshot(

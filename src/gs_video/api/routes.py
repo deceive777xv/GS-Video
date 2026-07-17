@@ -4,7 +4,6 @@ import asyncio
 import errno
 import hashlib
 import os
-import stat
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
@@ -16,6 +15,7 @@ from fastapi import APIRouter, Depends, Request, Response, WebSocket, status
 from gs_video.api.auth import require_session
 from gs_video.api.assets import AssetInspectorLike, ExportInspectorLike
 from gs_video.api.events import EventBus, TaskService, serve_events
+from gs_video.api.export_routes import build_export_router
 from gs_video.api.schemas import (
     API_VERSION,
     ApiError,
@@ -26,49 +26,42 @@ from gs_video.api.schemas import (
     BootstrapResponse,
     CameraConfirmationRequest,
     CameraInput,
-    ExportCopyRequest,
     HealthResponse,
     PickRequest,
     PickResponse,
     PreviewFrameRequest,
     PreviewFrameResponse,
     ProjectPatch,
-    SubjectMediaResponse,
-    SubjectMediaRole,
     TaskCreateRequest,
     TaskSnapshot,
     UploadComplete,
     UploadCreateRequest,
     UploadCreated,
     UploadStatus,
-    VerifiedExportResponse,
 )
+from gs_video.api.subject_routes import build_subject_router
 from gs_video.api.uploads import UploadManager, read_bounded_body
 from gs_video.api.workflow import (
     PreviewArtifactStore,
+    PreviewCoordinator,
     PreviewServiceLike,
-    resolve_subject_media,
     validate_pick_buffer,
+    validate_subject_prompt,
 )
+from gs_video.domain.contracts import PickBuffer
 from gs_video.domain.models import (
-    ArtifactRole,
     CameraPose,
-    ExportResultState,
     FootPointState,
     PreviewState,
     Project,
     StageName,
     StageState,
-    StageStatus,
     SubjectPromptState,
 )
-from gs_video.domain.errors import GsVideoError, RepairableError
 from gs_video.environment.doctor import EnvironmentReport
-from gs_video.media.export import copy_verified_export
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.workflow import ChangeKind, invalidate_for_change
 from gs_video.scene.camera import OrbitCamera
-from gs_video.segmentation.paths import has_reparse_component
 
 
 class ProjectRepositoryLike(Protocol):
@@ -87,6 +80,8 @@ class EnvironmentDoctorLike(Protocol):
 
 class PipelineRunnerLike(Protocol):
     def run(self, name: StageName, token: CancellationToken) -> StageState: ...
+
+    def supports(self, name: StageName) -> bool: ...
 
 
 class WorkerRegistryLike(Protocol):
@@ -128,8 +123,8 @@ def _preview_artifacts(request: Request) -> PreviewArtifactStore:
     return cast(PreviewArtifactStore, request.app.state.preview_artifacts)
 
 
-def _export_inspector(request: Request) -> ExportInspectorLike:
-    return cast(ExportInspectorLike, request.app.state.export_inspector)
+def _preview_coordinator(request: Request) -> PreviewCoordinator:
+    return cast(PreviewCoordinator, request.app.state.preview_coordinator)
 
 
 def _camera(value: CameraInput) -> OrbitCamera:
@@ -229,252 +224,6 @@ def _copy_bounded(source: Path, destination: Path, limit: int) -> tuple[int, str
     return size, digest.hexdigest()
 
 
-def _read_verified_artifact(
-    root: Path,
-    relative: str,
-    *,
-    directory: str,
-    expected_size: int | None,
-    expected_sha256: str | None,
-    limit: int,
-) -> tuple[Path, bytes, str]:
-    path, path_stat = _verified_artifact_state(
-        root,
-        relative,
-        directory=directory,
-        expected_size=expected_size,
-        limit=limit,
-    )
-    payload, digest = _read_stable_artifact(path, path_stat, limit=limit)
-    if expected_size is not None and len(payload) != expected_size:
-        raise ApiError(
-            409,
-            code="artifact_changed",
-            category="filesystem",
-            message="The project artifact identity changed.",
-        )
-    if expected_sha256 is not None and digest != expected_sha256:
-        raise ApiError(
-            409,
-            code="artifact_changed",
-            category="filesystem",
-            message="The project artifact identity changed.",
-        )
-    return path, payload, digest
-
-
-def _artifact_fingerprint(
-    value: os.stat_result,
-) -> tuple[int, int, int, int, int, int]:
-    return (
-        int(value.st_dev),
-        int(value.st_ino),
-        int(value.st_size),
-        int(value.st_nlink),
-        int(value.st_mtime_ns),
-        int(value.st_ctime_ns),
-    )
-
-
-def _read_stable_artifact(
-    path: Path, expected_stat: os.stat_result, *, limit: int
-) -> tuple[bytes, str]:
-    captured_size = int(expected_stat.st_size)
-    if captured_size <= 0 or captured_size > limit:
-        raise ApiError(
-            409,
-            code="artifact_changed",
-            category="filesystem",
-            message="The project artifact identity changed.",
-        )
-    digest = hashlib.sha256()
-    payload = bytearray()
-    try:
-        with path.open("rb") as stream:
-            opened_stat = os.fstat(stream.fileno())
-            if (
-                not stat.S_ISREG(opened_stat.st_mode)
-                or opened_stat.st_nlink != 1
-                or _artifact_fingerprint(opened_stat)
-                != _artifact_fingerprint(expected_stat)
-            ):
-                raise ApiError(
-                    409,
-                    code="artifact_changed",
-                    category="filesystem",
-                    message="The project artifact identity changed.",
-                )
-            while True:
-                remaining_with_sentinel = captured_size - len(payload) + 1
-                block = stream.read(min(1024 * 1024, remaining_with_sentinel))
-                if not block:
-                    break
-                payload.extend(block)
-                if len(payload) > captured_size:
-                    raise ApiError(
-                        409,
-                        code="artifact_changed",
-                        category="filesystem",
-                        message="The project artifact exceeded its captured size.",
-                    )
-                digest.update(block)
-            final_handle_stat = os.fstat(stream.fileno())
-        final_path_stat = path.stat()
-    except ApiError:
-        raise
-    except OSError as error:
-        raise ApiError(
-            409,
-            code="artifact_changed",
-            category="filesystem",
-            message="The project artifact could not be read safely.",
-        ) from error
-    expected_fingerprint = _artifact_fingerprint(expected_stat)
-    if (
-        len(payload) != captured_size
-        or _artifact_fingerprint(final_handle_stat) != expected_fingerprint
-        or _artifact_fingerprint(final_path_stat) != expected_fingerprint
-        or has_reparse_component(path)
-    ):
-        raise ApiError(
-            409,
-            code="artifact_changed",
-            category="filesystem",
-            message="The project artifact identity changed while it was read.",
-        )
-    return bytes(payload), digest.hexdigest()
-
-
-def _verified_artifact_state(
-    root: Path,
-    relative: str,
-    *,
-    directory: str,
-    expected_size: int | None,
-    limit: int,
-) -> tuple[Path, os.stat_result]:
-    canonical_root = root.resolve()
-    allowed_root = (canonical_root / directory).resolve()
-    try:
-        candidate = canonical_root / relative
-        path = candidate.resolve(strict=True)
-        path_stat = path.stat()
-    except OSError as error:
-        raise ApiError(
-            404,
-            code="artifact_unavailable",
-            category="project",
-            message="The requested project artifact is unavailable.",
-        ) from error
-    if (
-        not path.is_relative_to(allowed_root)
-        or has_reparse_component(candidate)
-        or has_reparse_component(path)
-        or not stat.S_ISREG(path_stat.st_mode)
-        or (int(path_stat.st_dev), int(path_stat.st_ino)) == (0, 0)
-        or path_stat.st_nlink != 1
-        or path_stat.st_size <= 0
-        or path_stat.st_size > limit
-        or (expected_size is not None and path_stat.st_size != expected_size)
-    ):
-        raise ApiError(
-            409,
-            code="artifact_changed",
-            category="filesystem",
-            message="The project artifact identity changed.",
-        )
-    return path, path_stat
-
-
-def _verified_artifact_path(
-    root: Path,
-    relative: str,
-    *,
-    directory: str,
-    expected_size: int | None,
-    limit: int,
-) -> Path:
-    path, _path_stat = _verified_artifact_state(
-        root,
-        relative,
-        directory=directory,
-        expected_size=expected_size,
-        limit=limit,
-    )
-    return path
-
-
-def _authoritative_export_relative(
-    project: Project, *, not_ready: bool = False
-) -> tuple[str, str]:
-    stage = project.stages.get(StageName.EXPORT)
-    registered = (
-        None
-        if stage is None
-        else stage.artifacts.get(ArtifactRole.EXPORT_VIDEO)
-    )
-    if (
-        stage is None
-        or stage.status is not StageStatus.SUCCEEDED
-        or stage.cache_key is None
-        or registered is None
-        or not stage.output_paths
-        or stage.output_paths[-1] != registered
-    ):
-        raise ApiError(
-            409,
-            code="export_not_ready" if not_ready else "export_changed",
-            category="project" if not_ready else "conflict",
-            message=(
-                "A verified export is not ready."
-                if not_ready
-                else "The verified export is no longer authoritative."
-            ),
-        )
-    assert stage.cache_key is not None
-    return registered, stage.cache_key
-
-
-def _opaque_export_id(cache_key: str, sha256: str) -> str:
-    return hashlib.sha256(f"export\0{cache_key}\0{sha256}".encode()).hexdigest()[:32]
-
-
-def _validate_export_descriptor_authority(
-    export: ExportResultState, cache_key: str
-) -> None:
-    if export.artifact_id != _opaque_export_id(cache_key, export.sha256):
-        raise ApiError(
-            409,
-            code="export_changed",
-            category="conflict",
-            message="The verified export descriptor is stale.",
-        )
-
-
-def _external_export_destination(project_root: Path, raw_destination: str) -> Path:
-    try:
-        canonical_root = project_root.resolve(strict=True)
-        requested = Path(raw_destination).expanduser()
-        if not requested.is_absolute():
-            raise ValueError("destination must be absolute")
-        destination = requested.resolve(strict=False)
-    except (OSError, RuntimeError, ValueError) as error:
-        raise ApiError(
-            400,
-            code="invalid_export_destination",
-            category="filesystem",
-            message="The selected export destination is unsafe or invalid.",
-        ) from error
-    if destination == canonical_root or destination.is_relative_to(canonical_root):
-        raise ApiError(
-            400,
-            code="invalid_export_destination",
-            category="filesystem",
-            message="The export destination must be outside the project directory.",
-        )
-    return destination
-
-
 def _import_asset_sync(
     services: ApiServices,
     settings: ApiSettings,
@@ -520,9 +269,7 @@ def _import_asset_sync(
 
     def persist(project: Project) -> None:
         if asset.kind == AssetKind.SOURCE_VIDEO.value:
-            project.source_video = relative
-            project.workflow.source_summary = cast(Any, summary)
-            invalidate_for_change(project, ChangeKind.SOURCE_VIDEO)
+            _replace_source_video(project, relative, cast(Any, summary))
         else:
             project.scene_ply = relative
             project.workflow.scene_summary = cast(Any, summary)
@@ -537,6 +284,18 @@ def _import_asset_sync(
     return AssetResponse(
         kind=asset.kind, path=relative, size=size, sha256=sha256
     )
+
+
+def _replace_source_video(project: Project, relative: str, summary: Any) -> None:
+    project.source_video = relative
+    project.workflow.source_summary = summary
+    project.workflow.subject_prompt = None
+    project.workflow.confirmed_camera_revision = None
+    project.workflow.foot_point = None
+    project.workflow.preview = None
+    project.workflow.export_result = None
+    project.workflow.active_task_id = None
+    invalidate_for_change(project, ChangeKind.SOURCE_VIDEO)
 
 
 def build_router() -> APIRouter:
@@ -570,13 +329,16 @@ def build_router() -> APIRouter:
             if patch.name is not None:
                 project.name = patch.name
             if "subject_prompt" in patch.model_fields_set:
-                project.workflow.subject_prompt = (
+                prompt = (
                     None
                     if patch.subject_prompt is None
                     else SubjectPromptState.model_validate(
                         patch.subject_prompt.model_dump()
                     )
                 )
+                if prompt is not None:
+                    validate_subject_prompt(project, repository.root, prompt)
+                project.workflow.subject_prompt = prompt
                 invalidate_for_change(project, ChangeKind.SUBJECT_PROMPT)
                 project.workflow.export_result = None
             if patch.motion_scale is not None:
@@ -604,7 +366,8 @@ def build_router() -> APIRouter:
         services = _services(request)
         repository = services.project_repository
         project = _load_project(repository)
-        if project.scene_ply is None:
+        scene_summary = project.workflow.scene_summary
+        if project.scene_ply is None or scene_summary is None:
             raise ApiError(
                 409,
                 code="scene_required",
@@ -620,10 +383,14 @@ def build_router() -> APIRouter:
                 message="A newer preview generation is already authoritative.",
             )
         camera = _camera(preview.camera)
-        buffer = await asyncio.to_thread(
+        scene_path = project.scene_ply
+        scene_authority = scene_summary.model_copy(deep=True)
+        buffer: PickBuffer = await _preview_coordinator(request).render(
+            preview.generation,
             _preview_service(request).render_pick,
             repository.root,
-            project.scene_ply,
+            scene_path,
+            scene_authority,
             camera,
             preview.width,
             preview.height,
@@ -633,6 +400,17 @@ def build_router() -> APIRouter:
 
         def persist(latest: Project) -> None:
             nonlocal response
+            if (
+                latest.scene_ply != scene_path
+                or latest.workflow.scene_summary != scene_authority
+            ):
+                raise ApiError(
+                    409,
+                    code="scene_changed",
+                    category="conflict",
+                    message="The Gaussian scene changed while the preview was rendered.",
+                    retryable=True,
+                )
             latest_preview = latest.workflow.preview
             if (
                 latest_preview is not None
@@ -645,7 +423,14 @@ def build_router() -> APIRouter:
                     message="A newer preview generation is already authoritative.",
                 )
             artifact_id, artifact_size, artifact_sha256 = (
-                _preview_artifacts(request).publish(buffer)
+                _preview_artifacts(request).publish(
+                    buffer,
+                    preserve_artifact_ids=(
+                        set()
+                        if latest_preview is None
+                        else {latest_preview.artifact_id}
+                    ),
+                )
             )
             revision = (
                 1
@@ -702,59 +487,6 @@ def build_router() -> APIRouter:
         return Response(
             content=payload,
             media_type="image/png",
-            headers={
-                "Cache-Control": "no-store",
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
-
-    @protected.get(
-        "/api/v1/projects/current/subject-media/{role}",
-        response_model=SubjectMediaResponse,
-    )
-    async def get_subject_media(
-        request: Request, role: SubjectMediaRole
-    ) -> SubjectMediaResponse:
-        services = _services(request)
-        resolved = await asyncio.to_thread(
-            resolve_subject_media,
-            _load_project(services.project_repository),
-            services.project_repository.root,
-            role,
-        )
-        return SubjectMediaResponse(
-            role=resolved.role,
-            artifact_id=resolved.artifact_id,
-            frame_index=resolved.frame_index,
-            width=resolved.width,
-            height=resolved.height,
-            size=resolved.size,
-            mime_type=resolved.mime_type,
-        )
-
-    @protected.get(
-        "/api/v1/projects/current/subject-media/{role}/{artifact_id}"
-    )
-    async def get_subject_media_artifact(
-        request: Request, role: SubjectMediaRole, artifact_id: str
-    ) -> Response:
-        services = _services(request)
-        resolved = await asyncio.to_thread(
-            resolve_subject_media,
-            _load_project(services.project_repository),
-            services.project_repository.root,
-            role,
-        )
-        if resolved.artifact_id != artifact_id:
-            raise ApiError(
-                404,
-                code="subject_media_unavailable",
-                category="project",
-                message="The requested subject media is unavailable.",
-            )
-        return Response(
-            content=resolved.payload,
-            media_type=resolved.mime_type,
             headers={
                 "Cache-Control": "no-store",
                 "X-Content-Type-Options": "nosniff",
@@ -881,213 +613,6 @@ def build_router() -> APIRouter:
         await asyncio.to_thread(repository.update, persist)
         return PickResponse.model_validate(foot.model_dump())
 
-    @protected.get(
-        "/api/v1/projects/current/export",
-        response_model=VerifiedExportResponse,
-    )
-    async def get_verified_export(request: Request) -> VerifiedExportResponse:
-        services = _services(request)
-        repository = services.project_repository
-        project = _load_project(repository)
-        relative, export_cache_key = _authoritative_export_relative(
-            project, not_ready=True
-        )
-        path, payload, digest = await asyncio.to_thread(
-            _read_verified_artifact,
-            repository.root,
-            relative,
-            directory="exports",
-            expected_size=None,
-            expected_sha256=None,
-            limit=_settings(request).max_artifact_response_size,
-        )
-        metadata = await asyncio.to_thread(_export_inspector(request).probe, path)
-        await asyncio.to_thread(
-            _read_verified_artifact,
-            repository.root,
-            relative,
-            directory="exports",
-            expected_size=len(payload),
-            expected_sha256=digest,
-            limit=_settings(request).max_artifact_response_size,
-        )
-        if metadata.frame_count is None:
-            raise ApiError(
-                409,
-                code="export_verification_incomplete",
-                category="export",
-                message="The exported video did not report a verified frame count.",
-            )
-        result = ExportResultState(
-            artifact_id=_opaque_export_id(export_cache_key, digest),
-            filename=path.name,
-            size=len(payload),
-            sha256=digest,
-            duration_seconds=metadata.duration,
-            fps=str(metadata.fps),
-            frame_count=metadata.frame_count,
-            has_audio=metadata.has_audio,
-            verified=True,
-        )
-
-        def persist(latest: Project) -> None:
-            try:
-                latest_relative, latest_cache_key = _authoritative_export_relative(
-                    latest
-                )
-            except ApiError as error:
-                raise ApiError(
-                    409,
-                    code="export_changed",
-                    category="conflict",
-                    message="The export changed while it was being verified.",
-                    retryable=True,
-                ) from error
-            if (
-                latest_relative != relative
-                or latest_cache_key != export_cache_key
-            ):
-                raise ApiError(
-                    409,
-                    code="export_changed",
-                    category="conflict",
-                    message="The export changed while it was being verified.",
-                    retryable=True,
-                )
-            latest.workflow.export_result = result
-
-        await asyncio.to_thread(repository.update, persist)
-        return VerifiedExportResponse.model_validate(
-            result.model_dump(exclude={"sha256"})
-        )
-
-    @protected.get(
-        "/api/v1/projects/current/exports/{artifact_id}"
-    )
-    async def get_export_artifact(request: Request, artifact_id: str) -> Response:
-        services = _services(request)
-        project = _load_project(services.project_repository)
-        export = project.workflow.export_result
-        if export is None or export.artifact_id != artifact_id or not export.verified:
-            raise ApiError(
-                404,
-                code="export_unavailable",
-                category="project",
-                message="The requested export is unavailable.",
-            )
-        artifact_limit = _settings(request).max_artifact_response_size
-        if export.size <= 0 or export.size > artifact_limit:
-            raise ApiError(
-                409,
-                code="export_changed",
-                category="conflict",
-                message="The verified export is outside the configured size bound.",
-            )
-        relative, export_cache_key = _authoritative_export_relative(project)
-        _validate_export_descriptor_authority(export, export_cache_key)
-        _path, payload, _digest = await asyncio.to_thread(
-            _read_verified_artifact,
-            services.project_repository.root,
-            relative,
-            directory="exports",
-            expected_size=export.size,
-            expected_sha256=export.sha256,
-            limit=artifact_limit,
-        )
-        return Response(
-            content=payload,
-            media_type="video/mp4",
-            headers={
-                "Cache-Control": "no-store",
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
-
-    @protected.post(
-        "/api/v1/projects/current/exports/{artifact_id}/copy",
-        status_code=status.HTTP_204_NO_CONTENT,
-    )
-    async def copy_export_artifact(
-        request: Request, artifact_id: str, body: ExportCopyRequest
-    ) -> Response:
-        services = _services(request)
-        project = _load_project(services.project_repository)
-        export = project.workflow.export_result
-        if export is None or export.artifact_id != artifact_id or not export.verified:
-            raise ApiError(
-                404,
-                code="export_unavailable",
-                category="project",
-                message="The requested export is unavailable.",
-            )
-        artifact_limit = _settings(request).max_artifact_response_size
-        if export.size <= 0 or export.size > artifact_limit:
-            raise ApiError(
-                409,
-                code="export_changed",
-                category="conflict",
-                message="The verified export is outside the configured size bound.",
-            )
-        relative, export_cache_key = _authoritative_export_relative(project)
-        _validate_export_descriptor_authority(export, export_cache_key)
-        source = await asyncio.to_thread(
-            _verified_artifact_path,
-            services.project_repository.root,
-            relative,
-            directory="exports",
-            expected_size=export.size,
-            limit=artifact_limit,
-        )
-        destination = _external_export_destination(
-            services.project_repository.root, body.destination
-        )
-        export_snapshot = export.model_copy(deep=True)
-
-        def revalidate_authority() -> None:
-            latest = _load_project(services.project_repository)
-            latest_relative, latest_cache_key = _authoritative_export_relative(latest)
-            latest_export = latest.workflow.export_result
-            if (
-                latest_relative != relative
-                or latest_cache_key != export_cache_key
-                or latest_export is None
-                or latest_export != export_snapshot
-            ):
-                raise ApiError(
-                    409,
-                    code="export_changed",
-                    category="conflict",
-                    message="The verified export changed before it was copied.",
-                    retryable=True,
-                )
-            _validate_export_descriptor_authority(latest_export, latest_cache_key)
-
-        try:
-            await asyncio.to_thread(
-                copy_verified_export,
-                source,
-                destination,
-                expected_size=export.size,
-                expected_sha256=export.sha256,
-                before_publish=revalidate_authority,
-            )
-        except RepairableError as error:
-            raise ApiError(
-                400,
-                code="invalid_export_destination",
-                category="filesystem",
-                message="The selected export destination is unsafe or invalid.",
-            ) from error
-        except GsVideoError as error:
-            raise ApiError(
-                409,
-                code="export_copy_failed",
-                category="filesystem",
-                message="The verified export could not be copied safely.",
-                retryable=True,
-            ) from error
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
-
     @protected.post(
         "/api/v1/assets/import",
         response_model=AssetResponse,
@@ -1106,7 +631,18 @@ def build_router() -> APIRouter:
         status_code=status.HTTP_202_ACCEPTED,
     )
     async def create_task(request: Request, task: TaskCreateRequest) -> TaskSnapshot:
-        snapshot = await _task_service(request).create(StageName(task.target_stage))
+        stage = StageName(task.target_stage)
+        runner = _services(request).pipeline_runner
+        supports = getattr(runner, "supports", None)
+        if callable(supports) and not supports(stage):
+            raise ApiError(
+                503,
+                code="workflow_unavailable",
+                category="capability",
+                message="The requested workflow stage is not assembled in this build.",
+                retryable=False,
+            )
+        snapshot = await _task_service(request).create(stage)
         repository = _services(request).project_repository
         await asyncio.to_thread(
             repository.update,
@@ -1199,9 +735,9 @@ def build_router() -> APIRouter:
 
             def update_project(project: Project) -> None:
                 if completed.kind == AssetKind.SOURCE_VIDEO.value:
-                    project.source_video = completed.path
-                    project.workflow.source_summary = cast(Any, summary)
-                    invalidate_for_change(project, ChangeKind.SOURCE_VIDEO)
+                    _replace_source_video(
+                        project, completed.path, cast(Any, summary)
+                    )
                 else:
                     project.scene_ply = completed.path
                     project.workflow.scene_summary = cast(Any, summary)
@@ -1232,5 +768,7 @@ def build_router() -> APIRouter:
         events = cast(EventBus, websocket.app.state.event_bus)
         await serve_events(websocket, settings, events)
 
+    protected.include_router(build_subject_router())
+    protected.include_router(build_export_router())
     router.include_router(protected)
     return router

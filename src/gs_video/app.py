@@ -24,6 +24,7 @@ from gs_video.api.uploads import UploadManager
 from gs_video.api.workflow import (
     GsplatPreviewService,
     PreviewArtifactStore,
+    PreviewCoordinator,
 )
 from gs_video.environment.doctor import EnvironmentDoctor
 from gs_video.pipeline.runner import PipelineRunner
@@ -80,6 +81,7 @@ def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
     app.state.preview_artifacts = PreviewArtifactStore(
         services.project_repository.root
     )
+    app.state.preview_coordinator = PreviewCoordinator()
     app.state.export_inspector = services.export_inspector or ExportInspector()
     app.add_middleware(
         CORSMiddleware,
@@ -164,6 +166,8 @@ def run_api(host: str, port: int) -> int:
                 {},
                 save=repository.save,
                 persist_stage=repository.update_stage,
+                compare_and_set_stage=repository.compare_and_set_stage,
+                claim_stage=repository.claim_stage,
             ),
             worker_registry=_NoopWorkerRegistry(),
             asset_inspector=AssetInspector(),

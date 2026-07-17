@@ -4,6 +4,7 @@ from pathlib import Path
 from threading import Event
 from typing import Protocol
 
+import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -68,6 +69,15 @@ class SlowShutdownRunner:
         return StageState(status=StageStatus.SUCCEEDED)
 
 
+class SupersededRunner:
+    def __init__(self, status: StageStatus = StageStatus.STALE) -> None:
+        self.status = status
+
+    def run(self, name: StageName, token: CancellationToken) -> StageState:
+        del name, token
+        return StageState(status=self.status)
+
+
 class RecordingWorkerRegistry:
     def __init__(self) -> None:
         self.terminate_calls = 0
@@ -118,6 +128,30 @@ def test_task_state_is_recoverable_without_websocket(tmp_path: Path) -> None:
     assert snapshot["status"] in {"queued", "running", "succeeded"}
     assert snapshot["target_stage"] == "segment"
     assert snapshot["revision"] >= 1
+
+
+@pytest.mark.parametrize("stage_status", [StageStatus.STALE, StageStatus.RUNNING])
+def test_uncommitted_stage_is_not_reported_as_task_success(
+    tmp_path: Path, stage_status: StageStatus
+) -> None:
+    app, _ = make_app(tmp_path, runner=SupersededRunner(stage_status))
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/tasks", json={"target_stage": "segment"}, headers=headers
+        )
+        task_id = created.json()["id"]
+        deadline = time.monotonic() + 1
+        while True:
+            snapshot = client.get(
+                f"/api/v1/tasks/{task_id}", headers=headers
+            ).json()
+            if snapshot["status"] not in {"queued", "running"}:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+
+    assert snapshot["status"] == "cancelled"
 
 
 def test_websocket_authenticates_then_resumes_events(tmp_path: Path) -> None:

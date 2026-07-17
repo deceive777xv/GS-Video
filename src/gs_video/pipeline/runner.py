@@ -1,14 +1,27 @@
 from collections.abc import Callable, Mapping
+from uuid import uuid4
 
 from gs_video.domain.contracts import Stage
 from gs_video.domain.errors import CancelledError, GsVideoError
-from gs_video.domain.models import Project, StageName, StageState, StageStatus
+from gs_video.domain.models import (
+    Project,
+    StageClaimResult,
+    StageName,
+    StageState,
+    StageStatus,
+    StageWriteGuard,
+    StageWriteResult,
+)
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter, discard_progress
 
 
 SaveProject = Callable[[Project], None]
 PersistStage = Callable[[StageName, StageState], Project]
+CompareAndSetStage = Callable[
+    [StageName, StageState, StageWriteGuard], StageWriteResult
+]
+ClaimStage = Callable[..., StageClaimResult]
 
 
 def _validated_dependencies(
@@ -57,6 +70,8 @@ class PipelineRunner:
         dependencies: Mapping[StageName, tuple[StageName, ...]] | None = None,
         reuse_succeeded: bool = False,
         persist_stage: PersistStage | None = None,
+        compare_and_set_stage: CompareAndSetStage | None = None,
+        claim_stage: ClaimStage | None = None,
     ) -> None:
         validated_dependencies = _validated_dependencies(stages, dependencies)
         self.project = project
@@ -66,6 +81,11 @@ class PipelineRunner:
         self.dependencies = validated_dependencies
         self.reuse_succeeded = reuse_succeeded
         self.persist_stage = persist_stage
+        self.compare_and_set_stage = compare_and_set_stage
+        self.claim_stage = claim_stage
+
+    def supports(self, name: StageName) -> bool:
+        return name in self.stages
 
     def _persist(self, name: StageName, state: StageState) -> StageState:
         if self.persist_stage is None:
@@ -74,11 +94,28 @@ class PipelineRunner:
         self.project = self.persist_stage(name, state)
         return self.project.stages[name]
 
+    def _compare_and_set(
+        self,
+        name: StageName,
+        state: StageState,
+        guard: StageWriteGuard,
+    ) -> tuple[StageState, bool]:
+        if self.compare_and_set_stage is None:
+            self.project.stages[name] = state
+            return self._persist(name, state), True
+        result = self.compare_and_set_stage(name, state, guard)
+        self.project = result.project
+        return self.project.stages.get(name, StageState()), result.applied
+
     def run(self, name: StageName, token: CancellationToken) -> StageState:
         if name not in self.stages:
             raise ValueError(f"unregistered target stage: {name.value}")
         state = self.project.stages.setdefault(name, StageState())
-        if self.reuse_succeeded and state.status is StageStatus.SUCCEEDED:
+        if (
+            self.claim_stage is None
+            and self.reuse_succeeded
+            and state.status is StageStatus.SUCCEEDED
+        ):
             return state
 
         for dependency in self.dependencies.get(name, ()):
@@ -86,26 +123,61 @@ class PipelineRunner:
             if dependency_state.status is not StageStatus.SUCCEEDED:
                 return state
 
-        state.status = StageStatus.RUNNING
-        state.cache_key = None
-        state.error_code = None
-        state = self._persist(name, state)
+        run_id = uuid4().hex
+        if self.claim_stage is not None:
+            claimed = self.claim_stage(
+                name, reuse_succeeded=self.reuse_succeeded, run_id=run_id
+            )
+            self.project = claimed.project
+            state = self.project.stages.get(name, StageState())
+            started = claimed.claimed
+            running = state
+        else:
+            prior = state.model_copy(deep=True)
+            running = prior.model_copy(deep=True)
+            running.status = StageStatus.RUNNING
+            running.cache_key = None
+            running.error_code = None
+            running.run_id = run_id
+            state, started = self._compare_and_set(
+                name,
+                running,
+                StageWriteGuard(
+                    input_generation=prior.input_generation,
+                    status=prior.status,
+                    run_id=prior.run_id,
+                ),
+            )
+        if not started:
+            return state
 
         try:
             token.raise_if_cancelled()
             result = self.stages[name].execute(self.project, token, self.emit)
             token.raise_if_cancelled()
-            state.status = StageStatus.SUCCEEDED
-            state.cache_key = result.cache_key
-            state.output_paths = [str(path) for path in result.output_paths]
-            state.artifacts = {
+            terminal = state.model_copy(deep=True)
+            terminal.status = StageStatus.SUCCEEDED
+            terminal.cache_key = result.cache_key
+            terminal.output_paths = [str(path) for path in result.output_paths]
+            terminal.artifacts = {
                 role: str(path) for role, path in result.artifacts.items()
             }
         except CancelledError:
-            state.status = StageStatus.CANCELLED
+            terminal = state.model_copy(deep=True)
+            terminal.status = StageStatus.CANCELLED
         except GsVideoError as error:
-            state.status = StageStatus.FAILED
-            state.error_code = error.code
+            terminal = state.model_copy(deep=True)
+            terminal.status = StageStatus.FAILED
+            terminal.error_code = error.code
 
-        state = self._persist(name, state)
+        terminal.run_id = None
+        state, _applied = self._compare_and_set(
+            name,
+            terminal,
+            StageWriteGuard(
+                input_generation=running.input_generation,
+                status=StageStatus.RUNNING,
+                run_id=running.run_id,
+            ),
+        )
         return state

@@ -12,6 +12,7 @@ from gs_video.app import create_app
 from gs_video.domain.models import StageName, StageState, StageStatus
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.pipeline.cancellation import CancellationToken
+from gs_video.pipeline.runner import PipelineRunner
 from gs_video.project.repository import ProjectRepository
 
 
@@ -185,3 +186,36 @@ def test_blocked_environment_probe_does_not_stall_other_rest_requests(
     assert health_response is not None
     assert health_response.status_code == 200
     assert bootstrap_response.status_code == 200
+
+
+def test_unassembled_production_workflow_is_rejected_before_task_admission(
+    tmp_path: Path, auth_headers: dict[str, str]
+) -> None:
+    repository = ProjectRepository(tmp_path / "unassembled")
+    project = repository.create("unassembled")
+    repository.save(project)
+    services = ApiServices(
+        project_repository=repository,
+        environment_doctor=StaticDoctor(),
+        pipeline_runner=PipelineRunner(
+            project,
+            {},
+            save=repository.save,
+            claim_stage=repository.claim_stage,
+            compare_and_set_stage=repository.compare_and_set_stage,
+        ),
+        worker_registry=RecordingWorkerRegistry(),
+    )
+    settings = ApiSettings(
+        bind_host="127.0.0.1", port=0, session_token=TOKEN,
+        allowed_origins=(ORIGIN,),
+    )
+
+    with TestClient(create_app(settings, services)) as client:
+        response = client.post(
+            "/api/v1/tasks", json={"target_stage": "segment"},
+            headers=auth_headers,
+        )
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "workflow_unavailable"

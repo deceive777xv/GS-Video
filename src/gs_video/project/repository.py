@@ -4,7 +4,15 @@ from collections.abc import Callable
 from pathlib import Path
 from threading import RLock
 
-from gs_video.domain.models import Project, StageName, StageState
+from gs_video.domain.models import (
+    Project,
+    StageClaimResult,
+    StageName,
+    StageState,
+    StageWriteGuard,
+    StageWriteResult,
+    StageStatus,
+)
 from gs_video.project.migrations import migrate_project_dict
 
 
@@ -53,6 +61,56 @@ class ProjectRepository:
                 name, state.model_copy(deep=True)
             )
         )
+
+    def compare_and_set_stage(
+        self,
+        name: StageName,
+        state: StageState,
+        guard: StageWriteGuard,
+    ) -> StageWriteResult:
+        with self._lock:
+            project = self._load_unlocked()
+            current = project.stages.get(name, StageState())
+            matches = (
+                current.input_generation == guard.input_generation
+                and current.status is guard.status
+                and current.run_id == guard.run_id
+            )
+            if matches:
+                project.stages[name] = state.model_copy(deep=True)
+                self._save_unlocked(project)
+            return StageWriteResult(
+                project=project.model_copy(deep=True), applied=matches
+            )
+
+    def claim_stage(
+        self,
+        name: StageName,
+        *,
+        reuse_succeeded: bool,
+        run_id: str,
+    ) -> StageClaimResult:
+        with self._lock:
+            project = self._load_unlocked()
+            current = project.stages.get(name, StageState())
+            if current.status is StageStatus.RUNNING:
+                return StageClaimResult(
+                    project=project.model_copy(deep=True), claimed=False
+                )
+            if reuse_succeeded and current.status is StageStatus.SUCCEEDED:
+                return StageClaimResult(
+                    project=project.model_copy(deep=True), claimed=False
+                )
+            running = current.model_copy(deep=True)
+            running.status = StageStatus.RUNNING
+            running.cache_key = None
+            running.error_code = None
+            running.run_id = run_id
+            project.stages[name] = running
+            self._save_unlocked(project)
+            return StageClaimResult(
+                project=project.model_copy(deep=True), claimed=True
+            )
 
     def _load_unlocked(self) -> Project:
         raw = json.loads(self.path.read_text(encoding="utf-8"))

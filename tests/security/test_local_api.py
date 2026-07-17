@@ -738,7 +738,7 @@ def test_cancel_retries_failed_handle_delete_without_leaving_source_file(
     manager.close()
 
 
-def test_upload_completion_can_retry_after_project_save_failure(tmp_path: Path) -> None:
+def test_upload_completion_can_retry_after_project_update_failure(tmp_path: Path) -> None:
     root = tmp_path / "retry-project"
     repository = ProjectRepository(root)
     repository.save(repository.create("retry"))
@@ -756,15 +756,18 @@ def test_upload_completion_can_retry_after_project_save_failure(tmp_path: Path) 
     )
     app = create_app(settings, services)
     content = b"retry-completion"
-    original_save = repository.save
-    save_attempts = 0
+    original_update = repository.update
+    update_attempts = 0
+    successful_updates = 0
 
-    def fail_once(project):  # type: ignore[no-untyped-def]
-        nonlocal save_attempts
-        save_attempts += 1
-        if save_attempts == 1:
+    def fail_once(mutation):  # type: ignore[no-untyped-def]
+        nonlocal update_attempts, successful_updates
+        update_attempts += 1
+        if update_attempts == 1:
             raise OSError("simulated persistence failure")
-        original_save(project)
+        project = original_update(mutation)
+        successful_updates += 1
+        return project
 
     with TestClient(app, raise_server_exceptions=False) as client:
         upload_id = str(create_upload(client, content)["id"])
@@ -773,7 +776,7 @@ def test_upload_completion_can_retry_after_project_save_failure(tmp_path: Path) 
             content=content,
             headers=auth_headers(),
         )
-        repository.save = fail_once  # type: ignore[method-assign]
+        repository.update = fail_once  # type: ignore[method-assign]
 
         first = client.post(
             f"/api/v1/uploads/{upload_id}/complete", headers=auth_headers()
@@ -793,6 +796,8 @@ def test_upload_completion_can_retry_after_project_save_failure(tmp_path: Path) 
     assert destination.read_bytes() == content
     assert repository.load().source_video == retried.json()["path"]
     assert len(list((root / "source").glob(f"{upload_id}-*"))) == 1
+    assert update_attempts == 2
+    assert successful_updates == 1
 
 
 def test_multichunk_completion_recovers_after_partial_cleanup_failure(

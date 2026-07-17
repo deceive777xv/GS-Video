@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from math import isfinite
@@ -39,6 +40,27 @@ class StageState(BaseModel):
     output_paths: list[str] = Field(default_factory=list)
     error_code: str | None = None
     artifacts: dict[ArtifactRole, str] = Field(default_factory=dict)
+    input_generation: int = Field(default=0, ge=0)
+    run_id: str | None = None
+
+
+@dataclass(frozen=True)
+class StageWriteGuard:
+    input_generation: int
+    status: StageStatus
+    run_id: str | None
+
+
+@dataclass(frozen=True)
+class StageWriteResult:
+    project: "Project"
+    applied: bool
+
+
+@dataclass(frozen=True)
+class StageClaimResult:
+    project: "Project"
+    claimed: bool
 
 
 class VideoSummary(BaseModel):

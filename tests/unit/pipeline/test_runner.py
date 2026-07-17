@@ -16,6 +16,8 @@ from gs_video.domain.models import (
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
 from gs_video.pipeline.runner import PipelineRunner
+from gs_video.pipeline.workflow import invalidate_from
+from gs_video.project.repository import ProjectRepository
 
 
 class RecordingStage:
@@ -208,6 +210,150 @@ def test_stage_persistence_merges_into_latest_project_authority() -> None:
         frame_index=4, x=100, y=120
     )
     assert authoritative.stages[StageName.RENDER].status is StageStatus.SUCCEEDED
+
+
+def test_running_stage_cannot_publish_after_concurrent_invalidation(
+    tmp_path: Path,
+) -> None:
+    repository = ProjectRepository(tmp_path / "project")
+    repository.save(repository.create("race"))
+
+    def invalidate_while_running(
+        project: Project, token: CancellationToken
+    ) -> StageResult:
+        del project, token
+        repository.update(lambda latest: invalidate_from(latest, StageName.RENDER))
+        return StageResult((Path("renders/obsolete.png"),), "obsolete-key")
+
+    runner = PipelineRunner(
+        repository.load(),
+        {StageName.RENDER: RecordingStage(invalidate_while_running)},
+        save=repository.save,
+        claim_stage=repository.claim_stage,
+        compare_and_set_stage=repository.compare_and_set_stage,
+    )
+
+    state = runner.run(StageName.RENDER, CancellationToken())
+    authoritative = repository.load().stages[StageName.RENDER]
+
+    assert state == authoritative
+    assert authoritative.status is StageStatus.STALE
+    assert authoritative.input_generation == 1
+    assert authoritative.run_id is None
+    assert authoritative.cache_key is None
+    assert authoritative.output_paths == []
+
+
+def test_obsolete_dependency_does_not_run_downstream_stage(tmp_path: Path) -> None:
+    repository = ProjectRepository(tmp_path / "project")
+    repository.save(repository.create("dependency-race"))
+
+    def invalidate_dependency(
+        project: Project, token: CancellationToken
+    ) -> StageResult:
+        del project, token
+        repository.update(lambda latest: invalidate_from(latest, StageName.RENDER))
+        return StageResult((Path("renders/obsolete.png"),), "obsolete-key")
+
+    downstream = RecordingStage(
+        lambda project, token: StageResult(
+            (Path("exports/must-not-run.mp4"),), "export-key"
+        )
+    )
+    runner = PipelineRunner(
+        repository.load(),
+        {
+            StageName.RENDER: RecordingStage(invalidate_dependency),
+            StageName.EXPORT: downstream,
+        },
+        save=repository.save,
+        dependencies={StageName.EXPORT: (StageName.RENDER,)},
+        claim_stage=repository.claim_stage,
+        compare_and_set_stage=repository.compare_and_set_stage,
+    )
+
+    state = runner.run(StageName.EXPORT, CancellationToken())
+
+    assert state.status is not StageStatus.SUCCEEDED
+    assert downstream.calls == 0
+
+
+def test_runner_claims_latest_invalidated_generation_instead_of_reusing_stale_copy(
+    tmp_path: Path,
+) -> None:
+    repository = ProjectRepository(tmp_path / "project")
+    project = repository.create("refresh-before-reuse")
+    project.stages[StageName.RENDER] = StageState(
+        status=StageStatus.SUCCEEDED, cache_key="old-key"
+    )
+    repository.save(project)
+    stage = RecordingStage(
+        lambda project, token: StageResult(
+            (Path("renders/current.png"),), "current-key"
+        )
+    )
+    runner = PipelineRunner(
+        repository.load(),
+        {StageName.RENDER: stage},
+        save=repository.save,
+        reuse_succeeded=True,
+        claim_stage=repository.claim_stage,
+        compare_and_set_stage=repository.compare_and_set_stage,
+    )
+    repository.update(lambda latest: invalidate_from(latest, StageName.RENDER))
+
+    state = runner.run(StageName.RENDER, CancellationToken())
+
+    assert stage.calls == 1
+    assert state.status is StageStatus.SUCCEEDED
+    assert state.input_generation == 1
+    assert state.cache_key == "current-key"
+
+
+def test_runner_atomically_reuses_current_succeeded_generation(
+    tmp_path: Path,
+) -> None:
+    repository = ProjectRepository(tmp_path / "project")
+    project = repository.create("reuse-current")
+    project.stages[StageName.RENDER] = StageState(
+        status=StageStatus.SUCCEEDED, cache_key="current-key"
+    )
+    repository.save(project)
+    stage = RecordingStage(
+        lambda project, token: StageResult((Path("unexpected"),), "unexpected")
+    )
+    runner = PipelineRunner(
+        repository.load(),
+        {StageName.RENDER: stage},
+        save=repository.save,
+        reuse_succeeded=True,
+        claim_stage=repository.claim_stage,
+        compare_and_set_stage=repository.compare_and_set_stage,
+    )
+
+    state = runner.run(StageName.RENDER, CancellationToken())
+
+    assert stage.calls == 0
+    assert state.status is StageStatus.SUCCEEDED
+    assert state.cache_key == "current-key"
+
+
+def test_repository_claim_does_not_replace_an_active_stage_owner(
+    tmp_path: Path,
+) -> None:
+    repository = ProjectRepository(tmp_path / "project")
+    repository.save(repository.create("single-owner"))
+
+    first = repository.claim_stage(
+        StageName.RENDER, reuse_succeeded=False, run_id="first-owner"
+    )
+    second = repository.claim_stage(
+        StageName.RENDER, reuse_succeeded=False, run_id="second-owner"
+    )
+
+    assert first.claimed is True
+    assert second.claimed is False
+    assert second.project.stages[StageName.RENDER].run_id == "first-owner"
 
 
 @pytest.mark.parametrize(
