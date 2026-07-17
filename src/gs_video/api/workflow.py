@@ -64,16 +64,16 @@ def _conflicting_preview_generation() -> ApiError:
     )
 
 
-@dataclass(frozen=True)
+@dataclass
 class _PreviewWorker:
     request_fingerprint: PreviewRequestFingerprint
     task: asyncio.Task[Any]
+    waiters: int = 0
 
 
 @dataclass
 class _PreviewAuthorityState:
     latest_generation: int
-    waiters: int
     workers: dict[int, _PreviewWorker]
 
 
@@ -83,6 +83,34 @@ class PreviewCoordinator:
     def __init__(self) -> None:
         self._render_lock = asyncio.Lock()
         self._authority_states: dict[PreviewAuthority, _PreviewAuthorityState] = {}
+
+    def _forget_worker_if_idle(
+        self,
+        authority: PreviewAuthority,
+        state: _PreviewAuthorityState,
+        generation: int,
+        worker: _PreviewWorker,
+    ) -> None:
+        if worker.waiters != 0 or not worker.task.done():
+            return
+        if state.workers.get(generation) is worker:
+            state.workers.pop(generation, None)
+        if not state.workers and self._authority_states.get(authority) is state:
+            self._authority_states.pop(authority, None)
+
+    def _worker_done(
+        self,
+        authority: PreviewAuthority,
+        state: _PreviewAuthorityState,
+        generation: int,
+        worker: _PreviewWorker,
+        task: asyncio.Task[Any],
+    ) -> None:
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+        self._forget_worker_if_idle(authority, state, generation, worker)
 
     async def _render_once(
         self,
@@ -106,9 +134,7 @@ class PreviewCoordinator:
     ) -> _PreviewResult:
         state = self._authority_states.get(authority)
         if state is None:
-            state = _PreviewAuthorityState(
-                latest_generation=generation, waiters=0, workers={}
-            )
+            state = _PreviewAuthorityState(latest_generation=generation, workers={})
             self._authority_states[authority] = state
         elif generation < state.latest_generation:
             raise _stale_preview_generation()
@@ -116,16 +142,22 @@ class PreviewCoordinator:
             state.latest_generation = generation
         worker = state.workers.get(generation)
         if worker is None:
+            task = asyncio.create_task(
+                self._render_once(state, generation, operation, args)
+            )
             worker = _PreviewWorker(
                 request_fingerprint=request_fingerprint,
-                task=asyncio.create_task(
-                    self._render_once(state, generation, operation, args)
-                ),
+                task=task,
             )
             state.workers[generation] = worker
+            task.add_done_callback(
+                lambda completed: self._worker_done(
+                    authority, state, generation, worker, completed
+                )
+            )
         elif worker.request_fingerprint != request_fingerprint:
             raise _conflicting_preview_generation()
-        state.waiters += 1
+        worker.waiters += 1
         try:
             result = await asyncio.shield(worker.task)
         except asyncio.CancelledError:
@@ -135,12 +167,8 @@ class PreviewCoordinator:
                 pass
             raise
         finally:
-            state.waiters -= 1
-            if worker.task.done() and state.workers.get(generation) is worker:
-                state.workers.pop(generation, None)
-            if state.waiters == 0 and not state.workers:
-                if self._authority_states.get(authority) is state:
-                    self._authority_states.pop(authority, None)
+            worker.waiters -= 1
+            self._forget_worker_if_idle(authority, state, generation, worker)
         if generation < state.latest_generation:
             raise _stale_preview_generation()
         return cast(_PreviewResult, result)

@@ -1,5 +1,6 @@
 import stat
 import asyncio
+import gc
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -22,9 +23,21 @@ from gs_video.scene.camera import OrbitCamera
 
 
 def _preview_fingerprint(
-    *, yaw: float = 0.0, width: int = 16, height: int = 9
+    *,
+    yaw: float = 0.0,
+    fov_y_degrees: float = 60.0,
+    width: int = 16,
+    height: int = 9,
 ) -> tuple[tuple[float, float, float], float, float, float, float, int, int]:
-    return ((0.0, 0.0, 0.0), 4.0, yaw, 0.0, 60.0, width, height)
+    return (
+        (0.0, 0.0, 0.0),
+        4.0,
+        yaw,
+        0.0,
+        fov_y_degrees,
+        width,
+        height,
+    )
 
 
 class _FakeArtifactHandle:
@@ -231,6 +244,89 @@ def test_preview_cancellation_keeps_serialization_until_thread_finishes() -> Non
     asyncio.run(exercise())
 
 
+def test_preview_double_cancellation_releases_finished_worker_authority() -> None:
+    async def exercise() -> None:
+        coordinator = PreviewCoordinator()
+        authority = ("project", "source/scene.ply", "a" * 64, 123, 0)
+        started = Event()
+        release = Event()
+
+        def render() -> str:
+            started.set()
+            assert release.wait(2)
+            return "cancelled"
+
+        waiter = asyncio.create_task(
+            coordinator.render(authority, 1, _preview_fingerprint(), render)
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+        waiter.cancel()
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        release.set()
+        for _ in range(100):
+            if not coordinator._authority_states:
+                break
+            await asyncio.sleep(0.01)
+
+        assert coordinator._authority_states == {}
+        assert await coordinator.render(
+            authority,
+            1,
+            _preview_fingerprint(yaw=15.0),
+            lambda: "fresh",
+        ) == "fresh"
+
+    asyncio.run(exercise())
+
+
+def test_preview_double_cancellation_retrieves_late_worker_exception() -> None:
+    async def exercise() -> None:
+        coordinator = PreviewCoordinator()
+        authority = ("project", "source/scene.ply", "a" * 64, 123, 0)
+        started = Event()
+        release = Event()
+        unobserved: list[dict[str, object]] = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: unobserved.append(context))
+
+        def render() -> None:
+            started.set()
+            assert release.wait(2)
+            raise RuntimeError("late render failure")
+
+        try:
+            waiter = asyncio.create_task(
+                coordinator.render(authority, 1, _preview_fingerprint(), render)
+            )
+            assert await asyncio.to_thread(started.wait, 1)
+            waiter.cancel()
+            await asyncio.sleep(0)
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+
+            release.set()
+            for _ in range(100):
+                if not coordinator._authority_states:
+                    break
+                await asyncio.sleep(0.01)
+            gc.collect()
+            await asyncio.sleep(0)
+
+            assert coordinator._authority_states == {}
+            assert unobserved == []
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+    asyncio.run(exercise())
+
+
 def test_preview_artifacts_are_bounded_while_preserving_authoritative_file(
     tmp_path: Path,
 ) -> None:
@@ -321,7 +417,22 @@ def test_preview_coordinator_coalesces_duplicate_queued_generation() -> None:
     asyncio.run(exercise())
 
 
-def test_preview_coordinator_rejects_conflicting_same_generation_fingerprint() -> None:
+@pytest.mark.parametrize(
+    "conflicting_fingerprint",
+    [
+        pytest.param(_preview_fingerprint(yaw=15.0), id="yaw"),
+        pytest.param(
+            _preview_fingerprint(fov_y_degrees=55.0), id="vertical-fov"
+        ),
+        pytest.param(_preview_fingerprint(width=32), id="width"),
+        pytest.param(_preview_fingerprint(height=18), id="height"),
+    ],
+)
+def test_preview_coordinator_rejects_conflicting_same_generation_fingerprint(
+    conflicting_fingerprint: tuple[
+        tuple[float, float, float], float, float, float, float, int, int
+    ],
+) -> None:
     async def exercise() -> None:
         coordinator = PreviewCoordinator()
         authority = ("project", "source/scene.ply", "a" * 64, 123, 0)
@@ -344,7 +455,7 @@ def test_preview_coordinator_rejects_conflicting_same_generation_fingerprint() -
         assert await asyncio.to_thread(started.wait, 1)
         conflict = asyncio.create_task(
             coordinator.render(
-                authority, 1, _preview_fingerprint(yaw=15.0), render, "conflict"
+                authority, 1, conflicting_fingerprint, render, "conflict"
             )
         )
         await asyncio.sleep(0)
