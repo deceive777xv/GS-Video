@@ -275,9 +275,7 @@ def _import_asset_sync(
             project.workflow.scene_summary = cast(Any, summary)
             invalidate_for_change(project, ChangeKind.TARGET_CAMERA)
             project.workflow.target_camera = None
-            project.workflow.foot_point = None
-            project.workflow.preview = None
-            project.workflow.confirmed_camera_revision = None
+            _clear_preview_authority(project)
         project.workflow.export_result = None
 
     services.project_repository.update(persist)
@@ -290,12 +288,18 @@ def _replace_source_video(project: Project, relative: str, summary: Any) -> None
     project.source_video = relative
     project.workflow.source_summary = summary
     project.workflow.subject_prompt = None
-    project.workflow.confirmed_camera_revision = None
-    project.workflow.foot_point = None
-    project.workflow.preview = None
+    _clear_preview_authority(project)
     project.workflow.export_result = None
     project.workflow.active_task_id = None
     invalidate_for_change(project, ChangeKind.SOURCE_VIDEO)
+
+
+def _clear_preview_authority(project: Project) -> None:
+    project.workflow.preview_epoch += 1
+    project.workflow.confirmed_camera_revision = None
+    project.workflow.confirmed_preview_artifact_id = None
+    project.workflow.foot_point = None
+    project.workflow.preview = None
 
 
 def build_router() -> APIRouter:
@@ -348,9 +352,7 @@ def build_router() -> APIRouter:
             if patch.preview_height is not None:
                 project.workflow.preview_height = patch.preview_height
                 invalidate_for_change(project, ChangeKind.TARGET_CAMERA)
-                project.workflow.preview = None
-                project.workflow.foot_point = None
-                project.workflow.confirmed_camera_revision = None
+                _clear_preview_authority(project)
                 project.workflow.export_result = None
 
         return await asyncio.to_thread(repository.update, mutate)
@@ -385,7 +387,15 @@ def build_router() -> APIRouter:
         camera = _camera(preview.camera)
         scene_path = project.scene_ply
         scene_authority = scene_summary.model_copy(deep=True)
+        preview_epoch = project.workflow.preview_epoch
         buffer: PickBuffer = await _preview_coordinator(request).render(
+            (
+                project.project_id,
+                scene_path,
+                scene_authority.sha256,
+                scene_authority.size,
+                preview_epoch,
+            ),
             preview.generation,
             _preview_service(request).render_pick,
             repository.root,
@@ -403,6 +413,7 @@ def build_router() -> APIRouter:
             if (
                 latest.scene_ply != scene_path
                 or latest.workflow.scene_summary != scene_authority
+                or latest.workflow.preview_epoch != preview_epoch
             ):
                 raise ApiError(
                     409,
@@ -442,6 +453,7 @@ def build_router() -> APIRouter:
             )
             latest.workflow.foot_point = None
             latest.workflow.confirmed_camera_revision = None
+            latest.workflow.confirmed_preview_artifact_id = None
             latest.workflow.preview = PreviewState(
                 artifact_id=artifact_id,
                 artifact_size=artifact_size,
@@ -519,6 +531,7 @@ def build_router() -> APIRouter:
             project.workflow.confirmed_camera_revision = (
                 confirmation.camera_revision
             )
+            project.workflow.confirmed_preview_artifact_id = preview.artifact_id
             project.workflow.foot_point = None
 
         return await asyncio.to_thread(repository.update, persist)
@@ -533,9 +546,15 @@ def build_router() -> APIRouter:
         project = _load_project(repository)
         preview = project.workflow.preview
         camera_state = project.workflow.target_camera
+        scene_path = project.scene_ply
+        scene_authority = project.workflow.scene_summary
+        preview_epoch = project.workflow.preview_epoch
         if (
             preview is None
             or camera_state is None
+            or scene_path is None
+            or scene_authority is None
+            or preview.artifact_id != pick.preview_artifact_id
             or preview.camera_revision != pick.camera_revision
             or preview.pick_buffer_revision != pick.pick_buffer_revision
         ):
@@ -545,7 +564,11 @@ def build_router() -> APIRouter:
                 category="conflict",
                 message="Regenerate the preview before choosing a foot point.",
             )
-        if project.workflow.confirmed_camera_revision != pick.camera_revision:
+        if (
+            project.workflow.confirmed_camera_revision != pick.camera_revision
+            or project.workflow.confirmed_preview_artifact_id
+            != pick.preview_artifact_id
+        ):
             raise ApiError(
                 409,
                 code="camera_not_confirmed",
@@ -581,6 +604,7 @@ def build_router() -> APIRouter:
         foot = FootPointState(
             image=(pick.x, pick.y),
             world=world,
+            preview_artifact_id=pick.preview_artifact_id,
             camera_revision=pick.camera_revision,
             pick_buffer_revision=pick.pick_buffer_revision,
         )
@@ -589,6 +613,10 @@ def build_router() -> APIRouter:
             latest_preview = latest.workflow.preview
             if (
                 latest_preview is None
+                or latest.scene_ply != scene_path
+                or latest.workflow.scene_summary != scene_authority
+                or latest.workflow.preview_epoch != preview_epoch
+                or latest_preview.artifact_id != pick.preview_artifact_id
                 or latest_preview.camera_revision != pick.camera_revision
                 or latest_preview.pick_buffer_revision
                 != pick.pick_buffer_revision
@@ -599,7 +627,11 @@ def build_router() -> APIRouter:
                     category="conflict",
                     message="Regenerate the preview before choosing a foot point.",
                 )
-            if latest.workflow.confirmed_camera_revision != pick.camera_revision:
+            if (
+                latest.workflow.confirmed_camera_revision != pick.camera_revision
+                or latest.workflow.confirmed_preview_artifact_id
+                != pick.preview_artifact_id
+            ):
                 raise ApiError(
                     409,
                     code="camera_not_confirmed",
@@ -743,9 +775,7 @@ def build_router() -> APIRouter:
                     project.workflow.scene_summary = cast(Any, summary)
                     invalidate_for_change(project, ChangeKind.TARGET_CAMERA)
                     project.workflow.target_camera = None
-                    project.workflow.foot_point = None
-                    project.workflow.preview = None
-                    project.workflow.confirmed_camera_revision = None
+                    _clear_preview_authority(project)
                 project.workflow.export_result = None
 
             services.project_repository.update(update_project)

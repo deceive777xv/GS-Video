@@ -78,6 +78,7 @@ export interface CameraDto extends CameraInput {
 export interface FootPointDto {
   image: [number, number]
   world: [number, number, number]
+  preview_artifact_id: string
   camera_revision: number
   pick_buffer_revision: number
 }
@@ -110,7 +111,9 @@ export interface WorkflowDto {
   scene_summary: SceneSummaryDto | null
   subject_prompt: SubjectPromptDto | null
   target_camera: CameraDto | null
+  preview_epoch: number
   confirmed_camera_revision: number | null
+  confirmed_preview_artifact_id: string | null
   foot_point: FootPointDto | null
   motion_scale: number
   preview_height: number
@@ -215,6 +218,7 @@ export interface PreviewFrameDto {
 export interface PickRequest {
   x: number
   y: number
+  preview_artifact_id: string
   camera_revision: number
   pick_buffer_revision: number
 }

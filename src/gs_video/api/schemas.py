@@ -146,6 +146,7 @@ class PreviewFrameResponse(StrictModel):
 class PickRequest(StrictModel):
     x: int = Field(ge=0)
     y: int = Field(ge=0)
+    preview_artifact_id: str = Field(min_length=1, max_length=128)
     camera_revision: int = Field(ge=1)
     pick_buffer_revision: int = Field(ge=1)
 
@@ -153,6 +154,7 @@ class PickRequest(StrictModel):
 class PickResponse(StrictModel):
     image: tuple[int, int]
     world: tuple[float, float, float]
+    preview_artifact_id: str
     camera_revision: int
     pick_buffer_revision: int
 

@@ -34,6 +34,7 @@ from gs_video.segmentation.paths import has_reparse_component
 MAX_PREVIEW_ARTIFACT_BYTES = 16 * 1024 * 1024
 MAX_SUBJECT_IMAGE_PIXELS = 1920 * 1080
 _PreviewResult = TypeVar("_PreviewResult")
+PreviewAuthority = tuple[str, str, str, int, int]
 
 
 def _stale_preview_generation() -> ApiError:
@@ -45,36 +46,56 @@ def _stale_preview_generation() -> ApiError:
     )
 
 
+@dataclass
+class _PreviewAuthorityState:
+    latest_generation: int
+    waiters: int
+    workers: dict[int, asyncio.Task[Any]]
+
+
 class PreviewCoordinator:
     """Coalesce preview requests without abandoning in-flight worker threads."""
 
     def __init__(self) -> None:
-        self._latest_generation = 0
         self._render_lock = asyncio.Lock()
-        self._generation_tasks: dict[int, asyncio.Task[Any]] = {}
+        self._authority_states: dict[PreviewAuthority, _PreviewAuthorityState] = {}
 
     async def _render_once(
-        self, generation: int, operation: Any, args: tuple[Any, ...]
+        self,
+        state: _PreviewAuthorityState,
+        generation: int,
+        operation: Any,
+        args: tuple[Any, ...],
     ) -> Any:
         async with self._render_lock:
-            if generation < self._latest_generation:
+            if generation < state.latest_generation:
                 raise _stale_preview_generation()
             return await asyncio.to_thread(operation, *args)
 
     async def render(
         self,
+        authority: PreviewAuthority,
         generation: int,
         operation: Any,
         *args: Any,
     ) -> _PreviewResult:
-        self._latest_generation = max(self._latest_generation, generation)
-        worker = self._generation_tasks.get(generation)
-        owns_worker = worker is None
+        state = self._authority_states.get(authority)
+        if state is None:
+            state = _PreviewAuthorityState(
+                latest_generation=generation, waiters=0, workers={}
+            )
+            self._authority_states[authority] = state
+        elif generation < state.latest_generation:
+            raise _stale_preview_generation()
+        else:
+            state.latest_generation = generation
+        state.waiters += 1
+        worker = state.workers.get(generation)
         if worker is None:
             worker = asyncio.create_task(
-                self._render_once(generation, operation, args)
+                self._render_once(state, generation, operation, args)
             )
-            self._generation_tasks[generation] = worker
+            state.workers[generation] = worker
         try:
             result = await asyncio.shield(worker)
         except asyncio.CancelledError:
@@ -84,9 +105,13 @@ class PreviewCoordinator:
                 pass
             raise
         finally:
-            if owns_worker and worker.done():
-                self._generation_tasks.pop(generation, None)
-        if generation < self._latest_generation:
+            state.waiters -= 1
+            if worker.done() and state.workers.get(generation) is worker:
+                state.workers.pop(generation, None)
+            if state.waiters == 0 and not state.workers:
+                if self._authority_states.get(authority) is state:
+                    self._authority_states.pop(authority, None)
+        if generation < state.latest_generation:
             raise _stale_preview_generation()
         return cast(_PreviewResult, result)
 

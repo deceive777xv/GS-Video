@@ -3,6 +3,7 @@ import hashlib
 from pathlib import Path
 from threading import Event
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import numpy as np
 import pytest
@@ -219,6 +220,7 @@ def test_preview_and_pick_are_persisted_with_revision_guards(
         json={
             "x": 8,
             "y": 4,
+            "preview_artifact_id": descriptor["artifact_id"],
             "camera_revision": descriptor["camera_revision"],
             "pick_buffer_revision": descriptor["pick_buffer_revision"],
         },
@@ -257,6 +259,7 @@ def test_preview_and_pick_are_persisted_with_revision_guards(
         json={
             "x": 8,
             "y": 4,
+            "preview_artifact_id": descriptor["artifact_id"],
             "camera_revision": descriptor["camera_revision"],
             "pick_buffer_revision": descriptor["pick_buffer_revision"],
         },
@@ -270,6 +273,7 @@ def test_preview_and_pick_are_persisted_with_revision_guards(
         json={
             "x": 8,
             "y": 4,
+            "preview_artifact_id": second["artifact_id"],
             "camera_revision": second["camera_revision"],
             "pick_buffer_revision": second["pick_buffer_revision"],
         },
@@ -283,6 +287,88 @@ def test_preview_and_pick_are_persisted_with_revision_guards(
         "/api/v1/projects/current", headers=auth_headers
     ).json()
     assert project["workflow"]["foot_point"] == picked.json()
+
+
+def test_pick_rejects_preview_artifact_aba_before_transaction_commit(
+    workflow_client: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = {
+        "generation": 1,
+        "width": 16,
+        "height": 9,
+        "camera": {
+            "target": [0.0, 0.0, 0.0],
+            "distance": 4.0,
+            "yaw": 0.0,
+            "pitch": 0.0,
+            "fov_y_degrees": 60.0,
+        },
+    }
+    old_preview = workflow_client.post(
+        "/api/v1/projects/current/preview", json=request, headers=auth_headers
+    ).json()
+    workflow_client.post(
+        "/api/v1/projects/current/camera/confirm",
+        json={"camera_revision": old_preview["camera_revision"]},
+        headers=auth_headers,
+    )
+    repository = workflow_client.app.state.services.project_repository
+
+    from gs_video.api import routes as workflow_routes
+
+    original_unproject = workflow_routes._unproject
+
+    def replace_authority_after_unproject(
+        *args: Any, **kwargs: Any
+    ) -> tuple[float, float, float]:
+        world = original_unproject(*args, **kwargs)
+
+        def replace(latest: Any) -> None:
+            latest.scene_ply = "source/scene-b.ply"
+            latest.workflow.scene_summary = SceneSummary(
+                filename="scene-b.ply",
+                size=7,
+                sha256="b" * 64,
+                gaussian_count=1,
+                estimated_vram_mb=1,
+            )
+            latest.workflow.preview = PreviewState(
+                artifact_id="preview-b",
+                artifact_size=1,
+                artifact_sha256="b" * 64,
+                generation=1,
+                width=16,
+                height=9,
+                camera_revision=1,
+                pick_buffer_revision=1,
+            )
+            latest.workflow.confirmed_camera_revision = 1
+            latest.workflow.confirmed_preview_artifact_id = "preview-b"
+
+        repository.update(replace)
+        return world
+
+    monkeypatch.setattr(
+        workflow_routes, "_unproject", replace_authority_after_unproject
+    )
+
+    stale = workflow_client.post(
+        "/api/v1/projects/current/pick",
+        json={
+            "x": 8,
+            "y": 4,
+            "preview_artifact_id": old_preview["artifact_id"],
+            "camera_revision": 1,
+            "pick_buffer_revision": 1,
+        },
+        headers=auth_headers,
+    )
+
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "stale_pick_buffer"
+    assert repository.load().workflow.foot_point is None
 
 
 def test_stale_preview_generation_cannot_replace_newer_snapshot(
@@ -440,6 +526,7 @@ def test_replacing_source_video_clears_all_source_derived_authority(
     replacement_path: str,
 ) -> None:
     repository = workflow_client.app.state.services.project_repository
+    initial_preview_epoch = repository.load().workflow.preview_epoch
 
     def seed_authority(project: object) -> None:
         workflow = project.workflow  # type: ignore[attr-defined]
@@ -448,8 +535,10 @@ def test_replacing_source_video_clears_all_source_derived_authority(
             pitch=0.0, fov_y_degrees=60.0, revision=3
         )
         workflow.confirmed_camera_revision = 3
+        workflow.confirmed_preview_artifact_id = "f" * 32
         workflow.foot_point = FootPointState(
             image=(8, 4), world=(0.0, 0.0, 2.0),
+            preview_artifact_id="f" * 32,
             camera_revision=3, pick_buffer_revision=3
         )
         workflow.preview = PreviewState(
@@ -496,7 +585,9 @@ def test_replacing_source_video_clears_all_source_derived_authority(
     project = repository.load()
     assert project.workflow.subject_prompt is None
     assert project.workflow.confirmed_camera_revision is None
+    assert project.workflow.confirmed_preview_artifact_id is None
     assert project.workflow.foot_point is None
+    assert project.workflow.preview_epoch == initial_preview_epoch + 1
     assert project.workflow.preview is None
     assert project.workflow.export_result is None
     assert project.workflow.active_task_id is None

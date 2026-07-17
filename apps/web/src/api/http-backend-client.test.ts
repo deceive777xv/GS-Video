@@ -12,7 +12,7 @@ import {
   useTaskEventSource,
 } from './task-events'
 import type { TaskEventSource, TaskEventSubscription } from './task-events'
-import type { TaskDto } from './types'
+import type { PickRequest, TaskDto } from './types'
 
 const task = (revision = 9): TaskDto => ({
   id: 't1',
@@ -320,6 +320,43 @@ describe('HttpBackendClient', () => {
     expect(String(fetchImpl.mock.calls[1]?.[0])).not.toContain('secret')
   })
 
+  it('binds a foot-point pick to the exact opaque preview artifact', async () => {
+    const input: PickRequest = {
+      x: 8,
+      y: 4,
+      preview_artifact_id: 'preview-1',
+      camera_revision: 2,
+      pick_buffer_revision: 2,
+    }
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          image: [8, 4],
+          world: [0, 0, 0],
+          preview_artifact_id: 'preview-1',
+          camera_revision: 2,
+          pick_buffer_revision: 2,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152',
+      token: 'secret',
+      fetchImpl,
+    })
+
+    await client.pickFootPoint(input)
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'http://127.0.0.1:49152/api/v1/projects/current/pick',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify(input),
+      }),
+    )
+  })
+
   it('retrieves only a verified opaque export and its authenticated Blob', async () => {
     const result = {
       artifact_id: 'export-1',
@@ -384,7 +421,7 @@ describe('HttpBackendClient', () => {
 
   it('confirms exactly the rendered camera revision through the project API', async () => {
     const project = {
-      schema_version: 2,
+      schema_version: 3,
       project_id: 'p1',
       name: 'demo',
       created_at: '2026-07-16T00:00:00Z',

@@ -386,6 +386,44 @@ def test_runner_maps_gs_video_errors_and_saves_terminal_state(
     assert project.stages[StageName.INGEST].output_paths == ["source/meta.json"]
 
 
+@pytest.mark.parametrize("error", [OSError("disk detail"), ValueError("vendor detail")])
+def test_runner_commits_unexpected_exception_and_allows_retry(
+    tmp_path: Path, error: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    repository = ProjectRepository(tmp_path / "project")
+    repository.save(repository.create("unexpected-retry"))
+    attempts = 0
+
+    def execute(project: Project, token: CancellationToken) -> StageResult:
+        nonlocal attempts
+        del project, token
+        attempts += 1
+        if attempts == 1:
+            raise error
+        return StageResult((Path("renders/final.png"),), "final-key")
+
+    runner = PipelineRunner(
+        repository.load(),
+        {StageName.RENDER: RecordingStage(execute)},
+        save=repository.save,
+        claim_stage=repository.claim_stage,
+        compare_and_set_stage=repository.compare_and_set_stage,
+    )
+
+    failed = runner.run(StageName.RENDER, CancellationToken())
+    persisted_failure = repository.load().stages[StageName.RENDER]
+    retried = runner.run(StageName.RENDER, CancellationToken())
+
+    assert failed.status is StageStatus.FAILED
+    assert failed.error_code == "unexpected_stage_failure"
+    assert persisted_failure.status is StageStatus.FAILED
+    assert persisted_failure.error_code == "unexpected_stage_failure"
+    assert persisted_failure.run_id is None
+    assert retried.status is StageStatus.SUCCEEDED
+    assert attempts == 2
+    assert str(error) in caplog.text
+
+
 def test_runner_handled_failure_clears_prior_same_stage_cache_key() -> None:
     project = project_with_prior_output()
     project.stages[StageName.RENDER] = StageState(

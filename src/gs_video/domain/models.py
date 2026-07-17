@@ -120,6 +120,7 @@ class FootPointState(BaseModel):
 
     image: tuple[int, int]
     world: tuple[float, float, float]
+    preview_artifact_id: str
     camera_revision: int = Field(ge=1)
     pick_buffer_revision: int = Field(ge=1)
 
@@ -158,7 +159,9 @@ class WorkflowState(BaseModel):
     scene_summary: SceneSummary | None = None
     subject_prompt: SubjectPromptState | None = None
     target_camera: CameraPose | None = None
+    preview_epoch: int = Field(default=0, ge=0)
     confirmed_camera_revision: int | None = Field(default=None, ge=1)
+    confirmed_preview_artifact_id: str | None = None
     foot_point: FootPointState | None = None
     motion_scale: float = Field(default=1.0, ge=0.1, le=4.0)
     preview_height: int = Field(default=540, ge=180, le=540)
@@ -170,7 +173,7 @@ class WorkflowState(BaseModel):
 class Project(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 2
+    schema_version: int = 3
     project_id: str = Field(default_factory=lambda: str(uuid4()))
     name: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

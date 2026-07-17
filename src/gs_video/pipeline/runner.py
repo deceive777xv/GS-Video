@@ -1,4 +1,5 @@
 from collections.abc import Callable, Mapping
+import logging
 from uuid import uuid4
 
 from gs_video.domain.contracts import Stage
@@ -14,6 +15,9 @@ from gs_video.domain.models import (
 )
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter, discard_progress
+
+
+logger = logging.getLogger(__name__)
 
 
 SaveProject = Callable[[Project], None]
@@ -169,6 +173,11 @@ class PipelineRunner:
             terminal = state.model_copy(deep=True)
             terminal.status = StageStatus.FAILED
             terminal.error_code = error.code
+        except Exception:
+            logger.exception("Unexpected failure in pipeline stage %s", name.value)
+            terminal = state.model_copy(deep=True)
+            terminal.status = StageStatus.FAILED
+            terminal.error_code = "unexpected_stage_failure"
 
         terminal.run_id = None
         state, _applied = self._compare_and_set(

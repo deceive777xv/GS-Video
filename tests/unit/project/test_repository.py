@@ -47,8 +47,45 @@ def test_repository_round_trips_project(tmp_path: Path) -> None:
 
     assert loaded == project
     assert loaded.project_id == project.project_id
-    assert loaded.schema_version == 2
+    assert loaded.schema_version == 3
     assert (tmp_path / "project.json").exists()
+
+
+def test_repository_load_migrates_v2_pick_authority_and_round_trips_v3(
+    tmp_path: Path,
+) -> None:
+    repository = ProjectRepository(tmp_path)
+    artifact_id = "a" * 32
+    raw = Project(name="legacy").model_dump(mode="json")
+    raw["schema_version"] = 2
+    raw["workflow"]["confirmed_camera_revision"] = 2
+    raw["workflow"].pop("confirmed_preview_artifact_id", None)
+    raw["workflow"]["preview"] = {
+        "artifact_id": artifact_id,
+        "artifact_size": 12,
+        "artifact_sha256": "b" * 64,
+        "generation": 1,
+        "width": 16,
+        "height": 9,
+        "camera_revision": 2,
+        "pick_buffer_revision": 3,
+    }
+    raw["workflow"]["foot_point"] = {
+        "image": [8, 4],
+        "world": [0.0, 0.0, 2.0],
+        "camera_revision": 2,
+        "pick_buffer_revision": 3,
+    }
+    repository.path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = repository.load()
+    repository.save(loaded)
+    round_tripped = repository.load()
+
+    assert round_tripped.schema_version == 3
+    assert round_tripped.workflow.confirmed_preview_artifact_id == artifact_id
+    assert round_tripped.workflow.foot_point is not None
+    assert round_tripped.workflow.foot_point.preview_artifact_id == artifact_id
 
 
 @pytest.mark.parametrize(

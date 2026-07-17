@@ -12,10 +12,13 @@ from gs_video.api.events import EventBus
 from gs_video.api.routes import ApiServices
 from gs_video.api.schemas import ApiSettings
 from gs_video.app import create_app
-from gs_video.domain.models import StageName, StageState, StageStatus
+from gs_video.domain.contracts import StageResult
+from gs_video.domain.models import Project, StageName, StageState, StageStatus
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.domain.errors import CancelledError
 from gs_video.pipeline.cancellation import CancellationToken
+from gs_video.pipeline.events import ProgressEmitter
+from gs_video.pipeline.runner import PipelineRunner
 from gs_video.project.repository import ProjectRepository
 
 
@@ -78,6 +81,25 @@ class SupersededRunner:
         return StageState(status=self.status)
 
 
+class UnexpectedThenSuccessfulStage:
+    name = StageName.SEGMENT
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def execute(
+        self,
+        project: Project,
+        token: CancellationToken,
+        emit: ProgressEmitter,
+    ) -> StageResult:
+        del project, token, emit
+        self.calls += 1
+        if self.calls == 1:
+            raise OSError("sensitive vendor path")
+        return StageResult((Path("masks"),), "segment-key")
+
+
 class RecordingWorkerRegistry:
     def __init__(self) -> None:
         self.terminate_calls = 0
@@ -112,6 +134,18 @@ def make_app(
         shutdown_timeout=shutdown_timeout,
     )
     return create_app(settings, services), registry
+
+
+def _wait_for_terminal_task(
+    client: TestClient, task_id: str, headers: dict[str, str]
+) -> dict[str, object]:
+    deadline = time.monotonic() + 2
+    while True:
+        snapshot = client.get(f"/api/v1/tasks/{task_id}", headers=headers).json()
+        if snapshot["status"] not in {"queued", "running"}:
+            return snapshot
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
 
 
 def test_task_state_is_recoverable_without_websocket(tmp_path: Path) -> None:
@@ -152,6 +186,39 @@ def test_uncommitted_stage_is_not_reported_as_task_success(
             time.sleep(0.001)
 
     assert snapshot["status"] == "cancelled"
+
+
+def test_unexpected_stage_failure_is_reported_and_next_task_can_retry(
+    tmp_path: Path,
+) -> None:
+    repository = ProjectRepository(tmp_path / "project")
+    repository.save(repository.create("retry-task"))
+    stage = UnexpectedThenSuccessfulStage()
+    runner = PipelineRunner(
+        repository.load(),
+        {StageName.SEGMENT: stage},
+        save=repository.save,
+        claim_stage=repository.claim_stage,
+        compare_and_set_stage=repository.compare_and_set_stage,
+    )
+    app, _ = make_app(tmp_path / "api", runner=runner)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+
+    with TestClient(app) as client:
+        first_id = client.post(
+            "/api/v1/tasks", json={"target_stage": "segment"}, headers=headers
+        ).json()["id"]
+        first = _wait_for_terminal_task(client, first_id, headers)
+        second_id = client.post(
+            "/api/v1/tasks", json={"target_stage": "segment"}, headers=headers
+        ).json()["id"]
+        second = _wait_for_terminal_task(client, second_id, headers)
+
+    assert first["status"] == "failed"
+    assert first["error"] == "unexpected_stage_failure"
+    assert "sensitive" not in str(first)
+    assert second["status"] == "succeeded"
+    assert repository.load().stages[StageName.SEGMENT].run_id is None
 
 
 def test_websocket_authenticates_then_resumes_events(tmp_path: Path) -> None:

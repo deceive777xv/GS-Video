@@ -165,10 +165,11 @@ def test_preview_coordinator_skips_obsolete_queued_generations() -> None:
                 assert release.wait(2)
             return generation
 
-        first = asyncio.create_task(coordinator.render(1, render, 1))
+        authority = ("project", "source/scene.ply", "a" * 64, 123, 0)
+        first = asyncio.create_task(coordinator.render(authority, 1, render, 1))
         assert await asyncio.to_thread(started.wait, 1)
-        second = asyncio.create_task(coordinator.render(2, render, 2))
-        third = asyncio.create_task(coordinator.render(3, render, 3))
+        second = asyncio.create_task(coordinator.render(authority, 2, render, 2))
+        third = asyncio.create_task(coordinator.render(authority, 3, render, 3))
         await asyncio.sleep(0)
         release.set()
         outcomes = await asyncio.gather(first, second, third, return_exceptions=True)
@@ -197,10 +198,11 @@ def test_preview_cancellation_keeps_serialization_until_thread_finishes() -> Non
             second_started.set()
             return 2
 
-        first = asyncio.create_task(coordinator.render(1, first_render))
+        authority = ("project", "source/scene.ply", "a" * 64, 123, 0)
+        first = asyncio.create_task(coordinator.render(authority, 1, first_render))
         assert await asyncio.to_thread(started.wait, 1)
         first.cancel()
-        second = asyncio.create_task(coordinator.render(2, second_render))
+        second = asyncio.create_task(coordinator.render(authority, 2, second_render))
         await asyncio.sleep(0.05)
         assert not second_started.is_set()
         release.set()
@@ -282,14 +284,71 @@ def test_preview_coordinator_coalesces_duplicate_queued_generation() -> None:
                 assert release.wait(2)
             return label
 
-        first = asyncio.create_task(coordinator.render(1, render, "first"))
+        authority = ("project", "source/scene.ply", "a" * 64, 123, 0)
+        first = asyncio.create_task(coordinator.render(authority, 1, render, "first"))
         assert await asyncio.to_thread(started.wait, 1)
-        latest = asyncio.create_task(coordinator.render(1, render, "latest"))
+        latest = asyncio.create_task(coordinator.render(authority, 1, render, "latest"))
         await asyncio.sleep(0)
         release.set()
         outcomes = await asyncio.gather(first, latest, return_exceptions=True)
 
         assert rendered == ["first"]
         assert outcomes == ["first", "first"]
+
+    asyncio.run(exercise())
+
+
+def test_preview_coordinator_forgets_completed_generation_for_fresh_preview() -> None:
+    async def exercise() -> None:
+        coordinator = PreviewCoordinator()
+        authority = ("project", "source/scene.ply", "a" * 64, 123, 0)
+
+        assert await coordinator.render(authority, 99, lambda: "old") == "old"
+        assert await coordinator.render(authority, 1, lambda: "fresh") == "fresh"
+        assert coordinator._authority_states == {}
+
+    asyncio.run(exercise())
+
+
+def test_preview_coordinator_forgets_failed_generation_for_fresh_preview() -> None:
+    async def exercise() -> None:
+        coordinator = PreviewCoordinator()
+        authority = ("project", "source/scene.ply", "a" * 64, 123, 0)
+
+        def fail() -> None:
+            raise ValueError("render failed")
+
+        with pytest.raises(ValueError, match="render failed"):
+            await coordinator.render(authority, 99, fail)
+        assert await coordinator.render(authority, 1, lambda: "fresh") == "fresh"
+        assert coordinator._authority_states == {}
+
+    asyncio.run(exercise())
+
+
+def test_preview_coordinator_separates_preview_epochs_while_old_render_runs() -> None:
+    async def exercise() -> None:
+        coordinator = PreviewCoordinator()
+        old_authority = ("project", "source/scene.ply", "a" * 64, 123, 0)
+        fresh_authority = ("project", "source/scene.ply", "a" * 64, 123, 1)
+        started = Event()
+        release = Event()
+
+        def old_render() -> str:
+            started.set()
+            assert release.wait(2)
+            return "old"
+
+        old = asyncio.create_task(coordinator.render(old_authority, 100, old_render))
+        assert await asyncio.to_thread(started.wait, 1)
+        fresh = asyncio.create_task(
+            coordinator.render(fresh_authority, 1, lambda: "fresh")
+        )
+        await asyncio.sleep(0)
+        release.set()
+
+        assert await old == "old"
+        assert await fresh == "fresh"
+        assert coordinator._authority_states == {}
 
     asyncio.run(exercise())
