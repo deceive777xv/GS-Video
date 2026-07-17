@@ -12,7 +12,9 @@ import {
 
 import type { BackendClient } from './api/backend-client'
 import { HttpBackendClient } from './api/http-backend-client'
-import type { SessionConfig } from './api/types'
+import { WebSocketTaskEventSource } from './api/task-events'
+import type { BootstrapDto, SessionConfig } from './api/types'
+import { App } from './app/app'
 import { BrowserPlatformBridge } from './platform/browser-platform-bridge'
 import type { PlatformBridge } from './platform/platform-bridge'
 import { TauriPlatformBridge } from './platform/tauri-platform-bridge'
@@ -53,11 +55,27 @@ function RuntimeProviders({
   )
 }
 
-function ConnectedShell(): ReactElement {
+function ConnectedShell({
+  client,
+  bridge,
+  bootstrap,
+  eventSource,
+}: {
+  client: BackendClient
+  bridge: PlatformBridge
+  bootstrap: BootstrapDto
+  eventSource: WebSocketTaskEventSource
+}): ReactElement {
   return (
-    <main>
-      <p>Connected to local service</p>
-    </main>
+    <>
+      <p className="sr-only">Connected to local service</p>
+      <App
+        backend={client}
+        eventSource={eventSource}
+        initialBootstrap={bootstrap}
+        platform={bridge}
+      />
+    </>
   )
 }
 
@@ -69,7 +87,11 @@ export function BrowserCompositionRoot({
   const bridge = useMemo(() => new BrowserPlatformBridge(), [])
   const [port, setPort] = useState('')
   const [token, setToken] = useState('')
-  const [client, setClient] = useState<BackendClient | null>(null)
+  const [runtime, setRuntime] = useState<{
+    client: BackendClient
+    bootstrap: BootstrapDto
+    eventSource: WebSocketTaskEventSource
+  } | null>(null)
   const [connecting, setConnecting] = useState(false)
   const [failed, setFailed] = useState(false)
   const portInput = useRef<HTMLInputElement>(null)
@@ -89,12 +111,20 @@ export function BrowserCompositionRoot({
       token,
     })
     try {
-      await candidate.bootstrap()
+      const session = {
+        origin: `http://127.0.0.1:${String(portNumber)}`,
+        token,
+      }
+      const initialBootstrap = await candidate.bootstrap()
       if (portInput.current !== null) portInput.current.value = ''
       if (tokenInput.current !== null) tokenInput.current.value = ''
       setPort('')
       setToken('')
-      setClient(candidate)
+      setRuntime({
+        client: candidate,
+        bootstrap: initialBootstrap,
+        eventSource: new WebSocketTaskEventSource(session),
+      })
     } catch {
       setFailed(true)
     } finally {
@@ -102,10 +132,15 @@ export function BrowserCompositionRoot({
     }
   }
 
-  if (client !== null) {
+  if (runtime !== null) {
     return (
-      <RuntimeProviders client={client} bridge={bridge}>
-        <ConnectedShell />
+      <RuntimeProviders client={runtime.client} bridge={bridge}>
+        <ConnectedShell
+          bootstrap={runtime.bootstrap}
+          bridge={bridge}
+          client={runtime.client}
+          eventSource={runtime.eventSource}
+        />
       </RuntimeProviders>
     )
   }
@@ -153,6 +188,8 @@ export function TauriCompositionRoot({
 }): ReactElement {
   const [client] = useState(() => createClient(session))
   const bridge = useMemo(() => new TauriPlatformBridge(client), [client])
+  const eventSource = useMemo(() => new WebSocketTaskEventSource(session), [session])
+  const [initialBootstrap, setInitialBootstrap] = useState<BootstrapDto | null>(null)
   const [connection, setConnection] = useState<'connecting' | 'ready' | 'failed'>(
     'connecting',
   )
@@ -161,7 +198,10 @@ export function TauriCompositionRoot({
     const controller = new AbortController()
     void client
       .bootstrap(controller.signal)
-      .then(() => setConnection('ready'))
+      .then((value) => {
+        setInitialBootstrap(value)
+        setConnection('ready')
+      })
       .catch(() => {
         if (!controller.signal.aborted) setConnection('failed')
       })
@@ -171,10 +211,15 @@ export function TauriCompositionRoot({
   if (connection === 'failed') {
     return <p role="alert">Desktop local service unavailable.</p>
   }
-  if (connection === 'connecting') return <p>Connecting to local service…</p>
+  if (connection === 'connecting' || initialBootstrap === null) return <p>Connecting to local service…</p>
   return (
     <RuntimeProviders client={client} bridge={bridge}>
-      <ConnectedShell />
+      <ConnectedShell
+        bootstrap={initialBootstrap}
+        bridge={bridge}
+        client={client}
+        eventSource={eventSource}
+      />
     </RuntimeProviders>
   )
 }

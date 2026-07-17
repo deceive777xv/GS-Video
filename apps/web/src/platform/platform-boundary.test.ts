@@ -13,8 +13,38 @@ import type { BackendClient } from '../api/backend-client'
 import { BrowserPlatformBridge } from './browser-platform-bridge'
 import { TauriPlatformBridge } from './tauri-platform-bridge'
 
+const bootstrap = {
+  api_version: '1',
+  capabilities: [],
+  environment: { ready: true, vram_mb: 8192, issues: [], renderer_versions: null },
+  project: {
+    schema_version: 3,
+    project_id: 'project-1',
+    name: 'Project',
+    created_at: '2026-07-17T00:00:00Z',
+    source_video: null,
+    scene_ply: null,
+    stages: {},
+    workflow: {
+      source_summary: null,
+      scene_summary: null,
+      subject_prompt: null,
+      target_camera: null,
+      preview_epoch: 0,
+      confirmed_camera_revision: null,
+      confirmed_preview_artifact_id: null,
+      foot_point: null,
+      motion_scale: 1,
+      preview_height: 540,
+      active_task_id: null,
+      preview: null,
+      export_result: null,
+    },
+  },
+} as const
+
 const fakeClient = (): BackendClient => ({
-  bootstrap: vi.fn().mockResolvedValue({}),
+  bootstrap: vi.fn().mockResolvedValue(bootstrap),
   importLocalPath: vi.fn().mockResolvedValue({
     kind: 'source_video',
     path: 'source/video.mp4',
