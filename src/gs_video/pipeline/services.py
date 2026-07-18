@@ -153,10 +153,17 @@ class _FrameInventory:
     paths: tuple[Path, ...]
     sizes: tuple[tuple[int, int], ...]
     fingerprint: str
+    directory_identity: tuple[int, int, int, int]
 
     @property
     def count(self) -> int:
         return len(self.paths)
+
+
+@dataclass(frozen=True)
+class _FileSnapshot:
+    size: int
+    sha256: str
 
 
 def _ordinary_file(path: Path, label: str) -> os.stat_result:
@@ -215,9 +222,30 @@ def _sha256(path: Path, label: str, token: CancellationToken) -> str:
     return digest.hexdigest()
 
 
+def _file_snapshot(
+    path: Path, label: str, token: CancellationToken
+) -> _FileSnapshot:
+    before = _ordinary_file(path, label)
+    digest = _sha256(path, label, token)
+    after = _ordinary_file(path, label)
+    if _file_identity(before) != _file_identity(after):
+        raise RepairableError(f"{label}快照期间身份发生变化")
+    return _FileSnapshot(int(after.st_size), digest)
+
+
+def _assert_file_snapshot(
+    path: Path,
+    expected: _FileSnapshot,
+    label: str,
+    token: CancellationToken,
+) -> None:
+    if _file_snapshot(path, label, token) != expected:
+        raise RepairableError(f"{label} authority 在处理期间发生变化")
+
+
 def _source_material(
     paths: WorkflowPaths, project: Project, token: CancellationToken
-) -> tuple[Path, VideoSummary]:
+) -> tuple[Path, VideoSummary, _FileSnapshot]:
     summary = project.workflow.source_summary
     if summary is None or project.source_video is None:
         raise RepairableError("尚未导入源视频")
@@ -226,13 +254,10 @@ def _source_material(
     if relative.is_absolute() or ".." in relative.parts or relative.parts[:1] != ("source",):
         raise RepairableError("源视频路径不属于项目 source 目录")
     source = paths.root / relative
-    metadata = _ordinary_file(source, "源视频")
-    if (
-        metadata.st_size != summary.size
-        or _sha256(source, "源视频", token) != summary.sha256
-    ):
+    snapshot = _file_snapshot(source, "源视频", token)
+    if snapshot != _FileSnapshot(summary.size, summary.sha256):
         raise RepairableError("源视频与已登记摘要不一致")
-    return source, summary
+    return source, summary, snapshot
 
 
 def _require_exportable_dimensions(summary: VideoSummary) -> None:
@@ -381,17 +406,46 @@ def _frame_inventory(
         or _directory_identity(directory_after) != directory_expected
     ):
         raise RepairableError(f"{label}帧目录身份在读取期间发生变化")
-    return _FrameInventory(ordered, tuple(sizes), fingerprint.hexdigest())
+    return _FrameInventory(
+        ordered,
+        tuple(sizes),
+        fingerprint.hexdigest(),
+        directory_expected,
+    )
+
+
+def _assert_frame_snapshot(
+    directory: Path,
+    expected: _FrameInventory,
+    *,
+    suffix: str,
+    image_format: str,
+    mode: str,
+    label: str,
+    token: CancellationToken,
+) -> None:
+    actual = _frame_inventory(
+        directory,
+        suffix=suffix,
+        image_format=image_format,
+        mode=mode,
+        label=label,
+        expected_count=expected.count,
+        expected_sizes=expected.sizes,
+        token=token,
+    )
+    if actual != expected:
+        raise RepairableError(f"{label}帧 authority 在处理期间发生变化")
 
 
 def _model_identity(
     path: Path, label: str, token: CancellationToken
 ) -> dict[str, object]:
-    metadata = _ordinary_file(path, label)
+    snapshot = _file_snapshot(path, label, token)
     return {
         "filename": path.name,
-        "size": metadata.st_size,
-        "sha256": _sha256(path, label, token),
+        "size": snapshot.size,
+        "sha256": snapshot.sha256,
     }
 
 
@@ -654,7 +708,9 @@ class MediaIngestService:
         emit: ProgressEmitter,
     ) -> StageResult:
         token.raise_if_cancelled()
-        source, summary = _source_material(self.paths, project, token)
+        source, summary, source_snapshot = _source_material(
+            self.paths, project, token
+        )
         source_identity = summary.model_dump(mode="json")
         # The decoded inventory can fill this derived probe field. Keeping it out of
         # the key makes the first unknown-count run reusable after persistence.
@@ -685,6 +741,7 @@ class MediaIngestService:
                 token=token,
             )
             discovered_count = inventory.count
+            _assert_file_snapshot(source, source_snapshot, "源视频", token)
             token.raise_if_cancelled()
 
         source_directory = self.paths.publisher.publish_tree(
@@ -716,6 +773,7 @@ class MediaIngestService:
                 token=token,
             )
             _validate_proxy_dimensions(inventory, summary, self.proxy_height)
+            _assert_file_snapshot(source, source_snapshot, "源视频", token)
             token.raise_if_cancelled()
 
         proxy_directory = self.paths.publisher.publish_tree(
@@ -834,8 +892,6 @@ class SegmentWorkflowService:
             )
             if sequence.frame_count != masks.count:
                 raise RepairableError("分割 worker 返回的帧数不一致")
-            if _segmentation_identity(self.segmenter, token) != identity:
-                raise RepairableError("分割 backend identity 在运行期间发生变化")
             for mask in masks.paths:
                 mask.replace(staging / mask.name)
             try:
@@ -852,6 +908,17 @@ class SegmentWorkflowService:
                 expected_sizes=inventory.sizes,
                 token=token,
             )
+            _assert_frame_snapshot(
+                proxies,
+                inventory,
+                suffix="jpg",
+                image_format="JPEG",
+                mode="RGB",
+                label="代理",
+                token=token,
+            )
+            if _segmentation_identity(self.segmenter, token) != identity:
+                raise RepairableError("分割 backend identity 在运行期间发生变化")
             token.raise_if_cancelled()
 
         output = self.paths.publisher.publish_tree("masks", result_key, build)
@@ -929,6 +996,15 @@ class CameraSolveWorkflowService:
             if len(solution.camera_to_world) != proxies.count:
                 raise RepairableError("相机求解轨迹帧数与代理帧数不一致")
             write_camera_solution(staging / "solution.json", solution)
+            _assert_frame_snapshot(
+                proxy_directory,
+                proxies,
+                suffix="jpg",
+                image_format="JPEG",
+                mode="RGB",
+                label="代理",
+                token=token,
+            )
             token.raise_if_cancelled()
 
         output = self.paths.publisher.publish_tree("camera", result_key, build)
@@ -962,7 +1038,7 @@ class TrajectoryMapWorkflowService:
             "camera",
             filename="solution.json",
         )
-        _ordinary_file(solution_path, "相机求解产物")
+        solution_snapshot = _file_snapshot(solution_path, "相机求解产物", token)
         solution = read_camera_solution(solution_path)
         workflow = project.workflow
         camera = workflow.target_camera
@@ -993,9 +1069,7 @@ class TrajectoryMapWorkflowService:
             StageName.MAP_TRAJECTORY.value,
             {
                 "solve_cache_key": solve.cache_key,
-                "camera_artifact_sha256": _sha256(
-                    solution_path, "相机求解产物", token
-                ),
+                "camera_artifact_sha256": solution_snapshot.sha256,
             },
             {
                 "camera": camera.model_dump(mode="json"),
@@ -1011,6 +1085,12 @@ class TrajectoryMapWorkflowService:
             write_mapped_trajectory(
                 staging / "trajectory.json",
                 MappedTrajectory(camera.fov_y_degrees, mapped),
+            )
+            _assert_file_snapshot(
+                solution_path,
+                solution_snapshot,
+                "相机求解产物",
+                token,
             )
             token.raise_if_cancelled()
 
@@ -1094,7 +1174,9 @@ class CompositeWorkflowService:
         emit: ProgressEmitter,
     ) -> StageResult:
         token.raise_if_cancelled()
-        source_video, summary = _source_material(self.paths, project, token)
+        source_video, summary, source_snapshot = _source_material(
+            self.paths, project, token
+        )
         ingest = _stage_state(project, StageName.INGEST)
         segment = _stage_state(project, StageName.SEGMENT)
         render = _stage_state(project, StageName.RENDER)
@@ -1195,6 +1277,42 @@ class CompositeWorkflowService:
                 )
                 Image.fromarray(composite).save(staging / f"{index:06d}.png")
                 emit(index, sources.count, f"合成全分辨率帧 {index}/{sources.count}")
+            _assert_frame_snapshot(
+                source_directory,
+                sources,
+                suffix="png",
+                image_format="PNG",
+                mode="RGB",
+                label="源",
+                token=token,
+            )
+            _assert_frame_snapshot(
+                proxy_directory,
+                proxies,
+                suffix="jpg",
+                image_format="JPEG",
+                mode="RGB",
+                label="代理",
+                token=token,
+            )
+            _assert_frame_snapshot(
+                mask_directory,
+                masks,
+                suffix="png",
+                image_format="PNG",
+                mode="L",
+                label="遮罩",
+                token=token,
+            )
+            _assert_frame_snapshot(
+                render_directory,
+                renders,
+                suffix="png",
+                image_format="PNG",
+                mode="RGB",
+                label="渲染",
+                token=token,
+            )
             token.raise_if_cancelled()
 
         composite_directory = self.paths.publisher.publish_tree(
@@ -1243,6 +1361,21 @@ class CompositeWorkflowService:
                 has_audio=summary.has_audio,
                 label="预览导出器",
                 allow_duration_tolerance=False,
+            )
+            _assert_frame_snapshot(
+                composite_directory,
+                composites,
+                suffix="png",
+                image_format="PNG",
+                mode="RGB",
+                label="合成",
+                token=token,
+            )
+            _assert_file_snapshot(
+                source_video,
+                source_snapshot,
+                "源视频",
+                token,
             )
             _write_mp4_manifest(
                 staging,
@@ -1319,7 +1452,9 @@ class ExportWorkflowService:
         emit: ProgressEmitter,
     ) -> StageResult:
         token.raise_if_cancelled()
-        source_video, summary = _source_material(self.paths, project, token)
+        source_video, summary, source_snapshot = _source_material(
+            self.paths, project, token
+        )
         composite = _stage_state(project, StageName.COMPOSITE)
         composite_directory = _artifact_path(
             self.paths,
@@ -1373,6 +1508,21 @@ class ExportWorkflowService:
                 has_audio=summary.has_audio,
                 label="最终导出器",
                 allow_duration_tolerance=False,
+            )
+            _assert_frame_snapshot(
+                composite_directory,
+                frames,
+                suffix="png",
+                image_format="PNG",
+                mode="RGB",
+                label="合成",
+                token=token,
+            )
+            _assert_file_snapshot(
+                source_video,
+                source_snapshot,
+                "源视频",
+                token,
             )
             _write_mp4_manifest(
                 staging,

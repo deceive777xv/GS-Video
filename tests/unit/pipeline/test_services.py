@@ -48,6 +48,7 @@ from gs_video.pipeline.services import (
     _preview_size,
     _sha256,
 )
+import gs_video.pipeline.services as workflow_services
 
 
 CacheKey = str
@@ -66,6 +67,30 @@ def write_rgb(path: Path, size: tuple[int, int], value: int) -> None:
 def write_mask(path: Path, size: tuple[int, int], value: int = 255) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.new("L", size, value).save(path)
+
+
+def replace_rgb_with_same_size(path: Path, value: int) -> None:
+    with Image.open(path) as image:
+        size = image.size
+    original = path.read_bytes()
+    replacement = path.with_name(f".{path.stem}-replacement{path.suffix}")
+    for candidate in (value, 0, 32, 64, 96, 128, 192, 255):
+        write_rgb(replacement, size, candidate)
+        remaining = len(original) - replacement.stat().st_size
+        if remaining >= 0 and replacement.read_bytes() != original:
+            with replacement.open("ab") as stream:
+                stream.write(b"\0" * remaining)
+            break
+    assert replacement.stat().st_size == len(original)
+    assert replacement.read_bytes() != original
+    replacement.replace(path)
+
+
+def replace_bytes_with_same_size(path: Path, payload: bytes) -> None:
+    assert len(payload) == path.stat().st_size
+    replacement = path.with_name(f".{path.name}-replacement")
+    replacement.write_bytes(payload)
+    replacement.replace(path)
 
 
 def source_project(root: Path, *, frame_count: int | None = 3) -> Project:
@@ -209,6 +234,27 @@ def test_ingest_cache_hit_revalidates_proxy_dimensions(tmp_path: Path) -> None:
     assert backend.proxy_calls == 1
 
 
+def test_ingest_rejects_source_replacement_by_backend_before_publication(
+    tmp_path: Path,
+) -> None:
+    project = source_project(tmp_path)
+
+    class ReplacingBackend(FakeMediaBackend):
+        def extract_source_frames(
+            self, source: Path, output_dir: Path
+        ) -> list[Path]:
+            frames = super().extract_source_frames(source, output_dir)
+            replace_bytes_with_same_size(source, b"source-V1deo")
+            return frames
+
+    with pytest.raises(RepairableError, match="源视频|authority|变化|摘要"):
+        MediaIngestService(WorkflowPaths(tmp_path), ReplacingBackend()).run(
+            project, CancellationToken(), discard_progress
+        )
+
+    assert not any((tmp_path / "frames").glob("?" * 64))
+
+
 @pytest.mark.parametrize(("width", "height"), [(1, 6), (8, 1), (7, 6), (8, 5)])
 def test_ingest_rejects_dimensions_that_cannot_be_exported_without_resizing(
     tmp_path: Path, width: int, height: int
@@ -258,6 +304,19 @@ class FakeSegmenter:
                 write_mask(output_dir / f"{index:06d}.png", image.size)
             emit(index, len(frames), f"mask {index}")
         return MaskSequence(output_dir, len(frames))
+
+
+class ReplacingSegmenter(FakeSegmenter):
+    def segment(
+        self,
+        frames: list[Path],
+        prompt: Prompt,
+        output_dir: Path,
+        emit: ProgressEmitter,
+        token: CancellationToken,
+    ) -> MaskSequence:
+        replace_rgb_with_same_size(frames[0], 200)
+        return super().segment(frames, prompt, output_dir, emit, token)
 
 
 def ingest_succeeded(project: Project, root: Path, cache_key: str = key("a")) -> Project:
@@ -324,6 +383,20 @@ def test_segment_cache_hit_revalidates_mask_count_and_proxy_sizes(
         service.run(project, CancellationToken(), discard_progress)
 
 
+def test_segment_rejects_proxy_replacement_by_worker_before_publication(
+    tmp_path: Path,
+) -> None:
+    project = ingest_succeeded(source_project(tmp_path), tmp_path)
+    project.workflow.subject_prompt = SubjectPromptState(frame_index=0, x=1, y=1)
+
+    with pytest.raises(RepairableError, match="代理|authority|变化|fingerprint"):
+        SegmentWorkflowService(
+            WorkflowPaths(tmp_path), ReplacingSegmenter(tmp_path)
+        ).run(project, CancellationToken(), discard_progress)
+
+    assert not any((tmp_path / "masks").glob("?" * 64))
+
+
 class FakeSolver:
     identity = "fake-opencv-solver-1"
 
@@ -348,6 +421,17 @@ class FakeSolver:
             0.9,
             {"backend": "fake"},
         )
+
+
+class ReplacingSolver(FakeSolver):
+    def solve(
+        self,
+        frame_paths: list[Path] | tuple[Path, ...],
+        emit: ProgressEmitter,
+        token: CancellationToken,
+    ) -> CameraSolution:
+        replace_rgb_with_same_size(frame_paths[0], 200)
+        return super().solve(frame_paths, emit, token)
 
 
 def test_custom_solver_requires_explicit_backend_identity(tmp_path: Path) -> None:
@@ -391,6 +475,21 @@ def test_camera_cache_hit_revalidates_pose_count(tmp_path: Path) -> None:
 
     with pytest.raises(RepairableError, match="帧数|轨迹"):
         service.run(project, CancellationToken(), discard_progress)
+
+
+def test_camera_solver_rejects_proxy_replacement_before_publication(
+    tmp_path: Path,
+) -> None:
+    project = ingest_succeeded(source_project(tmp_path), tmp_path)
+
+    with pytest.raises(RepairableError, match="代理|authority|变化|fingerprint"):
+        CameraSolveWorkflowService(
+            WorkflowPaths(tmp_path),
+            ReplacingSolver(),
+            backend_identity="replacing-solver-v1",
+        ).run(project, CancellationToken(), discard_progress)
+
+    assert not any((tmp_path / "camera").glob("?" * 64))
 
 
 def camera_succeeded(project: Project, root: Path, cache_key: str = key("c")) -> Project:
@@ -485,6 +584,47 @@ def test_trajectory_cache_hit_revalidates_fov_and_pose_count(tmp_path: Path) -> 
 
     with pytest.raises(RepairableError, match="轨迹|FOV|fov"):
         service.run(project, CancellationToken(), discard_progress)
+
+
+def test_trajectory_rejects_camera_replacement_during_mapping(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = camera_succeeded(source_project(tmp_path), tmp_path)
+    authorize_mapping(project)
+    solution_path = tmp_path / project.stages[StageName.SOLVE_CAMERA].artifacts[
+        ArtifactRole.CAMERA_SOLUTION
+    ]
+    original_map = workflow_services.map_trajectory
+
+    def replacing_map(
+        solution: CameraSolution,
+        target_camera_to_world: np.ndarray,
+        translation_scale: float,
+    ) -> tuple[np.ndarray, ...]:
+        replacement = solution_path.with_name("replacement.json")
+        restored = read_camera_solution(solution_path)
+        write_camera_solution(
+            replacement,
+            CameraSolution(
+                restored.intrinsics,
+                restored.camera_to_world,
+                restored.kind,
+                0.8,
+                restored.diagnostics,
+            ),
+        )
+        assert replacement.stat().st_size == solution_path.stat().st_size
+        replacement.replace(solution_path)
+        return original_map(solution, target_camera_to_world, translation_scale)
+
+    monkeypatch.setattr(workflow_services, "map_trajectory", replacing_map)
+
+    with pytest.raises(RepairableError, match="相机|authority|变化|摘要"):
+        TrajectoryMapWorkflowService(WorkflowPaths(tmp_path)).run(
+            project, CancellationToken(), discard_progress
+        )
+
+    assert not any((tmp_path / "trajectories").glob("?" * 64))
 
 
 class RecordingExporter:
@@ -721,6 +861,44 @@ def test_compositor_rejects_masks_that_are_not_proxy_resolution(tmp_path: Path) 
         ).run(project, CancellationToken(), discard_progress)
 
 
+def test_compositor_rejects_upstream_replacement_before_publication(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = completed_render_project(tmp_path)
+    source_directory = tmp_path / project.stages[StageName.INGEST].artifacts[
+        ArtifactRole.SOURCE_FRAMES
+    ]
+    original_composite = workflow_services.composite_frame
+    replaced = False
+
+    def replacing_composite(
+        foreground: np.ndarray,
+        background: np.ndarray,
+        alpha: np.ndarray,
+        *,
+        edge_px: int = 1,
+    ) -> np.ndarray:
+        nonlocal replaced
+        if not replaced:
+            replace_rgb_with_same_size(source_directory / "000002.png", 200)
+            replaced = True
+        return original_composite(
+            foreground, background, alpha, edge_px=edge_px
+        )
+
+    monkeypatch.setattr(workflow_services, "composite_frame", replacing_composite)
+
+    with pytest.raises(RepairableError, match="源|authority|变化|fingerprint"):
+        CompositeWorkflowService(
+            WorkflowPaths(tmp_path),
+            exporter=RecordingExporter(),
+            exporter_identity="recording-exporter-v1",
+            prober=RecordingProber(3),
+        ).run(project, CancellationToken(), discard_progress)
+
+    assert not any((tmp_path / "composites").glob("?" * 64))
+
+
 def test_export_registers_full_composite_video(tmp_path: Path) -> None:
     project = completed_render_project(tmp_path)
     preview_exporter = RecordingExporter()
@@ -782,6 +960,60 @@ def test_final_export_cache_hit_rejects_content_tampering(tmp_path: Path) -> Non
         service.run(project, CancellationToken(), discard_progress)
 
     assert len(exporter.calls) == 1
+
+
+@pytest.mark.parametrize("mutate_source", [False, True])
+def test_final_export_rejects_upstream_replacement_before_publication(
+    tmp_path: Path, mutate_source: bool
+) -> None:
+    project = completed_render_project(tmp_path)
+    composite = CompositeWorkflowService(
+        WorkflowPaths(tmp_path),
+        exporter=RecordingExporter(),
+        exporter_identity="recording-preview-exporter-v1",
+        prober=RecordingProber(3),
+    ).run(project, CancellationToken(), discard_progress)
+    project.stages[StageName.COMPOSITE] = StageState(
+        status=StageStatus.SUCCEEDED,
+        cache_key=composite.cache_key,
+        artifacts={role: str(path) for role, path in composite.artifacts.items()},
+    )
+
+    class ReplacingExporter(RecordingExporter):
+        def __call__(
+            self,
+            frames_dir: Path,
+            source_video: Path,
+            fps: Fraction,
+            frame_count: int,
+            output: Path,
+            *,
+            cancellation_check: Callable[[], None] | None = None,
+        ) -> ExportResult:
+            if mutate_source:
+                replace_bytes_with_same_size(source_video, b"source-V1deo")
+            else:
+                replace_rgb_with_same_size(frames_dir / "000001.png", 200)
+            return super().__call__(
+                frames_dir,
+                source_video,
+                fps,
+                frame_count,
+                output,
+                cancellation_check=cancellation_check,
+            )
+
+    with pytest.raises(
+        RepairableError, match="合成|源视频|authority|变化|fingerprint|摘要"
+    ):
+        ExportWorkflowService(
+            WorkflowPaths(tmp_path),
+            exporter=ReplacingExporter(),
+            exporter_identity="replacing-final-exporter-v1",
+            prober=RecordingProber(3),
+        ).run(project, CancellationToken(), discard_progress)
+
+    assert not any((tmp_path / "exports").glob("?" * 64))
 
 
 def test_services_check_cancellation_before_publication(tmp_path: Path) -> None:
