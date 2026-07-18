@@ -1,12 +1,45 @@
+import hashlib
+from fractions import Fraction
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
 import pytest
 
-from gs_video.domain.contracts import StageResult
+from gs_video.camera.classify import CameraKind
+from gs_video.camera.opencv_solver import CameraSolution
+from gs_video.domain.contracts import (
+    MaskSequence,
+    Prompt,
+    SegmentationBackend,
+    StageResult,
+)
 from gs_video.domain.errors import RepairableError
-from gs_video.domain.models import Project, StageName, StageStatus
+from gs_video.domain.models import (
+    ArtifactRole,
+    CameraPose,
+    FootPointState,
+    PreviewState,
+    Project,
+    StageName,
+    StageStatus,
+    SubjectPromptState,
+    VideoSummary,
+)
+from gs_video.media.export import ExportResult
+from gs_video.pipeline.artifacts import ArtifactPublisher
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
+from gs_video.pipeline.services import (
+    CameraSolveWorkflowService,
+    CompositeWorkflowService,
+    ExportWorkflowService,
+    MediaIngestService,
+    SegmentWorkflowService,
+    TrajectoryMapWorkflowService,
+    WorkflowPaths,
+)
+from gs_video.project.cache import cache_key
 import gs_video.pipeline.workflow as workflow
 
 
@@ -192,3 +225,229 @@ def test_dependency_terminal_state_stops_downstream_stages(cancel_solver: bool) 
         StageName.EXPORT,
     ):
         assert saved[-1].stages[name].status is StageStatus.PENDING
+
+
+def _write_rgb(path: Path, size: tuple[int, int], value: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", size, (value, value, value)).save(path)
+
+
+class _IntegrationMediaBackend:
+    identity = "integration-media-v1"
+
+    def extract_source_frames(self, source: Path, output_dir: Path) -> list[Path]:
+        del source
+        paths: list[Path] = []
+        for index, value in enumerate((40, 80), start=1):
+            path = output_dir / f"{index:06d}.png"
+            _write_rgb(path, (8, 6), value)
+            paths.append(path)
+        return paths
+
+    def extract_proxy_frames(
+        self, source: Path, output_dir: Path, max_height: int
+    ) -> list[Path]:
+        del source, max_height
+        paths: list[Path] = []
+        for index, value in enumerate((40, 80), start=1):
+            path = output_dir / f"{index:06d}.jpg"
+            _write_rgb(path, (4, 3), value)
+            paths.append(path)
+        return paths
+
+
+class _IntegrationSegmenter:
+    backend = SegmentationBackend.EDGETAM
+    worker_prefix = ("integration-worker",)
+
+    def __init__(self, root: Path) -> None:
+        self.model_config = root / "models" / "segment.yaml"
+        self.checkpoint = root / "models" / "segment.pt"
+        self.model_config.parent.mkdir(parents=True)
+        self.model_config.write_bytes(b"config")
+        self.checkpoint.write_bytes(b"checkpoint")
+
+    def segment(
+        self,
+        frames: list[Path],
+        prompt: Prompt,
+        output_dir: Path,
+        emit: ProgressEmitter,
+        token: CancellationToken,
+    ) -> MaskSequence:
+        assert prompt.frame_index == 0
+        output_dir.mkdir()
+        for index, frame in enumerate(frames, start=1):
+            token.raise_if_cancelled()
+            with Image.open(frame) as image:
+                Image.new("L", image.size, 255).save(
+                    output_dir / f"{index:06d}.png"
+                )
+            emit(index, len(frames), f"segment {index}")
+        return MaskSequence(output_dir, len(frames))
+
+
+class _IntegrationSolver:
+    def solve(
+        self,
+        frame_paths: list[Path] | tuple[Path, ...],
+        emit: ProgressEmitter,
+        token: CancellationToken,
+    ) -> CameraSolution:
+        poses = []
+        for index, _path in enumerate(frame_paths, start=1):
+            token.raise_if_cancelled()
+            pose = np.eye(4)
+            pose[0, 3] = index - 1
+            poses.append(pose)
+            emit(index, len(frame_paths), f"solve {index}")
+        return CameraSolution(
+            np.array([[3.0, 0.0, 2.0], [0.0, 3.0, 1.5], [0.0, 0.0, 1.0]]),
+            poses,
+            CameraKind.SIX_DOF,
+            0.9,
+        )
+
+
+class _IntegrationRenderer:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.publisher = ArtifactPublisher(root)
+
+    def run(
+        self,
+        project: Project,
+        namespace: workflow.RenderCacheNamespace,
+        token: CancellationToken,
+        emit: ProgressEmitter,
+    ) -> StageResult:
+        mapped = project.stages[StageName.MAP_TRAJECTORY]
+        assert mapped.cache_key is not None
+        result_key = cache_key(
+            StageName.RENDER.value,
+            {"mapped_cache_key": mapped.cache_key},
+            {"namespace": namespace.value},
+            "integration-renderer-v1",
+        )
+
+        def build(staging: Path) -> None:
+            for index in range(1, 3):
+                token.raise_if_cancelled()
+                _write_rgb(staging / f"{index:06d}.png", (8, 6), 200)
+                emit(index, 2, f"render {index}")
+
+        output = self.publisher.publish_tree("renders", result_key, build)
+        relative = output.relative_to(self.root)
+        return StageResult(
+            (relative,),
+            result_key,
+            {ArtifactRole.RENDER_FRAMES: relative},
+        )
+
+
+class _IntegrationExporter:
+    def __init__(self) -> None:
+        self.frame_counts: list[int] = []
+
+    def __call__(
+        self,
+        frames_dir: Path,
+        source_video: Path,
+        fps: Fraction,
+        frame_count: int,
+        output: Path,
+    ) -> ExportResult:
+        assert source_video.is_file()
+        assert len(tuple(frames_dir.glob("*.png"))) == frame_count
+        self.frame_counts.append(frame_count)
+        output.write_bytes(b"verified integration mp4")
+        return ExportResult(
+            output=output,
+            fps=fps,
+            frame_count=frame_count,
+            duration=Fraction(frame_count, 1) / fps,
+            has_audio=True,
+        )
+
+
+def test_concrete_cpu_services_progress_through_export_and_persist_artifacts(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source" / "source.mp4"
+    source.parent.mkdir(parents=True)
+    payload = b"integration source"
+    source.write_bytes(payload)
+    project = Project(name="concrete")
+    project.source_video = "source/source.mp4"
+    project.workflow.source_summary = VideoSummary(
+        filename="source.mp4",
+        size=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        width=8,
+        height=6,
+        duration_seconds=10,
+        fps="24/1",
+        has_audio=True,
+        frame_count=2,
+    )
+    project.workflow.subject_prompt = SubjectPromptState(frame_index=0, x=1, y=1)
+    project.workflow.target_camera = CameraPose(
+        target=(0, 0, 0),
+        distance=4,
+        yaw=0,
+        pitch=0,
+        fov_y_degrees=55,
+        revision=1,
+    )
+    project.workflow.confirmed_camera_revision = 1
+    project.workflow.confirmed_preview_artifact_id = "preview-1"
+    project.workflow.preview = PreviewState(
+        artifact_id="preview-1",
+        artifact_size=10,
+        artifact_sha256="f" * 64,
+        generation=1,
+        width=4,
+        height=3,
+        camera_revision=1,
+        pick_buffer_revision=1,
+    )
+    project.workflow.foot_point = FootPointState(
+        image=(1, 1),
+        world=(0, 0, 0),
+        preview_artifact_id="preview-1",
+        camera_revision=1,
+        pick_buffer_revision=1,
+    )
+    paths = WorkflowPaths(tmp_path)
+    exporter = _IntegrationExporter()
+    services = workflow.WorkflowServices(
+        media_ingest=MediaIngestService(paths, _IntegrationMediaBackend()),
+        segmenter=SegmentWorkflowService(paths, _IntegrationSegmenter(tmp_path)),
+        camera_solver=CameraSolveWorkflowService(
+            paths, _IntegrationSolver(), backend_identity="integration-solver-v1"
+        ),
+        trajectory_mapper=TrajectoryMapWorkflowService(paths),
+        renderer=_IntegrationRenderer(tmp_path),
+        compositor=CompositeWorkflowService(paths, exporter=exporter),
+        exporter=ExportWorkflowService(paths, exporter=exporter),
+    )
+    runner = workflow.build_mvp_workflow(services, project)
+
+    result = runner.run(StageName.EXPORT, CancellationToken())
+
+    assert result.status is StageStatus.SUCCEEDED
+    assert all(project.stages[name].status is StageStatus.SUCCEEDED for name in StageName)
+    ingest = project.stages[StageName.INGEST]
+    assert ingest.cache_key is not None
+    assert Path(ingest.artifacts[ArtifactRole.SOURCE_FRAMES]) == Path(
+        "frames", ingest.cache_key
+    )
+    assert Path(ingest.artifacts[ArtifactRole.PROXY_FRAMES]) == Path(
+        "proxies", ingest.cache_key
+    )
+    export_relative = project.stages[StageName.EXPORT].artifacts[
+        ArtifactRole.EXPORT_VIDEO
+    ]
+    assert Path(export_relative).parts[0] == "exports"
+    assert (tmp_path / export_relative).read_bytes() == b"verified integration mp4"
+    assert exporter.frame_counts == [2, 2]
