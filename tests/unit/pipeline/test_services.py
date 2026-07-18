@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
+import json
 from pathlib import Path
 
 import numpy as np
@@ -12,8 +13,11 @@ import pytest
 from gs_video.camera.classify import CameraKind
 from gs_video.camera.opencv_solver import CameraSolution
 from gs_video.camera.serialization import (
+    MappedTrajectory,
     read_camera_solution,
     read_mapped_trajectory,
+    write_camera_solution,
+    write_mapped_trajectory,
 )
 from gs_video.domain.contracts import MaskSequence, Prompt, SegmentationBackend
 from gs_video.domain.errors import CancelledError, RepairableError, UnsupportedMaterialError
@@ -40,6 +44,9 @@ from gs_video.pipeline.services import (
     SegmentWorkflowService,
     TrajectoryMapWorkflowService,
     WorkflowPaths,
+    _frame_inventory,
+    _preview_size,
+    _sha256,
 )
 
 
@@ -187,6 +194,40 @@ def test_ingest_cache_key_includes_backend_identity(tmp_path: Path) -> None:
     assert first.cache_key != second.cache_key
 
 
+def test_ingest_cache_hit_revalidates_proxy_dimensions(tmp_path: Path) -> None:
+    project = source_project(tmp_path)
+    backend = FakeMediaBackend()
+    service = MediaIngestService(WorkflowPaths(tmp_path), backend)
+    first = service.run(project, CancellationToken(), discard_progress)
+    proxy_dir = tmp_path / first.artifacts[ArtifactRole.PROXY_FRAMES]
+    for index in range(1, 4):
+        write_rgb(proxy_dir / f"{index:06d}.jpg", (16, 12), index)
+
+    with pytest.raises(RepairableError, match="代理帧尺寸"):
+        service.run(project, CancellationToken(), discard_progress)
+
+    assert backend.proxy_calls == 1
+
+
+@pytest.mark.parametrize(("width", "height"), [(1, 6), (8, 1), (7, 6), (8, 5)])
+def test_ingest_rejects_dimensions_that_cannot_be_exported_without_resizing(
+    tmp_path: Path, width: int, height: int
+) -> None:
+    project = source_project(tmp_path)
+    assert project.workflow.source_summary is not None
+    project.workflow.source_summary.width = width
+    project.workflow.source_summary.height = height
+    backend = FakeMediaBackend()
+
+    with pytest.raises(RepairableError, match="偶数|yuv420p|编码"):
+        MediaIngestService(WorkflowPaths(tmp_path), backend).run(
+            project, CancellationToken(), discard_progress
+        )
+
+    assert backend.source_calls == 0
+    assert backend.proxy_calls == 0
+
+
 class FakeSegmenter:
     backend = SegmentationBackend.EDGETAM
     worker_prefix = ("fake-python",)
@@ -269,6 +310,20 @@ def test_segment_rejects_stale_ingest_artifact_authority(tmp_path: Path) -> None
         )
 
 
+def test_segment_cache_hit_revalidates_mask_count_and_proxy_sizes(
+    tmp_path: Path,
+) -> None:
+    project = ingest_succeeded(source_project(tmp_path), tmp_path)
+    project.workflow.subject_prompt = SubjectPromptState(frame_index=0, x=1, y=1)
+    service = SegmentWorkflowService(WorkflowPaths(tmp_path), FakeSegmenter(tmp_path))
+    first = service.run(project, CancellationToken(), discard_progress)
+    mask_dir = tmp_path / first.artifacts[ArtifactRole.SUBJECT_MASKS]
+    write_mask(mask_dir / "000002.png", (8, 6))
+
+    with pytest.raises(RepairableError, match="尺寸|代理"):
+        service.run(project, CancellationToken(), discard_progress)
+
+
 class FakeSolver:
     identity = "fake-opencv-solver-1"
 
@@ -295,6 +350,11 @@ class FakeSolver:
         )
 
 
+def test_custom_solver_requires_explicit_backend_identity(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="identity"):
+        CameraSolveWorkflowService(WorkflowPaths(tmp_path), FakeSolver())
+
+
 def test_camera_solver_publishes_serialized_solution(tmp_path: Path) -> None:
     project = ingest_succeeded(source_project(tmp_path), tmp_path)
     service = CameraSolveWorkflowService(
@@ -310,12 +370,33 @@ def test_camera_solver_publishes_serialized_solution(tmp_path: Path) -> None:
     np.testing.assert_allclose(restored.camera_to_world[2][:3, 3], [2, 0, 0])
 
 
+def test_camera_cache_hit_revalidates_pose_count(tmp_path: Path) -> None:
+    project = ingest_succeeded(source_project(tmp_path), tmp_path)
+    service = CameraSolveWorkflowService(
+        WorkflowPaths(tmp_path), FakeSolver(), backend_identity="fake-opencv-1"
+    )
+    first = service.run(project, CancellationToken(), discard_progress)
+    path = tmp_path / first.artifacts[ArtifactRole.CAMERA_SOLUTION]
+    restored = read_camera_solution(path)
+    write_camera_solution(
+        path,
+        CameraSolution(
+            restored.intrinsics,
+            [restored.camera_to_world[0]],
+            restored.kind,
+            restored.confidence,
+            restored.diagnostics,
+        ),
+    )
+
+    with pytest.raises(RepairableError, match="帧数|轨迹"):
+        service.run(project, CancellationToken(), discard_progress)
+
+
 def camera_succeeded(project: Project, root: Path, cache_key: str = key("c")) -> Project:
     project = ingest_succeeded(project, root)
     camera_dir = root / "camera" / cache_key
     camera_dir.mkdir(parents=True, exist_ok=True)
-    from gs_video.camera.serialization import write_camera_solution
-
     write_camera_solution(camera_dir / "solution.json", FakeSolver().solve(
         [Path("1"), Path("2"), Path("3")], discard_progress, CancellationToken()
     ))
@@ -390,6 +471,22 @@ def test_trajectory_mapper_rejects_mismatched_pick_authority(tmp_path: Path) -> 
         )
 
 
+def test_trajectory_cache_hit_revalidates_fov_and_pose_count(tmp_path: Path) -> None:
+    project = camera_succeeded(source_project(tmp_path), tmp_path)
+    authorize_mapping(project)
+    service = TrajectoryMapWorkflowService(WorkflowPaths(tmp_path))
+    first = service.run(project, CancellationToken(), discard_progress)
+    path = tmp_path / first.artifacts[ArtifactRole.MAPPED_TRAJECTORY]
+    cached = read_mapped_trajectory(path)
+    write_mapped_trajectory(
+        path,
+        MappedTrajectory(77, cached.camera_to_world),
+    )
+
+    with pytest.raises(RepairableError, match="轨迹|FOV|fov"):
+        service.run(project, CancellationToken(), discard_progress)
+
+
 class RecordingExporter:
     def __init__(self) -> None:
         self.calls: list[tuple[Path, Path, Fraction, int, Path, tuple[int, int]]] = []
@@ -401,7 +498,11 @@ class RecordingExporter:
         fps: Fraction,
         frame_count: int,
         output: Path,
+        *,
+        cancellation_check: Callable[[], None] | None = None,
     ) -> ExportResult:
+        if cancellation_check is not None:
+            cancellation_check()
         with Image.open(frames_dir / "000001.png") as first:
             size = first.size
         self.calls.append((frames_dir, source_video, fps, frame_count, output, size))
@@ -413,6 +514,40 @@ class RecordingExporter:
             duration=Fraction(frame_count, 1) / fps,
             has_audio=True,
         )
+
+
+class RecordingProber:
+    def __init__(self, frame_count: int, *, has_audio: bool = True) -> None:
+        self.frame_count = frame_count
+        self.has_audio = has_audio
+        self.calls: list[Path] = []
+
+    def __call__(
+        self,
+        path: Path,
+        *,
+        cancellation_check: Callable[[], None] | None = None,
+    ) -> ExportResult:
+        if cancellation_check is not None:
+            cancellation_check()
+        self.calls.append(path)
+        fps = Fraction(24, 1)
+        return ExportResult(
+            output=path,
+            fps=fps,
+            frame_count=self.frame_count,
+            duration=Fraction(self.frame_count, 1) / fps,
+            has_audio=self.has_audio,
+        )
+
+
+def test_custom_exporters_require_explicit_identity(tmp_path: Path) -> None:
+    exporter = RecordingExporter()
+
+    with pytest.raises(ValueError, match="identity"):
+        CompositeWorkflowService(WorkflowPaths(tmp_path), exporter=exporter)
+    with pytest.raises(ValueError, match="identity"):
+        ExportWorkflowService(WorkflowPaths(tmp_path), exporter=exporter)
 
 
 def completed_render_project(root: Path) -> Project:
@@ -442,10 +577,13 @@ def test_compositor_uses_source_dimensions_and_registers_preview(
 ) -> None:
     project = completed_render_project(tmp_path)
     exporter = RecordingExporter()
+    prober = RecordingProber(2)
     service = CompositeWorkflowService(
         WorkflowPaths(tmp_path),
         preview_frame_limit=2,
         exporter=exporter,
+        exporter_identity="recording-exporter-v1",
+        prober=prober,
     )
 
     result = service.run(project, CancellationToken(), discard_progress)
@@ -464,6 +602,91 @@ def test_compositor_uses_source_dimensions_and_registers_preview(
     assert len(exporter.calls) == 1
     assert exporter.calls[0][3] == 2
     assert exporter.calls[0][5] == (8, 6)
+    assert len(prober.calls) == 1
+
+
+def test_composite_preview_cache_hit_rejects_content_tampering(tmp_path: Path) -> None:
+    project = completed_render_project(tmp_path)
+    exporter = RecordingExporter()
+    prober = RecordingProber(3)
+    service = CompositeWorkflowService(
+        WorkflowPaths(tmp_path),
+        exporter=exporter,
+        exporter_identity="recording-exporter-v1",
+        prober=prober,
+    )
+    first = service.run(project, CancellationToken(), discard_progress)
+    preview = tmp_path / first.artifacts[ArtifactRole.COMPOSITE_PREVIEW]
+    preview.write_bytes(b"tampered preview")
+
+    with pytest.raises(RepairableError, match="hash|摘要|清单|manifest"):
+        service.run(project, CancellationToken(), discard_progress)
+
+    assert len(exporter.calls) == 1
+
+
+def test_composite_preview_cache_hit_rejects_manifest_type_tampering(
+    tmp_path: Path,
+) -> None:
+    project = completed_render_project(tmp_path)
+    service = CompositeWorkflowService(
+        WorkflowPaths(tmp_path),
+        exporter=RecordingExporter(),
+        exporter_identity="recording-exporter-v1",
+        prober=RecordingProber(3),
+    )
+    first = service.run(project, CancellationToken(), discard_progress)
+    preview = tmp_path / first.artifacts[ArtifactRole.COMPOSITE_PREVIEW]
+    manifest = preview.parent / "manifest.json"
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    document["fps"] = 24
+    manifest.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(RepairableError, match="manifest|字段|类型"):
+        service.run(project, CancellationToken(), discard_progress)
+
+
+def test_preview_exporter_metadata_is_validated_before_publication(
+    tmp_path: Path,
+) -> None:
+    project = completed_render_project(tmp_path)
+
+    class WrongMetadataExporter(RecordingExporter):
+        def __call__(
+            self,
+            frames_dir: Path,
+            source_video: Path,
+            fps: Fraction,
+            frame_count: int,
+            output: Path,
+            *,
+            cancellation_check: Callable[[], None] | None = None,
+        ) -> ExportResult:
+            result = super().__call__(
+                frames_dir,
+                source_video,
+                fps,
+                frame_count,
+                output,
+                cancellation_check=cancellation_check,
+            )
+            return ExportResult(
+                output=result.output,
+                fps=result.fps,
+                frame_count=result.frame_count + 1,
+                duration=result.duration,
+                has_audio=result.has_audio,
+            )
+
+    with pytest.raises(RepairableError, match="metadata|元数据|帧数"):
+        CompositeWorkflowService(
+            WorkflowPaths(tmp_path),
+            exporter=WrongMetadataExporter(),
+            exporter_identity="wrong-metadata-exporter-v1",
+            prober=RecordingProber(3),
+        ).run(project, CancellationToken(), discard_progress)
+
+    assert not any((tmp_path / "previews").glob("?" * 64))
 
 
 def test_compositor_rejects_nonconsecutive_render_inventory(tmp_path: Path) -> None:
@@ -475,7 +698,10 @@ def test_compositor_rejects_nonconsecutive_render_inventory(tmp_path: Path) -> N
 
     with pytest.raises(RepairableError, match="连续|inventory|帧"):
         CompositeWorkflowService(
-            WorkflowPaths(tmp_path), exporter=RecordingExporter()
+            WorkflowPaths(tmp_path),
+            exporter=RecordingExporter(),
+            exporter_identity="recording-exporter-v1",
+            prober=RecordingProber(3),
         ).run(project, CancellationToken(), discard_progress)
 
 
@@ -488,7 +714,10 @@ def test_compositor_rejects_masks_that_are_not_proxy_resolution(tmp_path: Path) 
 
     with pytest.raises(RepairableError, match="尺寸|代理"):
         CompositeWorkflowService(
-            WorkflowPaths(tmp_path), exporter=RecordingExporter()
+            WorkflowPaths(tmp_path),
+            exporter=RecordingExporter(),
+            exporter_identity="recording-exporter-v1",
+            prober=RecordingProber(3),
         ).run(project, CancellationToken(), discard_progress)
 
 
@@ -496,7 +725,10 @@ def test_export_registers_full_composite_video(tmp_path: Path) -> None:
     project = completed_render_project(tmp_path)
     preview_exporter = RecordingExporter()
     composite = CompositeWorkflowService(
-        WorkflowPaths(tmp_path), exporter=preview_exporter
+        WorkflowPaths(tmp_path),
+        exporter=preview_exporter,
+        exporter_identity="recording-preview-exporter-v1",
+        prober=RecordingProber(3),
     ).run(project, CancellationToken(), discard_progress)
     project.stages[StageName.COMPOSITE] = StageState(
         status=StageStatus.SUCCEEDED,
@@ -504,9 +736,13 @@ def test_export_registers_full_composite_video(tmp_path: Path) -> None:
         artifacts={role: str(path) for role, path in composite.artifacts.items()},
     )
     final_exporter = RecordingExporter()
+    final_prober = RecordingProber(3)
 
     result = ExportWorkflowService(
-        WorkflowPaths(tmp_path), exporter=final_exporter
+        WorkflowPaths(tmp_path),
+        exporter=final_exporter,
+        exporter_identity="recording-final-exporter-v1",
+        prober=final_prober,
     ).run(project, CancellationToken(), discard_progress)
 
     assert result.artifacts[ArtifactRole.EXPORT_VIDEO] == Path(
@@ -515,6 +751,37 @@ def test_export_registers_full_composite_video(tmp_path: Path) -> None:
     assert len(final_exporter.calls) == 1
     assert final_exporter.calls[0][3] == 3
     assert final_exporter.calls[0][5] == (8, 6)
+    assert len(final_prober.calls) == 1
+
+
+def test_final_export_cache_hit_rejects_content_tampering(tmp_path: Path) -> None:
+    project = completed_render_project(tmp_path)
+    composite = CompositeWorkflowService(
+        WorkflowPaths(tmp_path),
+        exporter=RecordingExporter(),
+        exporter_identity="recording-preview-exporter-v1",
+        prober=RecordingProber(3),
+    ).run(project, CancellationToken(), discard_progress)
+    project.stages[StageName.COMPOSITE] = StageState(
+        status=StageStatus.SUCCEEDED,
+        cache_key=composite.cache_key,
+        artifacts={role: str(path) for role, path in composite.artifacts.items()},
+    )
+    exporter = RecordingExporter()
+    service = ExportWorkflowService(
+        WorkflowPaths(tmp_path),
+        exporter=exporter,
+        exporter_identity="recording-final-exporter-v1",
+        prober=RecordingProber(3),
+    )
+    first = service.run(project, CancellationToken(), discard_progress)
+    output = tmp_path / first.artifacts[ArtifactRole.EXPORT_VIDEO]
+    output.write_bytes(b"tampered final")
+
+    with pytest.raises(RepairableError, match="hash|摘要|清单|manifest"):
+        service.run(project, CancellationToken(), discard_progress)
+
+    assert len(exporter.calls) == 1
 
 
 def test_services_check_cancellation_before_publication(tmp_path: Path) -> None:
@@ -580,3 +847,87 @@ def test_source_frame_extraction_uses_unscaled_video_command(
         "0",
     ]
     assert "-vf" not in captured
+
+
+class CheckpointCancellationToken(CancellationToken):
+    def __init__(self, cancel_at: int) -> None:
+        super().__init__()
+        self.cancel_at = cancel_at
+        self.checks = 0
+
+    def raise_if_cancelled(self) -> None:
+        self.checks += 1
+        if self.checks == self.cancel_at:
+            self.cancel()
+        super().raise_if_cancelled()
+
+
+def test_frame_inventory_cancels_before_opening_the_second_frame(
+    tmp_path: Path,
+) -> None:
+    for index in range(1, 4):
+        write_rgb(tmp_path / f"{index:06d}.png", (8, 6), index)
+    token = CheckpointCancellationToken(cancel_at=6)
+
+    with pytest.raises(CancelledError):
+        _frame_inventory(
+            tmp_path,
+            suffix="png",
+            image_format="PNG",
+            mode="RGB",
+            label="test",
+            token=token,
+        )
+
+    assert token.checks == 6
+
+
+def test_sha256_checks_cancellation_between_one_megabyte_blocks(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    payload = tmp_path / "large.bin"
+    payload.write_bytes(b"x" * (3 * 1024 * 1024))
+    token = CheckpointCancellationToken(cancel_at=3)
+
+    with pytest.raises(CancelledError):
+        _sha256(payload, "large", token)
+
+    assert token.checks == 3
+
+
+def test_frame_inventory_rejects_path_replacement_between_decode_and_hash(
+    tmp_path: Path,
+) -> None:
+    frame = tmp_path / "000001.png"
+    parked = tmp_path.parent / f"{tmp_path.name}-parked.png"
+    write_rgb(frame, (8, 6), 10)
+
+    class ReplacingToken(CancellationToken):
+        def __init__(self) -> None:
+            super().__init__()
+            self.checks = 0
+
+        def raise_if_cancelled(self) -> None:
+            self.checks += 1
+            if self.checks == 3:
+                frame.replace(parked)
+                write_rgb(frame, (8, 6), 200)
+            super().raise_if_cancelled()
+
+    with pytest.raises(RepairableError, match="身份|替换|变化|不可读"):
+        _frame_inventory(
+            tmp_path,
+            suffix="png",
+            image_format="PNG",
+            mode="RGB",
+            label="test",
+            token=ReplacingToken(),
+        )
+
+
+def test_preview_size_never_enlarges_and_rejects_no_even_solution() -> None:
+    assert _preview_size((1920, 1080), 540) == (960, 540)
+    assert _preview_size((8, 6), 540) == (8, 6)
+    with pytest.raises(RepairableError, match="偶数|放大"):
+        _preview_size((1, 6), 540)
+    with pytest.raises(RepairableError, match="偶数|放大"):
+        _preview_size((2, 1000), 540)

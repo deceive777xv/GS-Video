@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import subprocess
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from PIL import Image, UnidentifiedImageError
 from gs_video.domain.errors import GsVideoError, RepairableError
 from gs_video.media.toolchain import MediaTools, resolve_media_tools
 from gs_video.segmentation.paths import has_reparse_component
+from gs_video.segmentation.tree_guard import create_process_tree_guard
 
 
 _PROBE_TIMEOUT_SECONDS = 30
@@ -25,6 +27,7 @@ _EXPORT_TIMEOUT_SECONDS = 300
 _OWNERSHIP_ATTEMPTS = 8
 
 FileIdentity = tuple[int, int]
+CancellationCheck = Callable[[], None]
 
 
 @dataclass(frozen=True)
@@ -210,7 +213,13 @@ def _require_ordinary(path: Path, *, kind: str, directory: bool = False) -> Path
     return absolute
 
 
-def _validate_inventory(frames_dir: Path, frame_count: int) -> tuple[Path, tuple[int, int]]:
+def _validate_inventory(
+    frames_dir: Path,
+    frame_count: int,
+    cancellation_check: CancellationCheck | None = None,
+) -> tuple[Path, tuple[int, int]]:
+    if cancellation_check is not None:
+        cancellation_check()
     directory = _require_ordinary(frames_dir, kind="帧目录", directory=True)
     expected = {f"{index:06d}.png" for index in range(1, frame_count + 1)}
     try:
@@ -222,6 +231,8 @@ def _validate_inventory(frames_dir: Path, frame_count: int) -> tuple[Path, tuple
 
     expected_size: tuple[int, int] | None = None
     for index in range(1, frame_count + 1):
+        if cancellation_check is not None:
+            cancellation_check()
         frame = directory / f"{index:06d}.png"
         if has_reparse_component(frame):
             raise RepairableError("帧文件不能是链接或重解析点")
@@ -378,11 +389,146 @@ def _append_log(log_sink: _LogSink, label: str, stderr: object) -> None:
     log_sink.write(label, stderr)
 
 
-def _run_command(
-    command: list[str], *, timeout: int, label: str, log_sink: _LogSink
+def _stop_process_tree(process: subprocess.Popen[str], guard: Any) -> None:
+    if process.returncode is not None:
+        return
+    stopped = False
+    try:
+        stopped = bool(guard.terminate(force=False))
+    except BaseException:
+        stopped = False
+    if not stopped:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.communicate(timeout=1.0)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    forced = False
+    try:
+        forced = bool(guard.terminate(force=True))
+    except BaseException:
+        forced = False
+    if not forced:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.communicate(timeout=1.0)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.communicate(timeout=1.0)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if process.returncode is None:
+        raise GsVideoError("无法终止媒体工具进程树")
+
+
+def _run_cancellable_command(
+    command: list[str],
+    *,
+    timeout: int,
+    cancellation_check: CancellationCheck,
 ) -> subprocess.CompletedProcess[str]:
+    process: subprocess.Popen[str] | None = None
+    guard: Any = None
+    primary_error: BaseException | None = None
     try:
         if os.name == "nt":
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=False,
+                creationflags=(
+                    subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+                ),
+            )
+        else:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=False,
+                start_new_session=True,
+            )
+        try:
+            guard = create_process_tree_guard(process)
+        except BaseException:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            process.communicate()
+            raise
+        deadline = time.monotonic() + timeout
+        while True:
+            cancellation_check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.05, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+            completed = subprocess.CompletedProcess(
+                command, process.returncode, stdout, stderr
+            )
+            if completed.returncode:
+                raise subprocess.CalledProcessError(
+                    completed.returncode,
+                    command,
+                    output=completed.stdout,
+                    stderr=completed.stderr,
+                )
+            return completed
+    except BaseException as exc:
+        primary_error = exc
+        if process is not None and guard is not None:
+            try:
+                _stop_process_tree(process, guard)
+            except BaseException as cleanup_error:
+                exc.add_note(f"media process-tree cleanup failed: {cleanup_error}")
+        raise
+    finally:
+        if guard is not None:
+            try:
+                guard.close()
+            except BaseException as close_error:
+                if primary_error is not None:
+                    primary_error.add_note(
+                        f"media process-tree guard close failed: {close_error}"
+                    )
+                else:
+                    raise GsVideoError("无法关闭媒体工具进程树守卫") from close_error
+
+
+def _run_command(
+    command: list[str],
+    *,
+    timeout: int,
+    label: str,
+    log_sink: _LogSink | None,
+    cancellation_check: CancellationCheck | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        if cancellation_check is not None:
+            completed = _run_cancellable_command(
+                command,
+                timeout=timeout,
+                cancellation_check=cancellation_check,
+            )
+        elif os.name == "nt":
             completed = subprocess.run(
                 command,
                 check=True,
@@ -425,7 +571,8 @@ def _run_command(
             label=label,
             stderr=str(exc),
         )
-    _append_log(log_sink, label, completed.stderr)
+    if log_sink is not None:
+        _append_log(log_sink, label, completed.stderr)
     return completed
 
 
@@ -433,14 +580,15 @@ def _raise_command_error(
     error: GsVideoError,
     cause: BaseException,
     *,
-    log_sink: _LogSink,
+    log_sink: _LogSink | None,
     label: str,
     stderr: object,
 ) -> NoReturn:
-    try:
-        _append_log(log_sink, label, stderr)
-    except GsVideoError as log_error:
-        error.add_note(f"diagnostic log write also failed: {log_error}")
+    if log_sink is not None:
+        try:
+            _append_log(log_sink, label, stderr)
+        except GsVideoError as log_error:
+            error.add_note(f"diagnostic log write also failed: {log_error}")
     raise error from cause
 
 
@@ -463,7 +611,12 @@ def _streams(payload: Mapping[str, Any], *, label: str) -> list[Mapping[str, Any
     return raw_streams
 
 
-def _probe_source_audio(source: Path, log_sink: _LogSink, tools: MediaTools) -> bool:
+def _probe_source_audio(
+    source: Path,
+    log_sink: _LogSink,
+    tools: MediaTools,
+    cancellation_check: CancellationCheck | None = None,
+) -> bool:
     command = [
         str(tools.ffprobe),
         "-v",
@@ -475,7 +628,11 @@ def _probe_source_audio(source: Path, log_sink: _LogSink, tools: MediaTools) -> 
         str(source),
     ]
     completed = _run_command(
-        command, timeout=_PROBE_TIMEOUT_SECONDS, label="ffprobe(source)", log_sink=log_sink
+        command,
+        timeout=_PROBE_TIMEOUT_SECONDS,
+        label="ffprobe(source)",
+        log_sink=log_sink,
+        cancellation_check=cancellation_check,
     )
     streams = _streams(_load_probe_json(completed, label="源视频"), label="源视频")
     if not any(stream.get("codec_type") == "video" for stream in streams):
@@ -543,7 +700,12 @@ def _parse_output_probe(payload: Mapping[str, Any]) -> _OutputProbe:
     )
 
 
-def _probe_output(path: Path, log_sink: _LogSink, tools: MediaTools) -> _OutputProbe:
+def _probe_output(
+    path: Path,
+    log_sink: _LogSink,
+    tools: MediaTools,
+    cancellation_check: CancellationCheck | None = None,
+) -> _OutputProbe:
     command = [
         str(tools.ffprobe),
         "-v",
@@ -556,9 +718,72 @@ def _probe_output(path: Path, log_sink: _LogSink, tools: MediaTools) -> _OutputP
         str(path),
     ]
     completed = _run_command(
-        command, timeout=_PROBE_TIMEOUT_SECONDS, label="ffprobe(output)", log_sink=log_sink
+        command,
+        timeout=_PROBE_TIMEOUT_SECONDS,
+        label="ffprobe(output)",
+        log_sink=log_sink,
+        cancellation_check=cancellation_check,
     )
     return _parse_output_probe(_load_probe_json(completed, label="导出文件"))
+
+
+def probe_mp4(
+    path: Path,
+    *,
+    cancellation_check: CancellationCheck | None = None,
+) -> ExportResult:
+    """Read-only ffprobe verification for a published single-link MP4."""
+
+    if cancellation_check is not None:
+        cancellation_check()
+    ordinary = _require_ordinary(Path(path), kind="MP4")
+    before = ordinary.stat()
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size <= 0:
+        raise RepairableError("MP4 必须是非空单链接普通文件")
+    expected = (
+        int(before.st_dev),
+        int(before.st_ino),
+        int(before.st_size),
+        int(before.st_mtime_ns),
+    )
+    tools = resolve_media_tools()
+    command = [
+        str(tools.ffprobe),
+        "-v",
+        "error",
+        "-count_frames",
+        "-show_entries",
+        "stream=codec_type,avg_frame_rate,r_frame_rate,nb_read_frames,nb_frames,duration:format=duration",
+        "-of",
+        "json",
+        str(ordinary),
+    ]
+    completed = _run_command(
+        command,
+        timeout=_PROBE_TIMEOUT_SECONDS,
+        label="ffprobe(published)",
+        log_sink=None,
+        cancellation_check=cancellation_check,
+    )
+    parsed = _parse_output_probe(_load_probe_json(completed, label="发布 MP4"))
+    after = ordinary.stat()
+    actual = (
+        int(after.st_dev),
+        int(after.st_ino),
+        int(after.st_size),
+        int(after.st_mtime_ns),
+    )
+    if has_reparse_component(ordinary) or after.st_nlink != 1 or actual != expected:
+        raise RepairableError("MP4 在 ffprobe 期间身份发生变化")
+    if cancellation_check is not None:
+        cancellation_check()
+    return ExportResult(
+        output=ordinary,
+        fps=parsed.fps,
+        frame_count=parsed.frame_count,
+        duration=parsed.duration,
+        has_audio=parsed.has_audio,
+    )
 
 
 def _duration_argument(duration: Fraction) -> str:
@@ -836,10 +1061,14 @@ def export_mp4(
     fps: Fraction,
     frame_count: int,
     output: Path,
+    *,
+    cancellation_check: CancellationCheck | None = None,
 ) -> ExportResult:
     """Encode and validate a frame-exact MP4 before atomically publishing it."""
     fps, frame_count = _validate_numbers(fps, frame_count)
-    frames, size = _validate_inventory(Path(frames_dir), frame_count)
+    frames, size = _validate_inventory(
+        Path(frames_dir), frame_count, cancellation_check
+    )
     if size[0] % 2 or size[1] % 2:
         raise RepairableError("libx264 yuv420p 要求 PNG 帧的宽度和高度都是偶数")
     source = _require_ordinary(Path(source_video), kind="源视频")
@@ -854,10 +1083,12 @@ def export_mp4(
     try:
         staging = _create_owned_staging(destination)
         staging.verify_directory()
-        has_audio = _probe_source_audio(source, log_sink, tools)
+        has_audio = _probe_source_audio(
+            source, log_sink, tools, cancellation_check
+        )
         staging.verify_directory()
         # Recheck the inventory after probing and immediately before FFmpeg opens the inputs.
-        _validate_inventory(frames, frame_count)
+        _validate_inventory(frames, frame_count, cancellation_check)
         staging.verify_directory()
         try:
             _run_command(
@@ -867,6 +1098,7 @@ def export_mp4(
                 timeout=_EXPORT_TIMEOUT_SECONDS,
                 label="ffmpeg",
                 log_sink=log_sink,
+                cancellation_check=cancellation_check,
             )
         except BaseException as exc:
             if staging.file.exists() or staging.file.is_symlink():
@@ -877,7 +1109,7 @@ def export_mp4(
             raise
         staging.record_file(protected | {log_sink.file_identity})
         staging.verify_file()
-        probe = _probe_output(staging.file, log_sink, tools)
+        probe = _probe_output(staging.file, log_sink, tools, cancellation_check)
         staging.verify_file()
         if probe.frame_count != frame_count:
             raise GsVideoError(

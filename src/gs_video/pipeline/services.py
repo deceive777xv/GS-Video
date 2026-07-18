@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import stat
@@ -35,7 +36,7 @@ from gs_video.domain.models import (
     StageStatus,
     VideoSummary,
 )
-from gs_video.media.export import ExportResult, export_mp4
+from gs_video.media.export import ExportResult, export_mp4, probe_mp4
 from gs_video.media.ingest import extract_proxy_frames, extract_source_frames
 from gs_video.pipeline.artifacts import ArtifactPublisher, validate_cache_key
 from gs_video.pipeline.cancellation import CancellationToken
@@ -56,7 +57,28 @@ _FRAME_NAME = re.compile(r"^(\d{6})\.(png|jpg)$")
 
 ProjectMutation = Callable[[Project], None]
 ProjectUpdater = Callable[[ProjectMutation], Project]
-ExportCallable = Callable[[Path, Path, Fraction, int, Path], ExportResult]
+
+
+class ExportCallable(Protocol):
+    def __call__(
+        self,
+        frames_dir: Path,
+        source_video: Path,
+        fps: Fraction,
+        frame_count: int,
+        output: Path,
+        *,
+        cancellation_check: Callable[[], None] | None = None,
+    ) -> ExportResult: ...
+
+
+class Mp4Prober(Protocol):
+    def __call__(
+        self,
+        path: Path,
+        *,
+        cancellation_check: Callable[[], None] | None = None,
+    ) -> ExportResult: ...
 
 
 class MediaIngestBackend(Protocol):
@@ -151,53 +173,78 @@ def _ordinary_file(path: Path, label: str) -> os.stat_result:
     return metadata
 
 
-def _sha256(path: Path, label: str) -> str:
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+        int(metadata.st_nlink),
+    )
+
+
+def _directory_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_ctime_ns),
+        int(metadata.st_mode),
+    )
+
+
+def _sha256(path: Path, label: str, token: CancellationToken) -> str:
+    token.raise_if_cancelled()
     before = _ordinary_file(path, label)
+    expected = _file_identity(before)
     digest = hashlib.sha256()
     try:
         with path.open("rb") as stream:
             opened = os.fstat(stream.fileno())
-            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            if _file_identity(opened) != expected:
                 raise RepairableError(f"{label}读取前身份发生变化")
             for block in iter(lambda: stream.read(1024 * 1024), b""):
+                token.raise_if_cancelled()
                 digest.update(block)
             after_handle = os.fstat(stream.fileno())
     except OSError as exc:
         raise RepairableError(f"{label}不可读") from exc
     after_path = _ordinary_file(path, label)
-    identity_before = (
-        before.st_dev,
-        before.st_ino,
-        before.st_size,
-        before.st_mtime_ns,
-    )
-    if identity_before != (
-        after_handle.st_dev,
-        after_handle.st_ino,
-        after_handle.st_size,
-        after_handle.st_mtime_ns,
-    ) or identity_before != (
-        after_path.st_dev,
-        after_path.st_ino,
-        after_path.st_size,
-        after_path.st_mtime_ns,
-    ):
+    if expected != _file_identity(after_handle) or expected != _file_identity(after_path):
         raise RepairableError(f"{label}读取期间身份发生变化")
     return digest.hexdigest()
 
 
-def _source_material(paths: WorkflowPaths, project: Project) -> tuple[Path, VideoSummary]:
+def _source_material(
+    paths: WorkflowPaths, project: Project, token: CancellationToken
+) -> tuple[Path, VideoSummary]:
     summary = project.workflow.source_summary
     if summary is None or project.source_video is None:
         raise RepairableError("尚未导入源视频")
+    _require_exportable_dimensions(summary)
     relative = Path(project.source_video)
     if relative.is_absolute() or ".." in relative.parts or relative.parts[:1] != ("source",):
         raise RepairableError("源视频路径不属于项目 source 目录")
     source = paths.root / relative
     metadata = _ordinary_file(source, "源视频")
-    if metadata.st_size != summary.size or _sha256(source, "源视频") != summary.sha256:
+    if (
+        metadata.st_size != summary.size
+        or _sha256(source, "源视频", token) != summary.sha256
+    ):
         raise RepairableError("源视频与已登记摘要不一致")
     return source, summary
+
+
+def _require_exportable_dimensions(summary: VideoSummary) -> None:
+    if (
+        summary.width < 2
+        or summary.height < 2
+        or summary.width % 2
+        or summary.height % 2
+    ):
+        raise RepairableError(
+            "源视频宽高必须是不小于 2 的偶数，才能无缩放编码为 yuv420p"
+        )
 
 
 def _stage_state(project: Project, name: StageName) -> StageState:
@@ -252,9 +299,12 @@ def _frame_inventory(
     expected_count: int | None = None,
     expected_size: tuple[int, int] | None = None,
     expected_sizes: tuple[tuple[int, int], ...] | None = None,
+    token: CancellationToken,
 ) -> _FrameInventory:
+    token.raise_if_cancelled()
     try:
         metadata = directory.lstat()
+        directory_expected = _directory_identity(metadata)
         entries = tuple(directory.iterdir())
     except OSError as exc:
         raise RepairableError(f"{label}帧目录不存在或不可读") from exc
@@ -278,17 +328,39 @@ def _frame_inventory(
     fingerprint = hashlib.sha256()
     try:
         for index, path in enumerate(ordered):
+            token.raise_if_cancelled()
             file_metadata = _ordinary_file(path, f"{label}帧")
+            expected_identity = _file_identity(file_metadata)
             match = _FRAME_NAME.fullmatch(path.name)
             if match is None or match.group(2) != suffix:
                 raise RepairableError(f"{label}帧文件名无效")
-            with Image.open(path) as image:
-                image.load()
-                if image.format != image_format or image.mode != mode:
-                    raise RepairableError(
-                        f"{label}帧必须是 {mode} {image_format} 图像"
-                    )
-                size = image.size
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if _file_identity(opened) != expected_identity:
+                    raise RepairableError(f"{label}帧打开前身份发生变化")
+                image = Image.open(stream)
+                try:
+                    image.load()
+                    if image.format != image_format or image.mode != mode:
+                        raise RepairableError(
+                            f"{label}帧必须是 {mode} {image_format} 图像"
+                        )
+                    size = image.size
+                    token.raise_if_cancelled()
+                    stream.seek(0)
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        token.raise_if_cancelled()
+                        digest.update(block)
+                    after_handle = os.fstat(stream.fileno())
+                finally:
+                    image.close()
+            after_path = _ordinary_file(path, f"{label}帧")
+            if (
+                _file_identity(after_handle) != expected_identity
+                or _file_identity(after_path) != expected_identity
+            ):
+                raise RepairableError(f"{label}帧读取期间身份被替换或发生变化")
             if expected_size is not None and size != expected_size:
                 raise RepairableError(f"{label}帧尺寸与源视频不一致")
             if expected_sizes is not None and size != expected_sizes[index]:
@@ -296,25 +368,267 @@ def _frame_inventory(
             sizes.append(size)
             fingerprint.update(path.name.encode("ascii"))
             fingerprint.update(str(file_metadata.st_size).encode("ascii"))
-            fingerprint.update(_sha256(path, f"{label}帧").encode("ascii"))
+            fingerprint.update(digest.hexdigest().encode("ascii"))
+            token.raise_if_cancelled()
     except (OSError, UnidentifiedImageError) as exc:
         raise RepairableError(f"{label}帧不可读") from exc
+    try:
+        directory_after = directory.lstat()
+    except OSError as exc:
+        raise RepairableError(f"{label}帧目录在读取期间消失") from exc
+    if (
+        has_reparse_component(directory)
+        or _directory_identity(directory_after) != directory_expected
+    ):
+        raise RepairableError(f"{label}帧目录身份在读取期间发生变化")
     return _FrameInventory(ordered, tuple(sizes), fingerprint.hexdigest())
 
 
-def _model_identity(path: Path, label: str) -> dict[str, object]:
+def _model_identity(
+    path: Path, label: str, token: CancellationToken
+) -> dict[str, object]:
     metadata = _ordinary_file(path, label)
     return {
         "filename": path.name,
         "size": metadata.st_size,
-        "sha256": _sha256(path, label),
+        "sha256": _sha256(path, label, token),
     }
 
 
-def _callable_identity(value: object) -> str:
-    module = getattr(value, "__module__", type(value).__module__)
-    name = getattr(value, "__qualname__", type(value).__qualname__)
-    return f"{module}.{name}"
+def _segmentation_identity(
+    segmenter: ForegroundSegmenterLike, token: CancellationToken
+) -> dict[str, object]:
+    backend_value = getattr(segmenter.backend, "value", segmenter.backend)
+    return {
+        "backend": str(backend_value),
+        "worker_prefix": list(segmenter.worker_prefix),
+        "config": _model_identity(segmenter.model_config, "分割配置", token),
+        "checkpoint": _model_identity(segmenter.checkpoint, "分割模型", token),
+    }
+
+
+def _validate_proxy_dimensions(
+    inventory: _FrameInventory,
+    summary: VideoSummary,
+    maximum_height: int,
+) -> None:
+    if len(set(inventory.sizes)) != 1 or any(
+        width > summary.width or height > min(summary.height, maximum_height)
+        for width, height in inventory.sizes
+    ):
+        raise RepairableError("代理帧尺寸不一致或超过源视频/代理高度上限")
+
+
+_MP4_MANIFEST_NAME = "manifest.json"
+_MP4_MANIFEST_KEYS = frozenset(
+    {
+        "version",
+        "cache_key",
+        "filename",
+        "size",
+        "sha256",
+        "fps",
+        "frame_count",
+        "duration",
+        "has_audio",
+    }
+)
+
+
+def _validate_export_result(
+    result: ExportResult,
+    output: Path,
+    *,
+    fps: Fraction,
+    frame_count: int,
+    has_audio: bool,
+    label: str,
+    allow_duration_tolerance: bool,
+) -> None:
+    expected_duration = Fraction(frame_count, 1) / fps
+    if Path(result.output).absolute() != output.absolute():
+        raise RepairableError(f"{label} metadata 输出路径不一致")
+    if result.fps != fps:
+        raise RepairableError(f"{label} metadata 帧率不一致")
+    if result.frame_count != frame_count:
+        raise RepairableError(f"{label} metadata 帧数不一致")
+    if result.has_audio is not has_audio:
+        raise RepairableError(f"{label} metadata 音轨 authority 不一致")
+    duration_error = abs(result.duration - expected_duration)
+    tolerance = Fraction(1, 1) / fps if allow_duration_tolerance else Fraction(0)
+    if duration_error > tolerance:
+        raise RepairableError(f"{label} metadata 时长不一致")
+
+
+def _write_mp4_manifest(
+    directory: Path,
+    *,
+    cache_key_value: str,
+    filename: str,
+    result: ExportResult,
+    token: CancellationToken,
+) -> None:
+    output = directory / filename
+    metadata = _ordinary_file(output, "MP4")
+    if metadata.st_size <= 0:
+        raise RepairableError("MP4 不能为空")
+    payload = {
+        "version": 1,
+        "cache_key": cache_key_value,
+        "filename": filename,
+        "size": int(metadata.st_size),
+        "sha256": _sha256(output, "MP4", token),
+        "fps": str(result.fps),
+        "frame_count": result.frame_count,
+        "duration": str(result.duration),
+        "has_audio": result.has_audio,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    (directory / _MP4_MANIFEST_NAME).write_text(encoded, encoding="utf-8")
+    token.raise_if_cancelled()
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise RepairableError(f"MP4 manifest 包含重复字段: {key}")
+        result[key] = value
+    return result
+
+
+def _forbid_json_constant(value: str) -> None:
+    raise RepairableError(f"MP4 manifest 包含非有限数值: {value}")
+
+
+def _read_mp4_manifest(path: Path, token: CancellationToken) -> dict[str, object]:
+    metadata = _ordinary_file(path, "MP4 manifest")
+    if metadata.st_size <= 0 or metadata.st_size > 64 * 1024:
+        raise RepairableError("MP4 manifest 大小无效")
+    expected = _file_identity(metadata)
+    token.raise_if_cancelled()
+    try:
+        with path.open("rb") as stream:
+            if _file_identity(os.fstat(stream.fileno())) != expected:
+                raise RepairableError("MP4 manifest 打开前身份发生变化")
+            payload = stream.read(64 * 1024 + 1)
+            after_handle = os.fstat(stream.fileno())
+    except OSError as exc:
+        raise RepairableError("MP4 manifest 不可读") from exc
+    after_path = _ordinary_file(path, "MP4 manifest")
+    if (
+        len(payload) != metadata.st_size
+        or _file_identity(after_handle) != expected
+        or _file_identity(after_path) != expected
+    ):
+        raise RepairableError("MP4 manifest 读取期间身份发生变化")
+    try:
+        document = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_forbid_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RepairableError("MP4 manifest JSON 无效") from exc
+    if not isinstance(document, dict) or set(document) != _MP4_MANIFEST_KEYS:
+        raise RepairableError("MP4 manifest 字段不完整或包含未知字段")
+    return document
+
+
+def _validate_published_mp4(
+    directory: Path,
+    *,
+    cache_key_value: str,
+    filename: str,
+    fps: Fraction,
+    frame_count: int,
+    has_audio: bool,
+    prober: Mp4Prober,
+    token: CancellationToken,
+) -> Path:
+    token.raise_if_cancelled()
+    allowed = {filename, _MP4_MANIFEST_NAME, ".gs-video-logs"}
+    try:
+        names = {entry.name for entry in directory.iterdir()}
+    except OSError as exc:
+        raise RepairableError("MP4 artifact 目录不可读") from exc
+    if not {filename, _MP4_MANIFEST_NAME}.issubset(names) or not names <= allowed:
+        raise RepairableError("MP4 artifact 目录成员与 manifest authority 不一致")
+    output = directory / filename
+    metadata = _ordinary_file(output, "MP4")
+    if metadata.st_size <= 0:
+        raise RepairableError("MP4 不能为空")
+    document = _read_mp4_manifest(directory / _MP4_MANIFEST_NAME, token)
+    expected_duration = Fraction(frame_count, 1) / fps
+    raw_cache_key = document["cache_key"]
+    raw_filename = document["filename"]
+    raw_sha256 = document["sha256"]
+    raw_fps = document["fps"]
+    raw_duration = document["duration"]
+    if not all(
+        type(value) is str
+        for value in (
+            raw_cache_key,
+            raw_filename,
+            raw_sha256,
+            raw_fps,
+            raw_duration,
+        )
+    ):
+        raise RepairableError("MP4 manifest 字符串字段类型无效")
+    assert isinstance(raw_cache_key, str)
+    assert isinstance(raw_filename, str)
+    assert isinstance(raw_sha256, str)
+    assert isinstance(raw_fps, str)
+    assert isinstance(raw_duration, str)
+    try:
+        manifest_fps = Fraction(raw_fps)
+        manifest_duration = Fraction(raw_duration)
+    except (TypeError, ValueError, ZeroDivisionError) as exc:
+        raise RepairableError("MP4 manifest 的帧率或时长无效") from exc
+    values_match = (
+        type(document["version"]) is int
+        and document["version"] == 1
+        and raw_cache_key == cache_key_value
+        and raw_filename == filename
+        and type(document["size"]) is int
+        and document["size"] == metadata.st_size
+        and len(raw_sha256) == 64
+        and all(character in "0123456789abcdef" for character in raw_sha256)
+        and manifest_fps == fps
+        and type(document["frame_count"]) is int
+        and document["frame_count"] == frame_count
+        and manifest_duration == expected_duration
+        and type(document["has_audio"]) is bool
+        and document["has_audio"] is has_audio
+    )
+    if not values_match:
+        raise RepairableError("MP4 manifest 与当前 cache authority 不一致")
+    digest = _sha256(output, "MP4", token)
+    if digest != raw_sha256:
+        raise RepairableError("MP4 hash 与 manifest 摘要不一致")
+    probed = prober(output, cancellation_check=token.raise_if_cancelled)
+    _validate_export_result(
+        probed,
+        output,
+        fps=fps,
+        frame_count=frame_count,
+        has_audio=has_audio,
+        label="ffprobe",
+        allow_duration_tolerance=True,
+    )
+    if (
+        _ordinary_file(output, "MP4").st_size != metadata.st_size
+        or _sha256(output, "MP4", token) != digest
+    ):
+        raise RepairableError("MP4 在 ffprobe 期间发生变化")
+    return output
 
 
 class MediaIngestService:
@@ -340,7 +654,7 @@ class MediaIngestService:
         emit: ProgressEmitter,
     ) -> StageResult:
         token.raise_if_cancelled()
-        source, summary = _source_material(self.paths, project)
+        source, summary = _source_material(self.paths, project, token)
         source_identity = summary.model_dump(mode="json")
         # The decoded inventory can fill this derived probe field. Keeping it out of
         # the key makes the first unknown-count run reusable after persistence.
@@ -368,6 +682,7 @@ class MediaIngestService:
                 label="源",
                 expected_count=summary.frame_count,
                 expected_size=(summary.width, summary.height),
+                token=token,
             )
             discovered_count = inventory.count
             token.raise_if_cancelled()
@@ -383,6 +698,7 @@ class MediaIngestService:
             label="源",
             expected_count=summary.frame_count,
             expected_size=(summary.width, summary.height),
+            token=token,
         )
         discovered_count = source_inventory.count
         emit(1, 2, "提取全分辨率源帧 1/2")
@@ -397,26 +713,24 @@ class MediaIngestService:
                 mode="RGB",
                 label="代理",
                 expected_count=source_inventory.count,
+                token=token,
             )
-            if any(
-                width > summary.width
-                or height > min(summary.height, self.proxy_height)
-                for width, height in inventory.sizes
-            ):
-                raise RepairableError("代理帧尺寸超过源视频或代理高度上限")
+            _validate_proxy_dimensions(inventory, summary, self.proxy_height)
             token.raise_if_cancelled()
 
         proxy_directory = self.paths.publisher.publish_tree(
             "proxies", result_key, build_proxies
         )
-        _frame_inventory(
+        published_proxies = _frame_inventory(
             proxy_directory,
             suffix="jpg",
             image_format="JPEG",
             mode="RGB",
             label="代理",
             expected_count=source_inventory.count,
+            token=token,
         )
+        _validate_proxy_dimensions(published_proxies, summary, self.proxy_height)
         token.raise_if_cancelled()
         if summary.frame_count is None:
             self._persist_discovered_count(project, summary, discovered_count)
@@ -476,6 +790,7 @@ class SegmentWorkflowService:
             image_format="JPEG",
             mode="RGB",
             label="代理",
+            token=token,
         )
         prompt_state = project.workflow.subject_prompt
         if prompt_state is None:
@@ -490,13 +805,7 @@ class SegmentWorkflowService:
             x=prompt_state.x,
             y=prompt_state.y,
         )
-        backend_value = getattr(self.segmenter.backend, "value", self.segmenter.backend)
-        identity = {
-            "backend": str(backend_value),
-            "worker_prefix": list(self.segmenter.worker_prefix),
-            "config": _model_identity(self.segmenter.model_config, "分割配置"),
-            "checkpoint": _model_identity(self.segmenter.checkpoint, "分割模型"),
-        }
+        identity = _segmentation_identity(self.segmenter, token)
         result_key = cache_key(
             StageName.SEGMENT.value,
             {"ingest_cache_key": ingest.cache_key},
@@ -521,9 +830,12 @@ class SegmentWorkflowService:
                 label="遮罩",
                 expected_count=inventory.count,
                 expected_sizes=inventory.sizes,
+                token=token,
             )
             if sequence.frame_count != masks.count:
                 raise RepairableError("分割 worker 返回的帧数不一致")
+            if _segmentation_identity(self.segmenter, token) != identity:
+                raise RepairableError("分割 backend identity 在运行期间发生变化")
             for mask in masks.paths:
                 mask.replace(staging / mask.name)
             try:
@@ -538,10 +850,21 @@ class SegmentWorkflowService:
                 label="遮罩",
                 expected_count=inventory.count,
                 expected_sizes=inventory.sizes,
+                token=token,
             )
             token.raise_if_cancelled()
 
         output = self.paths.publisher.publish_tree("masks", result_key, build)
+        _frame_inventory(
+            output,
+            suffix="png",
+            image_format="PNG",
+            mode="L",
+            label="遮罩",
+            expected_count=inventory.count,
+            expected_sizes=inventory.sizes,
+            token=token,
+        )
         relative = self.paths.relative(output)
         return StageResult(
             output_paths=(relative,),
@@ -556,13 +879,20 @@ class CameraSolveWorkflowService:
         paths: WorkflowPaths,
         solver: CameraSolverLike | None = None,
         *,
-        backend_identity: str = "opencv-camera-solver-v1",
+        backend_identity: str | None = None,
     ) -> None:
-        if not backend_identity:
-            raise ValueError("camera backend identity must not be empty")
         self.paths = paths
-        self.solver = solver or OpenCvCameraSolver()
-        self.backend_identity = backend_identity
+        self.solver: CameraSolverLike
+        if solver is None:
+            self.solver = OpenCvCameraSolver()
+            self.backend_identity = backend_identity or "opencv-camera-solver-v1"
+        else:
+            if not backend_identity:
+                raise ValueError(
+                    "custom camera solver requires an explicit nonempty identity"
+                )
+            self.solver = solver
+            self.backend_identity = backend_identity
 
     def run(
         self,
@@ -581,6 +911,7 @@ class CameraSolveWorkflowService:
             image_format="JPEG",
             mode="RGB",
             label="代理",
+            token=token,
         )
         result_key = cache_key(
             StageName.SOLVE_CAMERA.value,
@@ -602,7 +933,9 @@ class CameraSolveWorkflowService:
 
         output = self.paths.publisher.publish_tree("camera", result_key, build)
         relative = self.paths.relative(output / "solution.json")
-        read_camera_solution(self.paths.root / relative)
+        restored = read_camera_solution(self.paths.root / relative)
+        if len(restored.camera_to_world) != proxies.count:
+            raise RepairableError("缓存相机轨迹帧数与代理帧数不一致")
         return StageResult(
             output_paths=(relative,),
             cache_key=result_key,
@@ -647,11 +980,22 @@ class TrajectoryMapWorkflowService:
         )
         if not authority_matches:
             raise RepairableError("目标相机、确认预览和落脚点 authority 不一致")
+        target = OrbitCamera(
+            target=camera.target,
+            distance=camera.distance,
+            yaw=camera.yaw,
+            pitch=camera.pitch,
+            fov_y_degrees=camera.fov_y_degrees,
+        )
+        mapped = map_trajectory(solution, target.camera_to_world(), workflow.motion_scale)
+        token.raise_if_cancelled()
         result_key = cache_key(
             StageName.MAP_TRAJECTORY.value,
             {
                 "solve_cache_key": solve.cache_key,
-                "camera_artifact_sha256": _sha256(solution_path, "相机求解产物"),
+                "camera_artifact_sha256": _sha256(
+                    solution_path, "相机求解产物", token
+                ),
             },
             {
                 "camera": camera.model_dump(mode="json"),
@@ -664,14 +1008,6 @@ class TrajectoryMapWorkflowService:
 
         def build(staging: Path) -> None:
             token.raise_if_cancelled()
-            target = OrbitCamera(
-                target=camera.target,
-                distance=camera.distance,
-                yaw=camera.yaw,
-                pitch=camera.pitch,
-                fov_y_degrees=camera.fov_y_degrees,
-            )
-            mapped = map_trajectory(solution, target.camera_to_world(), workflow.motion_scale)
             write_mapped_trajectory(
                 staging / "trajectory.json",
                 MappedTrajectory(camera.fov_y_degrees, mapped),
@@ -680,7 +1016,18 @@ class TrajectoryMapWorkflowService:
 
         output = self.paths.publisher.publish_tree("trajectories", result_key, build)
         relative = self.paths.relative(output / "trajectory.json")
-        read_mapped_trajectory(self.paths.root / relative)
+        restored = read_mapped_trajectory(self.paths.root / relative)
+        if (
+            restored.fov_y_degrees != camera.fov_y_degrees
+            or len(restored.camera_to_world) != len(mapped)
+            or any(
+                not np.allclose(actual, expected, atol=1e-12)
+                for actual, expected in zip(
+                    restored.camera_to_world, mapped, strict=True
+                )
+            )
+        ):
+            raise RepairableError("缓存映射轨迹与当前相机 authority 不一致")
         emit(1, 1, "映射目标相机轨迹 1/1")
         return StageResult(
             output_paths=(relative,),
@@ -691,14 +1038,15 @@ class TrajectoryMapWorkflowService:
 
 def _preview_size(source: tuple[int, int], maximum_height: int) -> tuple[int, int]:
     width, height = source
-    target_height = min(height, maximum_height)
-    if target_height % 2:
-        target_height -= 1
-    target_height = max(2, target_height)
-    target_width = int(round(width * target_height / height))
-    if target_width % 2:
-        target_width -= 1
-    target_width = max(2, min(width if width % 2 == 0 else width - 1, target_width))
+    if width < 2 or height < 2 or maximum_height < 2:
+        raise RepairableError("无法在不放大的前提下生成偶数尺寸预览")
+    scale = min(1.0, maximum_height / height)
+    target_width = min(width, int(width * scale))
+    target_height = min(height, int(height * scale))
+    target_width -= target_width % 2
+    target_height -= target_height % 2
+    if target_width < 2 or target_height < 2:
+        raise RepairableError("无法在不放大的前提下生成偶数尺寸预览")
     return target_width, target_height
 
 
@@ -709,20 +1057,35 @@ class CompositeWorkflowService:
         *,
         preview_frame_limit: int = 150,
         edge_px: int = 1,
-        exporter: ExportCallable = export_mp4,
-        exporter_identity: str = "ffmpeg-export-v1",
+        exporter: ExportCallable | None = None,
+        exporter_identity: str | None = None,
+        prober: Mp4Prober | None = None,
     ) -> None:
         if type(preview_frame_limit) is not int or preview_frame_limit <= 0:
             raise ValueError("preview_frame_limit must be a positive integer")
         if type(edge_px) is not int or not 0 <= edge_px <= 3:
             raise ValueError("edge_px must be an integer between 0 and 3")
-        if not exporter_identity:
-            raise ValueError("exporter identity must not be empty")
         self.paths = paths
         self.preview_frame_limit = preview_frame_limit
         self.edge_px = edge_px
-        self.exporter = exporter
-        self.exporter_identity = exporter_identity
+        self.exporter: ExportCallable
+        self.prober: Mp4Prober
+        if exporter is None:
+            self.exporter = export_mp4
+            self.exporter_identity = exporter_identity or "ffmpeg-export-v1"
+            if prober is not None:
+                raise ValueError("default exporter must use the trusted ffprobe adapter")
+            self.prober = probe_mp4
+        else:
+            if not exporter_identity:
+                raise ValueError(
+                    "custom preview exporter requires an explicit nonempty identity"
+                )
+            self.exporter = exporter
+            self.exporter_identity = exporter_identity
+            if prober is None:
+                raise ValueError("custom preview exporter requires an explicit prober")
+            self.prober = prober
 
     def run(
         self,
@@ -731,7 +1094,7 @@ class CompositeWorkflowService:
         emit: ProgressEmitter,
     ) -> StageResult:
         token.raise_if_cancelled()
-        source_video, summary = _source_material(self.paths, project)
+        source_video, summary = _source_material(self.paths, project, token)
         ingest = _stage_state(project, StageName.INGEST)
         segment = _stage_state(project, StageName.SEGMENT)
         render = _stage_state(project, StageName.RENDER)
@@ -755,6 +1118,7 @@ class CompositeWorkflowService:
             label="源",
             expected_count=summary.frame_count,
             expected_size=(summary.width, summary.height),
+            token=token,
         )
         proxies = _frame_inventory(
             proxy_directory,
@@ -763,6 +1127,7 @@ class CompositeWorkflowService:
             mode="RGB",
             label="代理",
             expected_count=sources.count,
+            token=token,
         )
         masks = _frame_inventory(
             mask_directory,
@@ -772,6 +1137,7 @@ class CompositeWorkflowService:
             label="遮罩",
             expected_count=sources.count,
             expected_sizes=proxies.sizes,
+            token=token,
         )
         renders = _frame_inventory(
             render_directory,
@@ -781,6 +1147,7 @@ class CompositeWorkflowService:
             label="渲染",
             expected_count=sources.count,
             expected_size=(summary.width, summary.height),
+            token=token,
         )
         result_key = cache_key(
             StageName.COMPOSITE.value,
@@ -841,6 +1208,7 @@ class CompositeWorkflowService:
             label="合成",
             expected_count=sources.count,
             expected_size=(summary.width, summary.height),
+            token=token,
         )
         preview_count = min(composites.count, self.preview_frame_limit)
         preview_size = _preview_size(
@@ -865,12 +1233,24 @@ class CompositeWorkflowService:
                 Fraction(summary.fps),
                 preview_count,
                 output,
+                cancellation_check=token.raise_if_cancelled,
             )
-            if Path(exported.output).absolute() != output.absolute():
-                raise RepairableError("预览导出器返回了错误的输出路径")
-            metadata = _ordinary_file(output, "合成预览")
-            if metadata.st_size <= 0:
-                raise RepairableError("合成预览为空")
+            _validate_export_result(
+                exported,
+                output,
+                fps=Fraction(summary.fps),
+                frame_count=preview_count,
+                has_audio=summary.has_audio,
+                label="预览导出器",
+                allow_duration_tolerance=False,
+            )
+            _write_mp4_manifest(
+                staging,
+                cache_key_value=result_key,
+                filename="composite-preview.mp4",
+                result=exported,
+                token=token,
+            )
             for path in preview_frames.iterdir():
                 path.unlink()
             preview_frames.rmdir()
@@ -878,6 +1258,16 @@ class CompositeWorkflowService:
 
         preview_directory = self.paths.publisher.publish_tree(
             "previews", result_key, build_preview
+        )
+        _validate_published_mp4(
+            preview_directory,
+            cache_key_value=result_key,
+            filename="composite-preview.mp4",
+            fps=Fraction(summary.fps),
+            frame_count=preview_count,
+            has_audio=summary.has_audio,
+            prober=self.prober,
+            token=token,
         )
         composite_relative = self.paths.relative(composite_directory)
         preview_relative = self.paths.relative(
@@ -898,14 +1288,29 @@ class ExportWorkflowService:
         self,
         paths: WorkflowPaths,
         *,
-        exporter: ExportCallable = export_mp4,
-        exporter_identity: str = "ffmpeg-export-v1",
+        exporter: ExportCallable | None = None,
+        exporter_identity: str | None = None,
+        prober: Mp4Prober | None = None,
     ) -> None:
-        if not exporter_identity:
-            raise ValueError("exporter identity must not be empty")
         self.paths = paths
-        self.exporter = exporter
-        self.exporter_identity = exporter_identity
+        self.exporter: ExportCallable
+        self.prober: Mp4Prober
+        if exporter is None:
+            self.exporter = export_mp4
+            self.exporter_identity = exporter_identity or "ffmpeg-export-v1"
+            if prober is not None:
+                raise ValueError("default exporter must use the trusted ffprobe adapter")
+            self.prober = probe_mp4
+        else:
+            if not exporter_identity:
+                raise ValueError(
+                    "custom final exporter requires an explicit nonempty identity"
+                )
+            self.exporter = exporter
+            self.exporter_identity = exporter_identity
+            if prober is None:
+                raise ValueError("custom final exporter requires an explicit prober")
+            self.prober = prober
 
     def run(
         self,
@@ -914,7 +1319,7 @@ class ExportWorkflowService:
         emit: ProgressEmitter,
     ) -> StageResult:
         token.raise_if_cancelled()
-        source_video, summary = _source_material(self.paths, project)
+        source_video, summary = _source_material(self.paths, project, token)
         composite = _stage_state(project, StageName.COMPOSITE)
         composite_directory = _artifact_path(
             self.paths,
@@ -930,6 +1335,7 @@ class ExportWorkflowService:
             label="合成",
             expected_count=summary.frame_count,
             expected_size=(summary.width, summary.height),
+            token=token,
         )
         result_key = cache_key(
             StageName.EXPORT.value,
@@ -957,16 +1363,38 @@ class ExportWorkflowService:
                 Fraction(summary.fps),
                 frames.count,
                 output,
+                cancellation_check=token.raise_if_cancelled,
             )
-            if Path(exported.output).absolute() != output.absolute():
-                raise RepairableError("最终导出器返回了错误的输出路径")
-            metadata = _ordinary_file(output, "最终视频")
-            if metadata.st_size <= 0:
-                raise RepairableError("最终视频为空")
+            _validate_export_result(
+                exported,
+                output,
+                fps=Fraction(summary.fps),
+                frame_count=frames.count,
+                has_audio=summary.has_audio,
+                label="最终导出器",
+                allow_duration_tolerance=False,
+            )
+            _write_mp4_manifest(
+                staging,
+                cache_key_value=result_key,
+                filename="final.mp4",
+                result=exported,
+                token=token,
+            )
             token.raise_if_cancelled()
 
         output_directory = self.paths.publisher.publish_tree(
             "exports", result_key, build
+        )
+        _validate_published_mp4(
+            output_directory,
+            cache_key_value=result_key,
+            filename="final.mp4",
+            fps=Fraction(summary.fps),
+            frame_count=frames.count,
+            has_audio=summary.has_audio,
+            prober=self.prober,
+            token=token,
         )
         relative = self.paths.relative(output_directory / "final.mp4")
         emit(1, 1, "验证并发布最终视频 1/1")

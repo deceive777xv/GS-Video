@@ -1,4 +1,5 @@
 import hashlib
+from collections.abc import Callable
 from fractions import Fraction
 from pathlib import Path
 
@@ -356,7 +357,11 @@ class _IntegrationExporter:
         fps: Fraction,
         frame_count: int,
         output: Path,
+        *,
+        cancellation_check: Callable[[], None] | None = None,
     ) -> ExportResult:
+        if cancellation_check is not None:
+            cancellation_check()
         assert source_video.is_file()
         assert len(tuple(frames_dir.glob("*.png"))) == frame_count
         self.frame_counts.append(frame_count)
@@ -366,6 +371,25 @@ class _IntegrationExporter:
             fps=fps,
             frame_count=frame_count,
             duration=Fraction(frame_count, 1) / fps,
+            has_audio=True,
+        )
+
+
+class _IntegrationProber:
+    def __call__(
+        self,
+        path: Path,
+        *,
+        cancellation_check: Callable[[], None] | None = None,
+    ) -> ExportResult:
+        if cancellation_check is not None:
+            cancellation_check()
+        fps = Fraction(24, 1)
+        return ExportResult(
+            output=path,
+            fps=fps,
+            frame_count=2,
+            duration=Fraction(2, 1) / fps,
             has_audio=True,
         )
 
@@ -428,8 +452,18 @@ def test_concrete_cpu_services_progress_through_export_and_persist_artifacts(
         ),
         trajectory_mapper=TrajectoryMapWorkflowService(paths),
         renderer=_IntegrationRenderer(tmp_path),
-        compositor=CompositeWorkflowService(paths, exporter=exporter),
-        exporter=ExportWorkflowService(paths, exporter=exporter),
+        compositor=CompositeWorkflowService(
+            paths,
+            exporter=exporter,
+            exporter_identity="integration-preview-exporter-v1",
+            prober=_IntegrationProber(),
+        ),
+        exporter=ExportWorkflowService(
+            paths,
+            exporter=exporter,
+            exporter_identity="integration-final-exporter-v1",
+            prober=_IntegrationProber(),
+        ),
     )
     runner = workflow.build_mvp_workflow(services, project)
 

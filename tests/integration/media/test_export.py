@@ -13,8 +13,13 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from gs_video.domain.errors import GsVideoError, RepairableError
-from gs_video.media.export import ExportResult, copy_verified_export, export_mp4
+from gs_video.domain.errors import CancelledError, GsVideoError, RepairableError
+from gs_video.media.export import (
+    ExportResult,
+    _run_cancellable_command,
+    copy_verified_export,
+    export_mp4,
+)
 from gs_video.media.toolchain import MediaTools, resolve_media_tools
 
 
@@ -49,6 +54,140 @@ def write_rgb_frames(directory: Path, count: int, *, size: tuple[int, int] = (16
     for index in range(1, count + 1):
         pixels = np.full((height, width, 3), index * 20 % 256, np.uint8)
         Image.fromarray(pixels).save(directory / f"{index:06d}.png")
+
+
+def test_cancellable_export_terminates_the_live_process_tree_and_staging(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    frames = tmp_path / "frames"
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "out.mp4"
+    write_rgb_frames(frames, 2)
+    source.write_bytes(b"source")
+    armed = False
+
+    class BlockingProcess:
+        pid = 1234
+        returncode: int | None = None
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired(["ffprobe"], timeout or 0)
+            return "", "cancelled"
+
+    process = BlockingProcess()
+
+    class RecordingGuard:
+        def __init__(self) -> None:
+            self.terminated: list[bool] = []
+            self.closed = False
+
+        def terminate(self, *, force: bool) -> bool:
+            self.terminated.append(force)
+            process.returncode = -9 if force else -15
+            return True
+
+        def close(self) -> None:
+            self.closed = True
+
+    guard = RecordingGuard()
+
+    def popen(*_args: object, **_kwargs: object) -> BlockingProcess:
+        nonlocal armed
+        armed = True
+        return process
+
+    def cancellation_check() -> None:
+        if armed:
+            raise CancelledError("任务已取消")
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr("gs_video.media.export.resolve_media_tools", lambda: FAKE_TOOLS)
+    monkeypatch.setattr(
+        "gs_video.media.export._identity_from_stat",
+        lambda value: (
+            int(value.st_dev) or 1,
+            int(value.st_ino)
+            or abs(
+                hash(
+                    (
+                        int(value.st_size),
+                        int(value.st_mtime_ns),
+                        int(value.st_ctime_ns),
+                        int(value.st_mode),
+                    )
+                )
+            )
+            or 1,
+        ),
+    )
+    monkeypatch.setattr(
+        "gs_video.media.export.create_process_tree_guard", lambda _process: guard
+    )
+
+    with pytest.raises(CancelledError):
+        export_mp4(
+            frames,
+            source,
+            Fraction(24, 1),
+            2,
+            output,
+            cancellation_check=cancellation_check,
+        )
+
+    assert guard.terminated
+    assert guard.closed is True
+    assert not output.exists()
+    assert staging_entries(output) == []
+
+
+def test_cancellable_command_preserves_cancel_when_guard_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    armed = False
+
+    class BlockingProcess:
+        pid = 4321
+        returncode: int | None = None
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired(["ffmpeg"], timeout or 0)
+            return "", "cancelled"
+
+    process = BlockingProcess()
+
+    class ClosingFailureGuard:
+        def terminate(self, *, force: bool) -> bool:
+            del force
+            process.returncode = -15
+            return True
+
+        def close(self) -> None:
+            raise OSError("close failed")
+
+    def popen(*_args: object, **_kwargs: object) -> BlockingProcess:
+        nonlocal armed
+        armed = True
+        return process
+
+    def cancellation_check() -> None:
+        if armed:
+            raise CancelledError("任务已取消")
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        "gs_video.media.export.create_process_tree_guard",
+        lambda _process: ClosingFailureGuard(),
+    )
+
+    with pytest.raises(CancelledError) as captured:
+        _run_cancellable_command(
+            ["ffmpeg"], timeout=10, cancellation_check=cancellation_check
+        )
+
+    assert process.returncode == -15
+    assert any("guard close failed" in note for note in captured.value.__notes__)
 
 
 def test_copy_verified_export_atomically_publishes_verified_bytes(tmp_path: Path) -> None:
