@@ -322,7 +322,10 @@ def _subject_artifact_inventory(
             message="The requested subject media is not ready.",
         )
     registered = stage.artifacts.get(definition.artifact_role)
-    if stage.cache_key is None or registered != definition.directory_name:
+    if (
+        stage.cache_key is None
+        or registered != f"{definition.directory_name}/{stage.cache_key}"
+    ):
         raise ApiError(
             409,
             code="subject_media_contract_missing",
@@ -335,8 +338,10 @@ def _subject_artifact_inventory(
         if has_reparse_component(requested_root):
             raise OSError("project root contains a reparse point")
         root = requested_root.resolve(strict=True)
-        allowed_root = root / definition.directory_name
-        artifact_root = allowed_root.resolve(strict=True)
+        requested_category_root = root / definition.directory_name
+        allowed_root = requested_category_root.resolve(strict=True)
+        requested_artifact_root = allowed_root / stage.cache_key
+        artifact_root = requested_artifact_root.resolve(strict=True)
         entries = tuple(sorted(artifact_root.iterdir(), key=lambda path: path.name))
     except OSError as error:
         raise ApiError(
@@ -346,7 +351,8 @@ def _subject_artifact_inventory(
             message="The requested subject media inventory is unavailable.",
         ) from error
     if (
-        artifact_root != allowed_root
+        allowed_root != requested_category_root
+        or artifact_root != requested_artifact_root
         or not artifact_root.is_dir()
         or has_reparse_component(artifact_root)
         or not entries

@@ -18,10 +18,13 @@ from gs_video.project.migrations import migrate_project_dict
 
 PROJECT_DIRECTORIES = (
     "source",
+    "frames",
     "proxies",
     "masks",
     "camera",
+    "trajectories",
     "renders",
+    "composites",
     "previews",
     "exports",
     "logs",

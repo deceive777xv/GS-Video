@@ -16,3 +16,5 @@ node_modules/
 /apps/web/.vite/
 .playwright-cli/
 /output/playwright/
+/output/manual-smoke/
+/output/test-temp/

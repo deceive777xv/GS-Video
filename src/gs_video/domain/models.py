@@ -27,8 +27,14 @@ class StageStatus(StrEnum):
 
 
 class ArtifactRole(StrEnum):
+    SOURCE_FRAMES = "source_frames"
     PROXY_FRAMES = "proxy_frames"
     SUBJECT_MASKS = "subject_masks"
+    CAMERA_SOLUTION = "camera_solution"
+    MAPPED_TRAJECTORY = "mapped_trajectory"
+    RENDER_FRAMES = "render_frames"
+    COMPOSITE_FRAMES = "composite_frames"
+    COMPOSITE_PREVIEW = "composite_preview"
     EXPORT_VIDEO = "export_video"
 
 

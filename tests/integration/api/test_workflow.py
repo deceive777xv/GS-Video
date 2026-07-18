@@ -103,12 +103,16 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
         estimated_vram_mb=1,
     )
     (repository.root / "exports" / "final.mp4").write_bytes(b"verified-video")
+    proxy_root = repository.root / "proxies" / "ingest-key"
+    mask_root = repository.root / "masks" / "segment-key"
+    proxy_root.mkdir()
+    mask_root.mkdir()
     for index in range(1, 6):
         Image.new("RGB", (16, 9), (20, 40, 60)).save(
-            repository.root / "proxies" / f"{index:06d}.jpg"
+            proxy_root / f"{index:06d}.jpg"
         )
         Image.new("L", (16, 9), 255).save(
-            repository.root / "masks" / f"{index:06d}.png"
+            mask_root / f"{index:06d}.png"
         )
     project.workflow.subject_prompt = SubjectPromptState(
         frame_index=4, x=8, y=4
@@ -116,12 +120,12 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
     project.stages[StageName.INGEST] = StageState(
         status=StageStatus.SUCCEEDED,
         cache_key="ingest-key",
-        artifacts={ArtifactRole.PROXY_FRAMES: "proxies"},
+        artifacts={ArtifactRole.PROXY_FRAMES: "proxies/ingest-key"},
     )
     project.stages[StageName.SEGMENT] = StageState(
         status=StageStatus.SUCCEEDED,
         cache_key="segment-key",
-        artifacts={ArtifactRole.SUBJECT_MASKS: "masks"},
+        artifacts={ArtifactRole.SUBJECT_MASKS: "masks/segment-key"},
     )
     project.stages[StageName.EXPORT] = StageState(
         status=StageStatus.SUCCEEDED,
@@ -596,7 +600,7 @@ def test_subject_prompt_requires_authoritative_proxy_bounds(
 def test_subject_prompt_can_be_cleared_without_proxy_validation(
     workflow_client: TestClient, auth_headers: dict[str, str], tmp_path: Path
 ) -> None:
-    for proxy in (tmp_path / "project" / "proxies").glob("*.jpg"):
+    for proxy in (tmp_path / "project" / "proxies" / "ingest-key").glob("*.jpg"):
         proxy.unlink()
 
     response = workflow_client.patch(
@@ -910,7 +914,7 @@ def test_subject_alpha_requires_a_successful_prompt_bound_segment(
     "stage_mutation",
     [
         {"cache_key": None},
-        {"artifacts": {ArtifactRole.PROXY_FRAMES: "./proxies"}},
+        {"artifacts": {ArtifactRole.PROXY_FRAMES: "./proxies/ingest-key"}},
     ],
 )
 def test_subject_proxy_requires_exact_typed_stage_authority(
@@ -940,7 +944,9 @@ def test_subject_media_rejects_noncanonical_inventory_and_dimensions(
     tmp_path: Path,
 ) -> None:
     project_root = tmp_path / "project"
-    (project_root / "proxies" / "extra.jpg").write_bytes(b"not a frame")
+    proxy_root = project_root / "proxies" / "ingest-key"
+    mask_root = project_root / "masks" / "segment-key"
+    (proxy_root / "extra.jpg").write_bytes(b"not a frame")
 
     invalid_inventory = workflow_client.get(
         "/api/v1/projects/current/subject-media/proxy", headers=auth_headers
@@ -948,8 +954,8 @@ def test_subject_media_rejects_noncanonical_inventory_and_dimensions(
     assert invalid_inventory.status_code == 409
     assert invalid_inventory.json()["code"] == "subject_media_changed"
 
-    (project_root / "proxies" / "extra.jpg").unlink()
-    Image.new("L", (8, 8), 255).save(project_root / "masks" / "000005.png")
+    (proxy_root / "extra.jpg").unlink()
+    Image.new("L", (8, 8), 255).save(mask_root / "000005.png")
     invalid_dimensions = workflow_client.get(
         "/api/v1/projects/current/subject-media/alpha", headers=auth_headers
     )
@@ -966,7 +972,7 @@ def test_subject_media_descriptor_becomes_stale_when_bytes_change(
         "/api/v1/projects/current/subject-media/proxy", headers=auth_headers
     ).json()
     Image.new("RGB", (16, 9), (200, 10, 30)).save(
-        tmp_path / "project" / "proxies" / "000005.jpg"
+        tmp_path / "project" / "proxies" / "ingest-key" / "000005.jpg"
     )
 
     stale = workflow_client.get(
