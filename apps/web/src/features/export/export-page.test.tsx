@@ -58,6 +58,7 @@ function readyProject(exportReady = false): ProjectDto {
 function exportBackend(): BackendClient {
   return {
     getVerifiedExport: vi.fn(async () => descriptor),
+    getProject: vi.fn(async () => readyProject(true)),
     fetchExportArtifact: vi.fn(async () => new Blob(['video/mp4'])),
     copyVerifiedExport: vi.fn(async () => undefined),
   } as unknown as BackendClient
@@ -69,7 +70,7 @@ const successfulTask = (): TaskDto => ({
 })
 
 describe('ExportPage', () => {
-  it('fetches and saves a browser Blob only after export task success', async () => {
+  it('prefetches a verified browser Blob but saves only from the explicit user action', async () => {
     const backend = exportBackend()
     const platform: PlatformBridge = {
       kind: 'browser',
@@ -79,22 +80,120 @@ describe('ExportPage', () => {
     }
     const onStartStage = vi.fn(async () => successfulTask())
     const user = userEvent.setup()
-    render(
+    const view = render(
       <ExportPage
         activeTask={null}
         backend={backend}
+        busy={false}
         onError={vi.fn()}
+        onProjectChange={vi.fn()}
         onStartStage={onStartStage}
         platform={platform}
         project={readyProject()}
       />,
     )
     await user.click(screen.getByRole('button', { name: '导出视频' }))
+    view.rerender(
+      <ExportPage
+        activeTask={successfulTask()}
+        backend={backend}
+        busy={false}
+        onError={vi.fn()}
+        onProjectChange={vi.fn()}
+        onStartStage={onStartStage}
+        platform={platform}
+        project={readyProject(true)}
+      />,
+    )
 
-    await waitFor(() => expect(platform.saveExport).toHaveBeenCalledOnce())
+    const save = await screen.findByRole('button', { name: '保存已验证视频' })
     expect(backend.getVerifiedExport).toHaveBeenCalledAfter(onStartStage)
     expect(backend.fetchExportArtifact).toHaveBeenCalledWith('export-1')
+    expect(platform.saveExport).not.toHaveBeenCalled()
+    await user.click(save)
+    expect(platform.saveExport).toHaveBeenCalledOnce()
     expect(vi.mocked(platform.saveExport).mock.calls[0]?.[1]).toMatchObject({ kind: 'browser-download' })
+  })
+
+  it('rejects late export prefetches and clears save authority on invalidation', async () => {
+    let resolveOld: ((value: VerifiedExportDto) => void) | undefined
+    let resolveNew: ((value: VerifiedExportDto) => void) | undefined
+    const newer = { ...descriptor, artifact_id: 'export-2', filename: 'result-2.mp4' }
+    const backend = exportBackend()
+    vi.mocked(backend.getVerifiedExport)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveNew = resolve }))
+    vi.mocked(backend.fetchExportArtifact).mockImplementation(async (id) => new Blob([id]))
+    const platform: PlatformBridge = {
+      kind: 'browser', pickInputFile: vi.fn(), saveExport: vi.fn(async () => undefined),
+      openExternal: vi.fn(async () => undefined),
+    }
+    const first = readyProject(true)
+    const second = readyProject(true)
+    if (second.workflow.export_result === null) throw new Error('export fixture missing')
+    second.workflow.export_result = {
+      ...second.workflow.export_result,
+      artifact_id: newer.artifact_id,
+      filename: newer.filename,
+    }
+    const props = {
+      activeTask: null, backend, busy: false, onError: vi.fn(),
+      onProjectChange: vi.fn(), onStartStage: vi.fn(async () => successfulTask()), platform,
+    }
+    const view = render(<ExportPage {...props} project={first} />)
+    await waitFor(() => expect(backend.getVerifiedExport).toHaveBeenCalledTimes(1))
+    view.rerender(<ExportPage {...props} project={second} />)
+    await waitFor(() => expect(backend.getVerifiedExport).toHaveBeenCalledTimes(2))
+
+    resolveNew?.(newer)
+    expect(await screen.findByText('result-2.mp4')).toBeInTheDocument()
+    resolveOld?.(descriptor)
+    await Promise.resolve()
+    expect(screen.getByText('result-2.mp4')).toBeInTheDocument()
+
+    await userEvent.setup().click(screen.getByRole('button', { name: '保存已验证视频' }))
+    expect(platform.saveExport).toHaveBeenCalledOnce()
+    expect(backend.fetchExportArtifact).toHaveBeenCalledTimes(1)
+    expect(backend.fetchExportArtifact).toHaveBeenCalledWith('export-2')
+
+    view.rerender(<ExportPage {...props} project={readyProject(false)} />)
+    await waitFor(() => expect(screen.queryByRole('button', { name: '保存已验证视频' })).toBeNull())
+  })
+
+  it('verifies a newly completed browser export before exposing explicit save', async () => {
+    const backend = exportBackend()
+    const platform: PlatformBridge = {
+      kind: 'browser', pickInputFile: vi.fn(), saveExport: vi.fn(async () => undefined),
+      openExternal: vi.fn(async () => undefined),
+    }
+    const running: TaskDto = {
+      ...successfulTask(), status: 'running', revision: 6,
+    }
+    const props = {
+      backend, busy: false, onError: vi.fn(),
+      onStartStage: vi.fn(async () => successfulTask()), platform,
+    }
+    let view: ReturnType<typeof render>
+    const onProjectChange = vi.fn((next: ProjectDto) => {
+      view.rerender(
+        <ExportPage {...props} activeTask={successfulTask()} onProjectChange={onProjectChange} project={next} />,
+      )
+    })
+    view = render(
+      <ExportPage {...props} activeTask={running} onProjectChange={onProjectChange} project={readyProject(false)} />,
+    )
+
+    view.rerender(
+      <ExportPage {...props} activeTask={successfulTask()} onProjectChange={onProjectChange} project={readyProject(false)} />,
+    )
+
+    const save = await screen.findByRole('button', { name: '保存已验证视频' })
+    expect(backend.getVerifiedExport).toHaveBeenCalled()
+    expect(backend.getProject).toHaveBeenCalled()
+    expect(backend.fetchExportArtifact).toHaveBeenCalledWith('export-1')
+    expect(platform.saveExport).not.toHaveBeenCalled()
+    await userEvent.setup().click(save)
+    expect(platform.saveExport).toHaveBeenCalledOnce()
   })
 
   it('passes a verified opaque copy closure to the Tauri bridge', async () => {
@@ -111,7 +210,9 @@ describe('ExportPage', () => {
       <ExportPage
         activeTask={null}
         backend={backend}
+        busy={false}
         onError={vi.fn()}
+        onProjectChange={vi.fn()}
         onStartStage={vi.fn(async () => successfulTask())}
         platform={platform}
         project={readyProject()}
@@ -141,7 +242,9 @@ describe('ExportPage', () => {
       <ExportPage
         activeTask={null}
         backend={backend}
+        busy={false}
         onError={vi.fn()}
+        onProjectChange={vi.fn()}
         onStartStage={onStartStage}
         platform={platform}
         project={readyProject(true)}

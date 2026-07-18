@@ -6,13 +6,14 @@ import { toImagePoint } from '../camera/scene-viewport'
 
 interface SubjectPageProps {
   backend: BackendClient
+  busy: boolean
   project: ProjectDto
   onError(value: unknown): void
   onProjectChange(project: ProjectDto): void
   onStartStage(stage: 'segment'): Promise<unknown>
 }
 
-export function SubjectPage({ backend, project, onError, onProjectChange, onStartStage }: SubjectPageProps) {
+export function SubjectPage({ backend, busy, project, onError, onProjectChange, onStartStage }: SubjectPageProps) {
   const [proxy, setProxy] = useState<SubjectMediaDto | null>(null)
   const [proxyUrl, setProxyUrl] = useState<string | null>(null)
   const [alphaUrl, setAlphaUrl] = useState<string | null>(null)
@@ -67,6 +68,7 @@ export function SubjectPage({ backend, project, onError, onProjectChange, onStar
   }, [])
 
   const submit = async (point = { x: Number(x), y: Number(y) }): Promise<void> => {
+    if (busy) return
     if (proxy === null || !Number.isInteger(point.x) || !Number.isInteger(point.y)
       || point.x < 0 || point.y < 0 || point.x >= proxy.width || point.y >= proxy.height) {
       onError('人物坐标必须位于代表帧图像内。')
@@ -115,7 +117,7 @@ export function SubjectPage({ backend, project, onError, onProjectChange, onStar
         <p>在代表帧的人物身体内点击。服务会验证坐标后再写入项目并启动分割。</p>
       </div>
       <div className="subject-layout">
-        <div aria-label="人物代表帧" className="subject-frame" onClick={pick} ref={frameRef} role="application" tabIndex={0}>
+        <div aria-label="人物代表帧" className="subject-frame" onClick={pick} ref={frameRef} tabIndex={0}>
           {proxyUrl === null ? <div className="viewport-empty">载入代表帧…</div> : <img alt="人物代表帧" src={proxyUrl} />}
           {alphaUrl === null ? null : <img alt="人物 Alpha 叠加" className="alpha-overlay" src={alphaUrl} />}
         </div>
@@ -124,7 +126,7 @@ export function SubjectPage({ backend, project, onError, onProjectChange, onStar
           <p>键盘用户可输入代表帧像素坐标。</p>
           <label>人物 X 坐标<input aria-label="人物 X 坐标" inputMode="numeric" onChange={(event) => setX(event.currentTarget.value)} value={x} /></label>
           <label>人物 Y 坐标<input aria-label="人物 Y 坐标" inputMode="numeric" onChange={(event) => setY(event.currentTarget.value)} value={y} /></label>
-          <button disabled={proxy === null || submitting} onClick={() => void submit()} type="button">{submitting ? '处理中…' : '确认人物位置'}</button>
+          <button disabled={busy || proxy === null || submitting} onClick={() => void submit()} type="button">{submitting ? '处理中…' : '确认人物位置'}</button>
           {project.workflow.subject_prompt !== null ? <button className="button-secondary" onClick={() => void reselect()} type="button">重新选择人物</button> : null}
         </aside>
       </div>

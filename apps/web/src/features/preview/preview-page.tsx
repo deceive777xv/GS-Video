@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 
 import type { BackendClient } from '../../api/backend-client'
-import type { ProjectDto, TaskDto } from '../../api/types'
+import type { ProjectDto, TaskDto, TaskEvent } from '../../api/types'
 
 interface PreviewPageProps {
   backend: BackendClient
+  busy: boolean
+  latestEvent: TaskEvent | null
   project: ProjectDto
   activeTask: TaskDto | null
   onError(value: unknown): void
@@ -15,7 +17,7 @@ interface PreviewPageProps {
 }
 
 export function PreviewPage({
-  backend, project, activeTask, onError, onProjectChange, onStartStage,
+  backend, busy, project, activeTask, latestEvent, onError, onProjectChange, onStartStage,
   onBackToCamera, onReselectSubject,
 }: PreviewPageProps) {
   const [frameUrl, setFrameUrl] = useState<string | null>(null)
@@ -25,6 +27,11 @@ export function PreviewPage({
   const preview = project.workflow.preview
 
   useEffect(() => {
+    if (url.current !== null) {
+      URL.revokeObjectURL(url.current)
+      url.current = null
+    }
+    setFrameUrl(null)
     if (preview === null) return
     const controller = new AbortController()
     void backend.fetchPreviewArtifact(preview.artifact_id, controller.signal).then((blob) => {
@@ -53,6 +60,7 @@ export function PreviewPage({
   }
 
   const generate = async (): Promise<void> => {
+    if (busy) return
     setRunning(true)
     try { await onStartStage('composite') }
     catch (error) { onError(error instanceof Error ? error : '预览合成任务失败。') }
@@ -63,6 +71,33 @@ export function PreviewPage({
   const compositeRunning = activeTask?.target_stage === 'composite'
     && ['queued', 'running'].includes(activeTask.status)
   const stageRows = ['map_trajectory', 'render', 'composite'] as const
+  const eventError = latestEvent?.type === 'task_event'
+    && latestEvent.task_id === activeTask?.id
+    ? latestEvent.error
+    : null
+  const eventCode = typeof eventError?.code === 'string' ? eventError.code : null
+  const eventCategory = typeof eventError?.category === 'string' ? eventError.category : null
+  const recoveryTarget = activeTask?.target_stage ?? 'composite'
+  const recoveryStage = project.stages[recoveryTarget]
+  const recoveryCode = eventCode ?? activeTask?.error ?? recoveryStage?.error_code ?? ''
+  const recoveryKey = `${recoveryTarget}:${eventCategory ?? ''}:${recoveryCode}`.toLowerCase()
+  const subjectRecovery = recoveryTarget === 'segment'
+    || /(subject|segment|mask|alpha)/.test(recoveryKey)
+  const cameraRecovery = !subjectRecovery && (
+    recoveryTarget === 'solve_camera'
+    || recoveryTarget === 'map_trajectory'
+    || /(camera|authority|preview_stale|pick)/.test(recoveryKey)
+  )
+  const resourceRecovery = !subjectRecovery && !cameraRecovery && (
+    recoveryTarget === 'render'
+    || recoveryTarget === 'composite'
+    || /(resource|cuda|gpu|vram|memory|render)/.test(recoveryKey)
+  )
+  const retryable = activeTask?.status === 'failed'
+    && eventError?.retryable === true
+    && activeTask.target_stage === 'composite'
+  const recoveryFailed = activeTask?.status === 'failed'
+    || recoveryStage?.status === 'failed'
   return (
     <section aria-labelledby="preview-title" className="page-grid">
       <div className="page-heading">
@@ -85,7 +120,7 @@ export function PreviewPage({
             <output>{Number(motionScale).toFixed(2)}×</output>
           </label>
           <button className="button-secondary" onClick={() => void patchMotion()} type="button">应用运动幅度</button>
-          <button disabled={running || compositeRunning || project.workflow.foot_point === null} onClick={() => void generate()} type="button">{running || compositeRunning ? '生成中…' : '生成预览'}</button>
+          <button disabled={busy || running || compositeRunning || project.workflow.foot_point === null} onClick={() => void generate()} type="button">{busy || running || compositeRunning ? '生成中…' : '生成预览'}</button>
           <div className="stage-list" aria-label="预览阶段缓存状态">
             {stageRows.map((name) => <div key={name}><span>{name}</span><strong>{project.stages[name]?.status ?? 'pending'}</strong></div>)}
           </div>
@@ -95,12 +130,12 @@ export function PreviewPage({
         <strong>{composite?.status === 'succeeded' ? '合成阶段已由后端确认' : '等待真实合成任务'}</strong>
         <p>当前 API 公开的是最近验证的静态场景帧；低分辨率合成视频尚未暴露。完整预览仍需要 Task 15 前完成具体 WorkflowServices 组装。</p>
       </div>
-      {composite?.status === 'failed' ? (
+      {recoveryFailed ? (
         <div className="recovery-actions">
-          <button onClick={onReselectSubject} type="button">重新选择人物</button>
-          <button onClick={() => void backend.updateProject({ preview_height: 360 }).then(onProjectChange).catch((error: unknown) => onError(error instanceof Error ? error : '无法降低预览分辨率。'))} type="button">降低预览分辨率</button>
-          <button onClick={onBackToCamera} type="button">返回机位</button>
-          <button onClick={() => void generate()} type="button">重试</button>
+          {subjectRecovery ? <button onClick={onReselectSubject} type="button">重新选择人物</button> : null}
+          {resourceRecovery ? <button onClick={() => void backend.updateProject({ preview_height: 360 }).then(onProjectChange).catch((error: unknown) => onError(error instanceof Error ? error : '无法降低预览分辨率。'))} type="button">降低预览分辨率</button> : null}
+          {cameraRecovery ? <button onClick={onBackToCamera} type="button">返回机位</button> : null}
+          {retryable ? <button disabled={busy} onClick={() => void generate()} type="button">重试</button> : null}
         </div>
       ) : null}
     </section>

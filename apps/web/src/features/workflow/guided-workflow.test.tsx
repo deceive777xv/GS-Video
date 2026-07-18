@@ -1,7 +1,7 @@
 import { StrictMode } from 'react'
-import { act, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { BackendClient } from '../../api/backend-client'
 import type {
@@ -17,6 +17,12 @@ import type {
 } from '../../api/types'
 import type { PickedFile, PickFileOptions, PlatformBridge } from '../../platform/platform-bridge'
 import { App } from '../../app/app'
+import { readUploadResume, writeUploadResume } from '../import/upload-resume'
+
+afterEach(() => {
+  sessionStorage.clear()
+  vi.useRealTimers()
+})
 
 function stage(status: 'pending' | 'succeeded' = 'pending'): StageStateDto {
   return {
@@ -326,7 +332,7 @@ describe('guided workflow', () => {
     const createOwnedTaskStore = vi.fn(() => ({
       subscribe: () => () => undefined,
       snapshot: () => snapshot,
-      onEvent: vi.fn(), onConnectionChange: vi.fn(), replaceFromRest: vi.fn(),
+      onEvent: vi.fn(), onConnectionChange: vi.fn(), replaceFromRest: vi.fn(), acknowledgeResync: vi.fn(),
       whenIdle: async () => undefined, dispose,
     }))
     const view = render(
@@ -344,7 +350,7 @@ describe('guided workflow', () => {
     await waitFor(() => expect(dispose).toHaveBeenCalledTimes(1))
   })
 
-  it('cancels an active task and retries a failed task through backend authority', async () => {
+  it('cancels an active task without presenting cancelled work as retryable', async () => {
     const active = project()
     active.workflow.active_task_id = 'task-composite'
     const harness = createHarness(active)
@@ -361,9 +367,8 @@ describe('guided workflow', () => {
 
     await user.click(await screen.findByRole('button', { name: '取消任务' }))
     expect(harness.client.cancelTask).toHaveBeenCalledWith('task-composite')
-    const retry = await screen.findByRole('button', { name: '重试阶段' })
-    await user.click(retry)
-    expect(harness.client.startTask).toHaveBeenCalledWith('composite')
+    expect(screen.queryByRole('button', { name: '重试阶段' })).toBeNull()
+    expect(harness.client.startTask).not.toHaveBeenCalled()
   })
 
   it('polls REST until an active task converges while realtime events are disconnected', async () => {
@@ -380,12 +385,116 @@ describe('guided workflow', () => {
     expect(harness.client.getProject).toHaveBeenCalled()
   })
 
+  it('retries initial active-task recovery after a transient failure and acknowledges only success', async () => {
+    vi.useFakeTimers()
+    const active = project()
+    active.workflow.active_task_id = 'task-ingest'
+    const harness = createHarness(active)
+    vi.mocked(harness.client.getTask)
+      .mockRejectedValueOnce(new Error('temporarily offline'))
+      .mockResolvedValueOnce({
+        id: 'task-ingest', target_stage: 'ingest', status: 'succeeded',
+        revision: 2, error: null,
+      })
+
+    render(<App backend={harness.client} initialBootstrap={bootstrap(active)} platform={harness.platform} />)
+    await act(async () => { await Promise.resolve() })
+    expect(harness.client.getTask).toHaveBeenCalledTimes(1)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(250) })
+    expect(harness.client.getTask).toHaveBeenCalledTimes(2)
+    expect(screen.getByText(/ingest · succeeded/)).toBeInTheDocument()
+    vi.useRealTimers()
+  })
+
+  it('cleans up bounded initial active-task recovery when the app unmounts', async () => {
+    vi.useFakeTimers()
+    const active = project()
+    active.workflow.active_task_id = 'task-ingest'
+    const harness = createHarness(active)
+    vi.mocked(harness.client.getTask).mockRejectedValue(new Error('offline'))
+    const view = render(<App backend={harness.client} initialBootstrap={bootstrap(active)} platform={harness.platform} />)
+    await act(async () => { await Promise.resolve() })
+    expect(harness.client.getTask).toHaveBeenCalledOnce()
+
+    view.unmount()
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+    expect(harness.client.getTask).toHaveBeenCalledOnce()
+    expect(vi.getTimerCount()).toBe(0)
+    vi.useRealTimers()
+  })
+
+  it('treats an unrecovered project task owner as provisionally busy', async () => {
+    const active = project()
+    active.workflow.active_task_id = 'task-ingest'
+    const harness = createHarness(active)
+    vi.mocked(harness.client.getTask).mockImplementation(() => new Promise(() => undefined))
+
+    render(<App backend={harness.client} initialBootstrap={bootstrap(active)} platform={harness.platform} />)
+    expect(screen.getByRole('button', { name: '选择源视频' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '选择 Gaussian 场景' })).toBeDisabled()
+    expect(harness.client.startTask).not.toHaveBeenCalled()
+  })
+
+  it('releases a stale persisted owner only after a deterministic task-not-found response', async () => {
+    const active = project()
+    active.workflow.active_task_id = 'task-from-old-service'
+    const harness = createHarness(active)
+    vi.mocked(harness.client.getTask).mockRejectedValueOnce(Object.assign(
+      new Error('task not found'),
+      { status: 404, code: 'task_not_found' },
+    ))
+
+    render(<App backend={harness.client} initialBootstrap={bootstrap(active)} platform={harness.platform} />)
+    expect(screen.getByRole('button', { name: '选择源视频' })).toBeDisabled()
+    await waitFor(() => expect(screen.getByRole('button', { name: '选择源视频' })).toBeEnabled())
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('switches App REST recovery from an old project owner to the newer gap event task', async () => {
+    const active = project()
+    active.workflow.active_task_id = 'task-old'
+    const harness = createHarness(active)
+    let resolveOld: ((value: TaskDto) => void) | undefined
+    vi.mocked(harness.client.getTask).mockImplementation((id) => id === 'task-old'
+      ? new Promise((resolve) => { resolveOld = resolve })
+      : Promise.resolve({
+          id, target_stage: 'render', status: 'running', revision: 9, error: null,
+        }))
+    let subscription: Parameters<NonNullable<Parameters<typeof App>[0]['eventSource']>['subscribe']>[0] | undefined
+    const eventSource = {
+      subscribe: vi.fn((next: NonNullable<typeof subscription>) => {
+        subscription = next
+        return () => undefined
+      }),
+    }
+    render(<App backend={harness.client} eventSource={eventSource} initialBootstrap={bootstrap(active)} platform={harness.platform} />)
+    await waitFor(() => expect(harness.client.getTask).toHaveBeenCalledWith('task-old'))
+
+    act(() => subscription?.onEvent({
+      type: 'resync_required', task_id: 'task-new', revision: 9,
+    }))
+    await waitFor(() => expect(harness.client.getTask).toHaveBeenCalledWith('task-new'))
+    await screen.findByText(/render · running/)
+
+    resolveOld?.({
+      id: 'task-old', target_stage: 'segment', status: 'running', revision: 1, error: null,
+    })
+    await act(async () => { await Promise.resolve() })
+    expect(screen.getByText(/render · running/)).toBeInTheDocument()
+    expect(screen.queryByText(/segment · running/)).toBeNull()
+  })
+
   it('keeps a browser upload session for retry and focuses the structured error alert', async () => {
     const user = userEvent.setup()
     const harness = createHarness()
     vi.mocked(harness.client.putUploadChunk)
       .mockRejectedValueOnce(new Error('chunk interrupted'))
       .mockResolvedValue(undefined)
+    vi.mocked(harness.client.getUpload).mockResolvedValue({
+      id: 'upload-source_video', chunk_size: 4, kind: 'source_video',
+      filename: 'portrait.mp4', total_size: 12, uploaded_chunks: [],
+    })
     render(<App backend={harness.client} platform={harness.platform} />)
     await screen.findByRole('heading', { name: '导入素材' })
 
@@ -396,6 +505,183 @@ describe('guided workflow', () => {
     await waitFor(() => expect(harness.client.completeUpload).toHaveBeenCalledTimes(1))
     expect(harness.client.createUpload).toHaveBeenCalledTimes(1)
     expect(harness.client.getUpload).toHaveBeenCalledWith('upload-source_video')
+  })
+
+  it('admits only one local import while file selection is still pending', async () => {
+    const harness = createHarness()
+    let resolvePick: ((value: PickedFile | null) => void) | undefined
+    vi.mocked(harness.platform.pickInputFile).mockImplementation(
+      () => new Promise((resolve) => { resolvePick = resolve }),
+    )
+    const user = userEvent.setup()
+    render(<App backend={harness.client} platform={harness.platform} />)
+    await screen.findByRole('heading', { name: '导入素材' })
+
+    await user.click(screen.getByRole('button', { name: '选择源视频' }))
+    expect(screen.getByRole('button', { name: '选择源视频' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '选择 Gaussian 场景' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: '选择 Gaussian 场景' }))
+    expect(harness.platform.pickInputFile).toHaveBeenCalledOnce()
+
+    resolvePick?.(null)
+    await waitFor(() => expect(screen.getByRole('button', { name: '选择源视频' })).toBeEnabled())
+  })
+
+  it('keeps a server upload resumable across unmount and resumes only missing chunks after reselection', async () => {
+    const first = createHarness()
+    let abortedSignal: AbortSignal | undefined
+    vi.mocked(first.client.putUploadChunk).mockImplementation(async (_id, index, _blob, signal) => {
+      if (index === 0) return
+      abortedSignal = signal
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+      })
+    })
+    const user = userEvent.setup()
+    const firstView = render(<App backend={first.client} platform={first.platform} />)
+    await screen.findByRole('heading', { name: '导入素材' })
+    await user.click(screen.getByRole('button', { name: '选择源视频' }))
+    await waitFor(() => expect(first.client.putUploadChunk).toHaveBeenCalledTimes(2))
+    expect(readUploadResume('project-1', 'source_video')?.id).toBe('upload-source_video')
+
+    firstView.unmount()
+    expect(abortedSignal?.aborted).toBe(true)
+    expect(first.client.cancelUpload).not.toHaveBeenCalled()
+
+    const second = createHarness()
+    vi.mocked(second.client.getUpload).mockResolvedValue({
+      id: 'upload-source_video', chunk_size: 4, kind: 'source_video',
+      filename: 'portrait.mp4', total_size: 12, uploaded_chunks: [0],
+    })
+    render(<App backend={second.client} platform={second.platform} />)
+    await screen.findByRole('heading', { name: '导入素材' })
+    await user.click(screen.getByRole('button', { name: '选择源视频' }))
+    await waitFor(() => expect(second.client.completeUpload).toHaveBeenCalledWith('upload-source_video'))
+    expect(second.client.createUpload).not.toHaveBeenCalled()
+    expect(second.client.putUploadChunk).toHaveBeenCalledTimes(2)
+    expect(second.client.putUploadChunk).toHaveBeenNthCalledWith(1, 'upload-source_video', 1, expect.any(Blob), expect.any(AbortSignal))
+    expect(readUploadResume('project-1', 'source_video')).toBeNull()
+  })
+
+  it('cancels and clears a mismatched superseded upload before creating a new session', async () => {
+    writeUploadResume({
+      version: 1, projectId: 'project-1', kind: 'source_video',
+      filename: 'old.mp4', mimeType: 'video/mp4', size: 99,
+      sha256: 'a'.repeat(64), id: 'upload-old', chunkSize: 4,
+    })
+    const harness = createHarness()
+    const user = userEvent.setup()
+    render(<App backend={harness.client} platform={harness.platform} />)
+    await screen.findByRole('heading', { name: '导入素材' })
+
+    await user.click(screen.getByRole('button', { name: '选择源视频' }))
+    await waitFor(() => expect(harness.client.completeUpload).toHaveBeenCalled())
+    expect(harness.client.cancelUpload).toHaveBeenCalledWith('upload-old')
+    expect(vi.mocked(harness.client.cancelUpload).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(harness.client.createUpload).mock.invocationCallOrder[0]!)
+  })
+
+  it('replaces an expired matching upload session instead of trapping later selections', async () => {
+    const selected = new File(['source_video'], 'portrait.mp4')
+    const digest = await crypto.subtle.digest('SHA-256', await selected.arrayBuffer())
+    const sha256 = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+    writeUploadResume({
+      version: 1, projectId: 'project-1', kind: 'source_video',
+      filename: selected.name, mimeType: 'application/octet-stream', size: selected.size,
+      sha256, id: 'upload-expired', chunkSize: 4,
+    })
+    const harness = createHarness()
+    vi.mocked(harness.client.getUpload).mockRejectedValueOnce(Object.assign(
+      new Error('upload not found'),
+      { status: 404 },
+    ))
+    const user = userEvent.setup()
+    render(<App backend={harness.client} platform={harness.platform} />)
+    await screen.findByRole('heading', { name: '导入素材' })
+
+    await user.click(screen.getByRole('button', { name: '选择源视频' }))
+    await waitFor(() => expect(harness.client.completeUpload).toHaveBeenCalledWith('upload-source_video'))
+    expect(harness.client.createUpload).toHaveBeenCalledOnce()
+    expect(harness.client.cancelUpload).not.toHaveBeenCalledWith('upload-expired')
+    expect(readUploadResume('project-1', 'source_video')).toBeNull()
+  })
+
+  it('continues after a mismatched upload was already removed by the service', async () => {
+    writeUploadResume({
+      version: 1, projectId: 'project-1', kind: 'source_video',
+      filename: 'old.mp4', mimeType: 'video/mp4', size: 99,
+      sha256: 'a'.repeat(64), id: 'upload-already-gone', chunkSize: 4,
+    })
+    const harness = createHarness()
+    vi.mocked(harness.client.cancelUpload).mockRejectedValueOnce(Object.assign(
+      new Error('upload not found'),
+      { status: 404 },
+    ))
+    const user = userEvent.setup()
+    render(<App backend={harness.client} platform={harness.platform} />)
+    await screen.findByRole('heading', { name: '导入素材' })
+
+    await user.click(screen.getByRole('button', { name: '选择源视频' }))
+    await waitFor(() => expect(harness.client.completeUpload).toHaveBeenCalledWith('upload-source_video'))
+    expect(harness.client.createUpload).toHaveBeenCalledOnce()
+    expect(readUploadResume('project-1', 'source_video')).toBeNull()
+  })
+
+  it('explicit upload cancellation destroys the server session and resume metadata', async () => {
+    writeUploadResume({
+      version: 1, projectId: 'project-1', kind: 'scene_ply',
+      filename: 'scene.ply', mimeType: 'application/octet-stream', size: 10,
+      sha256: 'b'.repeat(64), id: 'upload-scene', chunkSize: 4,
+    })
+    const harness = createHarness()
+    vi.mocked(harness.client.cancelUpload).mockRejectedValueOnce(Object.assign(
+      new Error('upload already removed'),
+      { status: 404 },
+    ))
+    vi.mocked(harness.client.putUploadChunk).mockImplementation(async (_id, _index, _blob, signal) => {
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+      })
+    })
+    const user = userEvent.setup()
+    render(<App backend={harness.client} platform={harness.platform} />)
+    await screen.findByRole('heading', { name: '导入素材' })
+    await user.click(screen.getByRole('button', { name: '选择源视频' }))
+    await user.click(await screen.findByRole('button', { name: '取消当前上传' }))
+
+    expect(harness.client.cancelUpload).toHaveBeenCalledWith('upload-source_video')
+    expect(readUploadResume('project-1', 'source_video')).toBeNull()
+    expect(readUploadResume('project-1', 'scene_ply')?.id).toBe('upload-scene')
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+  })
+
+  it('keeps local import admission closed until server cancellation finishes', async () => {
+    const harness = createHarness()
+    vi.mocked(harness.client.putUploadChunk).mockImplementation(async (_id, _index, _blob, signal) => {
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+      })
+    })
+    let resolveCancel: (() => void) | undefined
+    vi.mocked(harness.client.cancelUpload).mockImplementation(
+      () => new Promise((resolve) => { resolveCancel = resolve }),
+    )
+    const user = userEvent.setup()
+    render(<App backend={harness.client} platform={harness.platform} />)
+    await screen.findByRole('heading', { name: '导入素材' })
+    await user.click(screen.getByRole('button', { name: '选择源视频' }))
+    await waitFor(() => expect(harness.client.putUploadChunk).toHaveBeenCalled())
+
+    await user.click(screen.getByRole('button', { name: '取消当前上传' }))
+    await waitFor(() => expect(harness.client.cancelUpload).toHaveBeenCalled())
+    expect(screen.getByRole('button', { name: '选择源视频' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '选择 Gaussian 场景' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: '选择 Gaussian 场景' }))
+    expect(harness.platform.pickInputFile).toHaveBeenCalledOnce()
+
+    resolveCancel?.()
+    await waitFor(() => expect(screen.getByRole('button', { name: '选择源视频' })).toBeEnabled())
+    expect(readUploadResume('project-1', 'source_video')).toBeNull()
   })
 
   it('does not let an older preview refresh overwrite a newer camera confirmation', async () => {
@@ -440,5 +726,133 @@ describe('guided workflow', () => {
       await Promise.resolve()
     })
     expect(screen.getByLabelText('创作交互 2 / 3')).toBeInTheDocument()
+  })
+
+  it('disables every task-starting control while any authoritative owner is active', async () => {
+    const ready = project()
+    ready.source_video = 'opaque:source'
+    ready.scene_ply = 'opaque:scene'
+    ready.workflow.source_summary = {
+      filename: 'portrait.mp4', size: 10, sha256: 's', width: 640, height: 360,
+      duration_seconds: 12, fps: '30/1', has_audio: true, frame_count: 360,
+    }
+    ready.workflow.scene_summary = {
+      filename: 'garden.ply', size: 20, sha256: 'g', gaussian_count: 100,
+      estimated_vram_mb: 128,
+    }
+    ready.workflow.subject_prompt = { frame_index: 0, x: 10, y: 10 }
+    ready.stages.segment = stage('succeeded')
+    ready.stages.solve_camera = stage('succeeded')
+    ready.stages.composite = stage('succeeded')
+    ready.workflow.target_camera = { target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50, revision: 1 }
+    ready.workflow.preview = { artifact_id: 'preview-1', artifact_size: 1, artifact_sha256: 'p', generation: 1, width: 960, height: 540, camera_revision: 1, pick_buffer_revision: 1 }
+    ready.workflow.confirmed_camera_revision = 1
+    ready.workflow.confirmed_preview_artifact_id = 'preview-1'
+    ready.workflow.foot_point = { image: [10, 10], world: [0, 0, 0], preview_artifact_id: 'preview-1', camera_revision: 1, pick_buffer_revision: 1 }
+    ready.workflow.active_task_id = 'task-render'
+    const harness = createHarness(ready)
+    const active = { id: 'task-render', target_stage: 'render' as const, status: 'running' as const, revision: 4, error: null }
+    const snapshot = { task: active, revision: 4, pendingResyncRevision: null, connection: 'connected' as const, latestEvent: null }
+    const createOwnedTaskStore = () => ({
+      subscribe: () => () => undefined,
+      snapshot: () => snapshot,
+      onEvent: vi.fn(), onConnectionChange: vi.fn(), replaceFromRest: vi.fn(), acknowledgeResync: vi.fn(),
+      whenIdle: async () => undefined, dispose: vi.fn(),
+    })
+    const user = userEvent.setup()
+    render(<App backend={harness.client} createOwnedTaskStore={createOwnedTaskStore} initialBootstrap={bootstrap(ready)} platform={harness.platform} />)
+
+    expect(screen.getByRole('button', { name: '验证导出中…' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: /01.*导入/ }))
+    expect(screen.getByRole('button', { name: '选择源视频' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '选择 Gaussian 场景' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: /02.*人物/ }))
+    expect(await screen.findByRole('button', { name: '确认人物位置' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: /04.*预览/ }))
+    expect(screen.getByRole('button', { name: '生成中…' })).toBeDisabled()
+    expect(harness.client.startTask).not.toHaveBeenCalled()
+  })
+
+  it('lets disconnected REST polling converge a newer owner past an older event', async () => {
+    vi.useFakeTimers()
+    const current = project()
+    const harness = createHarness(current)
+    const queued: TaskDto = {
+      id: 'task-new', target_stage: 'render', status: 'queued', revision: 9, error: null,
+    }
+    const succeeded: TaskDto = { ...queued, status: 'succeeded', revision: 10 }
+    vi.mocked(harness.client.getTask).mockResolvedValue(succeeded)
+    const snapshot = {
+      task: queued,
+      revision: 9,
+      pendingResyncRevision: null,
+      connection: 'disconnected' as const,
+      latestEvent: {
+        type: 'task_event' as const,
+        task_id: 'task-old',
+        revision: 8,
+        stage: 'segment' as const,
+        progress: 1,
+        error: null,
+      },
+    }
+    const replaceFromRest = vi.fn()
+    const createOwnedTaskStore = () => ({
+      subscribe: () => () => undefined,
+      snapshot: () => snapshot,
+      onEvent: vi.fn(), onConnectionChange: vi.fn(), replaceFromRest, acknowledgeResync: vi.fn(),
+      whenIdle: async () => undefined, dispose: vi.fn(),
+    })
+    render(<App backend={harness.client} createOwnedTaskStore={createOwnedTaskStore} initialBootstrap={bootstrap(current)} platform={harness.platform} />)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(250) })
+    expect(replaceFromRest).toHaveBeenCalledWith(succeeded)
+    vi.useRealTimers()
+  })
+
+  it('admits only one stage request for a rapid double click', async () => {
+    const ready = project()
+    ready.workflow.source_summary = {
+      filename: 'portrait.mp4', size: 10, sha256: 's', width: 640, height: 360,
+      duration_seconds: 12, fps: '30/1', has_audio: true, frame_count: 360,
+    }
+    ready.workflow.scene_summary = { filename: 'garden.ply', size: 20, sha256: 'g', gaussian_count: 100, estimated_vram_mb: 128 }
+    ready.workflow.subject_prompt = { frame_index: 0, x: 10, y: 10 }
+    ready.stages.segment = stage('succeeded')
+    ready.stages.solve_camera = stage('succeeded')
+    ready.workflow.target_camera = { target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50, revision: 1 }
+    ready.workflow.confirmed_camera_revision = 1
+    ready.workflow.confirmed_preview_artifact_id = 'preview-1'
+    ready.workflow.foot_point = { image: [10, 10], world: [0, 0, 0], preview_artifact_id: 'preview-1', camera_revision: 1, pick_buffer_revision: 1 }
+    const harness = createHarness(ready)
+    vi.mocked(harness.client.startTask).mockImplementation(() => new Promise(() => undefined))
+    render(<App backend={harness.client} initialBootstrap={bootstrap(ready)} platform={harness.platform} />)
+
+    const generate = screen.getByRole('button', { name: '生成预览' })
+    fireEvent.click(generate)
+    fireEvent.click(generate)
+    expect(harness.client.startTask).toHaveBeenCalledTimes(1)
+  })
+
+  it('renders latest matching event progress as a determinate accessible progressbar', () => {
+    const current = project()
+    current.workflow.active_task_id = 'task-render'
+    const harness = createHarness(current)
+    const task = { id: 'task-render', target_stage: 'render' as const, status: 'running' as const, revision: 8, error: null }
+    const snapshot = {
+      task, revision: 8, pendingResyncRevision: null, connection: 'connected' as const,
+      latestEvent: { type: 'task_event' as const, task_id: task.id, revision: 8, stage: 'render' as const, progress: 0.42, error: null },
+    }
+    const createOwnedTaskStore = () => ({
+      subscribe: () => () => undefined, snapshot: () => snapshot,
+      onEvent: vi.fn(), onConnectionChange: vi.fn(), replaceFromRest: vi.fn(), acknowledgeResync: vi.fn(),
+      whenIdle: async () => undefined, dispose: vi.fn(),
+    })
+    render(<App backend={harness.client} createOwnedTaskStore={createOwnedTaskStore} initialBootstrap={bootstrap(current)} platform={harness.platform} />)
+
+    const progress = screen.getByRole('progressbar', { name: 'render 进度' })
+    expect(progress).toHaveAttribute('aria-valuenow', '42')
+    expect(progress).toHaveTextContent('42%')
+    expect(screen.getByText('render · running').parentElement).toHaveClass('task-copy')
   })
 })

@@ -145,9 +145,19 @@ export function BrowserCompositionRoot({
     )
   }
   return (
-    <main>
-      <h1>Connect to the local service</h1>
-      <form onSubmit={(event) => void connect(event)}>
+    <main className="connection-screen">
+      <form
+        aria-describedby="connection-help"
+        aria-label="连接本地服务"
+        className="connection-card"
+        onSubmit={(event) => void connect(event)}
+      >
+        <div aria-hidden="true" className="connection-mark"><span /><span /><span /></div>
+        <p className="eyebrow">LOCAL WORKFLOW</p>
+        <h1>Connect to the local service</h1>
+        <p className="connection-help" id="connection-help">
+          输入桌面服务启动时显示的端口与一次性令牌。一次性会话令牌只保存在当前内存中，连接后立即清空输入框。
+        </p>
         <label>
           Local API port
           <input
@@ -173,8 +183,9 @@ export function BrowserCompositionRoot({
         <button disabled={connecting || token.length === 0} type="submit">
           {connecting ? 'Connecting…' : 'Connect'}
         </button>
+        {failed ? <p className="connection-error" role="alert">无法连接。请确认本地服务正在运行，端口与一次性令牌仍然有效。</p> : null}
+        <p className="connection-footnote">仅允许连接 127.0.0.1；不会把令牌写入浏览器存储。</p>
       </form>
-      {failed ? <p role="alert">Could not connect to the local service.</p> : null}
     </main>
   )
 }

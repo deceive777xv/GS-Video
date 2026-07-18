@@ -75,6 +75,15 @@ function uiError(error: unknown): UiError {
   }
 }
 
+function isTaskNotFound(error: unknown): boolean {
+  return error instanceof BackendClientError
+    ? error.status === 404 || error.code === 'task_not_found'
+    : typeof error === 'object'
+      && error !== null
+      && (('status' in error && error.status === 404)
+        || ('code' in error && error.code === 'task_not_found'))
+}
+
 function AppShell({ children }: { children: ReactNode }) {
   return <div className="app-shell">{children}</div>
 }
@@ -95,14 +104,31 @@ export function App({
     : workflowStepForProject(initialBootstrap.project))
   const [error, setError] = useState<UiError | null>(null)
   const [loading, setLoading] = useState(initialBootstrap === undefined)
+  const [startingStage, setStartingStage] = useState(false)
+  const [missingTaskOwnerId, setMissingTaskOwnerId] = useState<string | null>(null)
   const errorRef = useRef<HTMLDivElement>(null)
   const disposalCycle = useRef(0)
   const recoveredTaskId = useRef<string | null>(null)
   const autoSolveKey = useRef<string | null>(null)
   const projectAuthority = useRef(0)
+  const stageAdmission = useRef(false)
 
   const reportError = useCallback((value: unknown): void => setError(uiError(value)), [])
   const reportUnknownError = useCallback((value: unknown): void => setError(uiError(value)), [])
+  const taskRequestStillAuthoritative = useCallback((taskId: string): boolean => {
+    const snapshot = taskStore.snapshot()
+    const latest = snapshot.latestEvent
+    if (latest === null) return true
+    if (latest.type === 'task_event') {
+      return latest.task_id === taskId
+        || (snapshot.task?.id === taskId && snapshot.task.revision >= latest.revision)
+    }
+    const owner = latest.taskId ?? latest.task_id
+    return owner === undefined
+      ? snapshot.pendingResyncRevision === null && snapshot.task?.id === taskId
+      : owner === taskId
+        || (snapshot.task?.id === taskId && snapshot.task.revision >= latest.revision)
+  }, [taskStore])
   const acceptProject = useCallback((next: ProjectDto): void => {
     projectAuthority.current += 1
     setProject(next)
@@ -147,9 +173,42 @@ export function App({
   useEffect(() => {
     const taskId = project?.workflow.active_task_id
     if (taskId === null || taskId === undefined || recoveredTaskId.current === taskId) return
-    recoveredTaskId.current = taskId
-    void backend.getTask(taskId).then(taskStore.replaceFromRest).catch(reportUnknownError)
-  }, [backend, project?.workflow.active_task_id, reportUnknownError, taskStore])
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const retryDelays = [250, 500, 1_000]
+    let attempt = 0
+    const recover = async (): Promise<void> => {
+      try {
+        const task = await backend.getTask(taskId)
+        if (stopped
+          || project?.workflow.active_task_id !== taskId
+          || !taskRequestStillAuthoritative(taskId)) return
+        taskStore.replaceFromRest(task)
+        recoveredTaskId.current = taskId
+        setMissingTaskOwnerId(null)
+      } catch (value) {
+        if (stopped) return
+        if (isTaskNotFound(value)) {
+          if (!taskRequestStillAuthoritative(taskId)) return
+          recoveredTaskId.current = taskId
+          setMissingTaskOwnerId(taskId)
+          return
+        }
+        const delay = retryDelays[attempt]
+        attempt += 1
+        if (delay === undefined) {
+          reportUnknownError(value)
+          return
+        }
+        timer = setTimeout(() => void recover(), delay)
+      }
+    }
+    void recover()
+    return () => {
+      stopped = true
+      if (timer !== null) clearTimeout(timer)
+    }
+  }, [backend, project?.workflow.active_task_id, reportUnknownError, taskRequestStillAuthoritative, taskStore])
 
   useEffect(() => {
     const task = taskState.task
@@ -165,7 +224,7 @@ export function App({
           backend.getProject(),
         ])
         if (stopped) return
-        taskStore.replaceFromRest(nextTask)
+        if (taskRequestStillAuthoritative(task.id)) taskStore.replaceFromRest(nextTask)
         if (projectAuthority.current === authority) setProject(nextProject)
         if (['queued', 'running'].includes(nextTask.status)) {
           timer = setTimeout(() => void poll(), 1_000)
@@ -182,7 +241,7 @@ export function App({
       stopped = true
       if (timer !== null) clearTimeout(timer)
     }
-  }, [backend, reportUnknownError, taskState.connection, taskState.task?.id, taskState.task?.status, taskStore])
+  }, [backend, reportUnknownError, taskRequestStillAuthoritative, taskState.connection, taskState.task?.id, taskState.task?.status, taskStore])
 
   const refreshProject = useCallback(async (): Promise<ProjectDto> => {
     const authority = ++projectAuthority.current
@@ -194,34 +253,76 @@ export function App({
   useEffect(() => {
     const latest = taskState.latestEvent
     if (latest === null) return
-    const taskId = latest.type === 'task_event'
+    const explicitTaskId = latest.type === 'task_event'
       ? latest.task_id
-      : taskState.task?.id ?? project?.workflow.active_task_id
-    if (taskId === null || taskId === undefined) return
+      : latest.taskId ?? latest.task_id
     const controller = new AbortController()
     const authority = ++projectAuthority.current
-    void Promise.all([backend.getTask(taskId), backend.getProject()]).then(([task, nextProject]) => {
-      if (controller.signal.aborted) return
-      taskStore.replaceFromRest(task)
-      if (projectAuthority.current === authority) setProject(nextProject)
-    }).catch((value: unknown) => {
+    void (async () => {
+      const nextProject = await backend.getProject()
+      if (controller.signal.aborted || projectAuthority.current !== authority) return
+      setProject(nextProject)
+      const taskId = explicitTaskId ?? nextProject.workflow.active_task_id
+      let task: TaskDto | null = null
+      if (taskId !== null) {
+        try {
+          task = await backend.getTask(taskId)
+        } catch (value) {
+          if (latest.type === 'resync_required' && isTaskNotFound(value)) {
+            if (controller.signal.aborted || projectAuthority.current !== authority) return
+            setMissingTaskOwnerId(taskId)
+            taskStore.acknowledgeResync(latest.revision, null)
+            return
+          }
+          throw value
+        }
+      }
+      if (controller.signal.aborted || projectAuthority.current !== authority) return
+      if (latest.type === 'resync_required') {
+        taskStore.acknowledgeResync(
+          latest.revision,
+          task !== null && task.id === taskId ? task : null,
+        )
+      } else if (task !== null && task.id === taskId) {
+        taskStore.replaceFromRest(task)
+      }
+    })().catch((value: unknown) => {
       if (!controller.signal.aborted) reportUnknownError(value)
     })
     return () => controller.abort()
-  }, [backend, project?.workflow.active_task_id, reportUnknownError, taskState.latestEvent, taskStore])
+  }, [backend, reportUnknownError, taskState.latestEvent, taskStore])
 
   const runStage = useCallback(async (target: StageName): Promise<TaskDto> => {
     setError(null)
+    const owner = taskStore.snapshot().task
+    const projectOwnerId = project?.workflow.active_task_id
+    const unresolvedProjectOwner = projectOwnerId !== null
+      && projectOwnerId !== undefined
+      && missingTaskOwnerId !== projectOwnerId
+      && (owner === null || owner.id !== projectOwnerId)
+    if (stageAdmission.current
+      || unresolvedProjectOwner
+      || (owner !== null && ['queued', 'running'].includes(owner.status))) {
+      const value = new Error('已有阶段任务正在运行，请等待完成或先取消。')
+      reportUnknownError(value)
+      throw value
+    }
+    stageAdmission.current = true
+    setStartingStage(true)
     try {
       const task = await backend.startTask(target)
+      setMissingTaskOwnerId(null)
       taskStore.replaceFromRest(task)
       await refreshProject()
       return task
     } catch (value) {
       reportUnknownError(value)
       throw value
+    } finally {
+      stageAdmission.current = false
+      setStartingStage(false)
     }
-  }, [backend, refreshProject, reportUnknownError, taskStore])
+  }, [backend, missingTaskOwnerId, project?.workflow.active_task_id, refreshProject, reportUnknownError, taskStore])
 
   useEffect(() => {
     if (project === null) return
@@ -273,14 +374,27 @@ export function App({
   const next = WORKFLOW_STEPS[currentIndex + 1]
   const activeTask = taskState.task
   const activeTaskRunning = activeTask !== null && ['queued', 'running'].includes(activeTask.status)
+  const unresolvedProjectOwner = project.workflow.active_task_id !== null
+    && missingTaskOwnerId !== project.workflow.active_task_id
+    && (activeTask === null || activeTask.id !== project.workflow.active_task_id)
+  const workflowBusy = startingStage || activeTaskRunning || unresolvedProjectOwner
+  const progressEvent = taskState.latestEvent?.type === 'task_event'
+    && taskState.latestEvent.task_id === activeTask?.id
+    ? taskState.latestEvent
+    : null
+  const progressPercent = progressEvent === null || !Number.isFinite(progressEvent.progress)
+    ? null
+    : Math.round(Math.min(1, Math.max(0, progressEvent.progress)) * 100)
+  const retryableTask = activeTask?.status === 'failed'
+    && progressEvent?.error?.retryable === true
 
   let page: ReactNode
   switch (step) {
     case 'import':
-      page = <ImportPage backend={backend} environment={bootstrap.environment} onError={reportError} onProjectChange={acceptProject} onStartStage={runStage} platform={platform} project={project} />
+      page = <ImportPage backend={backend} busy={workflowBusy} environment={bootstrap.environment} onError={reportError} onProjectChange={acceptProject} onStartStage={runStage} platform={platform} project={project} />
       break
     case 'subject':
-      page = <SubjectPage backend={backend} onError={reportError} onProjectChange={acceptProject} onStartStage={runStage} project={project} />
+      page = <SubjectPage backend={backend} busy={workflowBusy} onError={reportError} onProjectChange={acceptProject} onStartStage={runStage} project={project} />
       break
     case 'camera':
       page = <CameraPage backend={backend} onError={reportError} onProjectChange={acceptProject} onRefresh={refreshProject} project={project} />
@@ -289,6 +403,8 @@ export function App({
       page = <PreviewPage
         activeTask={activeTask}
         backend={backend}
+        busy={workflowBusy}
+        latestEvent={taskState.latestEvent}
         onBackToCamera={() => setStep('camera')}
         onError={reportError}
         onProjectChange={acceptProject}
@@ -298,7 +414,7 @@ export function App({
       />
       break
     case 'export':
-      page = <ExportPage activeTask={activeTask} backend={backend} onError={reportError} onStartStage={runStage} platform={platform} project={project} />
+      page = <ExportPage activeTask={activeTask} backend={backend} busy={workflowBusy} onError={reportError} onProjectChange={acceptProject} onStartStage={runStage} platform={platform} project={project} />
       break
   }
 
@@ -359,14 +475,27 @@ export function App({
         <div aria-live="polite" className="task-progress">
           <span className={`task-indicator ${activeTaskRunning ? 'is-running' : ''}`} />
           {activeTask === null ? (
-            <span><strong>准备就绪</strong><small>阶段状态保存在项目中</small></span>
+            <span className="task-copy"><strong>准备就绪</strong><small>阶段状态保存在项目中</small></span>
           ) : (
-            <span><strong>{activeTask.target_stage} · {activeTask.status}</strong><small>revision {activeTask.revision} · {taskState.connection}</small></span>
+            <span className="task-copy"><strong>{activeTask.target_stage} · {activeTask.status}</strong><small>revision {activeTask.revision} · {taskState.connection}</small></span>
           )}
+          {progressEvent !== null && progressPercent !== null ? (
+            <div
+              aria-label={`${progressEvent.stage} 进度`}
+              aria-valuemax={100}
+              aria-valuemin={0}
+              aria-valuenow={progressPercent}
+              className="task-progressbar"
+              role="progressbar"
+            >
+              <span style={{ width: `${progressPercent}%` }} />
+              <small>{progressPercent}%</small>
+            </div>
+          ) : null}
         </div>
         <div className="footer-actions">
           {activeTaskRunning ? <button className="button-danger" onClick={() => void cancelActiveTask()} type="button">取消任务</button> : null}
-          {activeTask !== null && ['failed', 'cancelled'].includes(activeTask.status) && activeTask.error !== null ? <button className="button-secondary" onClick={() => void runStage(activeTask.target_stage)} type="button">重试阶段</button> : null}
+          {activeTask !== null && retryableTask ? <button className="button-secondary" onClick={() => void runStage(activeTask.target_stage)} type="button">重试阶段</button> : null}
           <button className="button-secondary" disabled={previous === undefined} onClick={() => previous !== undefined && setStep(previous)} type="button">上一步</button>
           <button disabled={next === undefined || !canAdvance(project, step)} onClick={() => next !== undefined && setStep(next)} type="button">下一步</button>
         </div>

@@ -179,6 +179,9 @@ describe('browser and Tauri composition roots', () => {
     const storage = vi.spyOn(Storage.prototype, 'setItem')
 
     render(createElement(BrowserCompositionRoot, { createClient }))
+    expect(screen.getByRole('main')).toHaveClass('connection-screen')
+    expect(screen.getByRole('form', { name: '连接本地服务' })).toHaveClass('connection-card')
+    expect(screen.getByText(/一次性会话令牌只保存在当前内存中/)).toBeInTheDocument()
     const port = screen.getByRole('textbox', { name: 'Local API port' })
     const token = screen.getByLabelText('Session token') as HTMLInputElement
     await user.type(port, '49152')
@@ -207,7 +210,7 @@ describe('browser and Tauri composition roots', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
 
-    await screen.findByRole('alert')
+    expect(await screen.findByRole('alert')).toHaveTextContent('确认本地服务正在运行')
     expect(screen.getByRole('button', { name: 'Connect' })).toBeEnabled()
   })
 

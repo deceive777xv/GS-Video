@@ -20,6 +20,16 @@ export interface Point { x: number; y: number }
 export interface PointEvent { clientX: number; clientY: number }
 export interface PointBounds { left: number; top: number; width: number; height: number }
 
+export function cameraFingerprint(camera: CameraInput): string {
+  return [
+    ...camera.target,
+    camera.distance,
+    camera.yaw,
+    camera.pitch,
+    camera.fov_y_degrees,
+  ].map((value) => Object.is(value, -0) ? '0' : String(value)).join('|')
+}
+
 export function toImagePoint(
   event: PointEvent,
   bounds: PointBounds,
@@ -65,13 +75,22 @@ export function SceneViewport({
     camera_revision: initialPreview.camera_revision,
     pick_buffer_revision: initialPreview.pick_buffer_revision,
   })
+  const [frameCameraFingerprint, setFrameCameraFingerprint] = useState<string | null>(
+    initialPreview === null ? null : cameraFingerprint(initialCamera),
+  )
   const [frameUrl, setFrameUrl] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [footX, setFootX] = useState('')
   const [footY, setFootY] = useState('')
   const generation = useRef(initialPreview?.generation ?? 0)
   const requestAuthority = useRef(0)
-  const drag = useRef<{ x: number; y: number; moved: boolean } | null>(null)
+  const drag = useRef<{
+    originX: number
+    originY: number
+    lastX: number
+    lastY: number
+    moved: boolean
+  } | null>(null)
   const suppressNextClick = useRef(false)
   const frameUrlRef = useRef<string | null>(null)
   const viewportRef = useRef<HTMLDivElement>(null)
@@ -94,18 +113,16 @@ export function SceneViewport({
 
   useEffect(() => {
     setCamera(initialCamera)
-    if (initialPreview !== null) {
-      generation.current = Math.max(generation.current, initialPreview.generation)
-      setFrame({
-        artifact_id: initialPreview.artifact_id,
-        generation: initialPreview.generation,
-        width: initialPreview.width,
-        height: initialPreview.height,
-        camera_revision: initialPreview.camera_revision,
-        pick_buffer_revision: initialPreview.pick_buffer_revision,
-      })
-      firstRender.current = true
+    requestAuthority.current += 1
+    setFrame(null)
+    setFrameCameraFingerprint(null)
+    replaceFrameUrl(null)
+    if (initialPreview === null) {
+      firstRender.current = false
+      return
     }
+    generation.current = Math.max(generation.current, initialPreview.generation)
+    firstRender.current = true
   }, [
     initialCamera.distance,
     initialCamera.fov_y_degrees,
@@ -122,16 +139,43 @@ export function SceneViewport({
     if (initialPreview === null) return
     const controller = new AbortController()
     const authority = ++requestAuthority.current
+    const nextFrame = {
+      artifact_id: initialPreview.artifact_id,
+      generation: initialPreview.generation,
+      width: initialPreview.width,
+      height: initialPreview.height,
+      camera_revision: initialPreview.camera_revision,
+      pick_buffer_revision: initialPreview.pick_buffer_revision,
+    }
+    const nextFingerprint = cameraFingerprint(initialCamera)
     void backend.fetchPreviewArtifact(initialPreview.artifact_id, controller.signal)
       .then((blob) => {
         if (controller.signal.aborted || authority !== requestAuthority.current) return
+        firstRender.current = false
         replaceFrameUrl(URL.createObjectURL(blob))
+        setFrame(nextFrame)
+        setFrameCameraFingerprint(nextFingerprint)
       })
       .catch((error: unknown) => {
         if (!controller.signal.aborted) onErrorRef.current(error instanceof Error ? error : '无法载入场景预览。')
       })
     return () => controller.abort()
-  }, [backend, initialPreview?.artifact_id])
+  }, [
+    backend,
+    initialCamera.distance,
+    initialCamera.fov_y_degrees,
+    initialCamera.pitch,
+    initialCamera.target[0],
+    initialCamera.target[1],
+    initialCamera.target[2],
+    initialCamera.yaw,
+    initialPreview?.artifact_id,
+    initialPreview?.camera_revision,
+    initialPreview?.generation,
+    initialPreview?.height,
+    initialPreview?.pick_buffer_revision,
+    initialPreview?.width,
+  ])
 
   useEffect(() => {
     if (firstRender.current) {
@@ -153,6 +197,7 @@ export function SceneViewport({
         if (controller.signal.aborted || authority !== requestAuthority.current) return
         replaceFrameUrl(URL.createObjectURL(blob))
         setFrame(nextFrame)
+        setFrameCameraFingerprint(cameraFingerprint(camera))
         onPreviewRef.current(nextFrame, camera)
       }).catch((error: unknown) => {
         if (!controller.signal.aborted && authority === requestAuthority.current) {
@@ -175,18 +220,28 @@ export function SceneViewport({
   }
 
   const pointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
-    drag.current = { x: event.clientX, y: event.clientY, moved: false }
+    drag.current = {
+      originX: event.clientX,
+      originY: event.clientY,
+      lastX: event.clientX,
+      lastY: event.clientY,
+      moved: false,
+    }
     suppressNextClick.current = false
     event.currentTarget.setPointerCapture?.(event.pointerId)
   }
   const pointerMove = (event: ReactPointerEvent<HTMLDivElement>): void => {
     if (drag.current === null) return
-    const dx = event.clientX - drag.current.x
-    const dy = event.clientY - drag.current.y
+    const dx = event.clientX - drag.current.lastX
+    const dy = event.clientY - drag.current.lastY
     drag.current = {
-      x: event.clientX,
-      y: event.clientY,
-      moved: drag.current.moved || Math.hypot(dx, dy) >= 3,
+      ...drag.current,
+      lastX: event.clientX,
+      lastY: event.clientY,
+      moved: drag.current.moved || Math.hypot(
+        event.clientX - drag.current.originX,
+        event.clientY - drag.current.originY,
+      ) >= 3,
     }
     setCamera((current) => ({
       ...current,
@@ -204,7 +259,7 @@ export function SceneViewport({
       suppressNextClick.current = false
       return
     }
-    if (drag.current !== null || frame === null || viewportRef.current === null) return
+    if (drag.current !== null || frame === null || !frameMatchesCamera || viewportRef.current === null) return
     const mapped = toImagePoint(event, viewportRef.current.getBoundingClientRect(), frame)
     if (mapped === null) {
       onError('点击位于预览内容之外，请在图像范围内选择落脚点。')
@@ -216,7 +271,7 @@ export function SceneViewport({
   }
 
   const submitFootPoint = async (override?: Point): Promise<void> => {
-    if (frame === null) {
+    if (frame === null || !frameMatchesCamera) {
       onError('请先等待最新场景预览。')
       return
     }
@@ -241,7 +296,7 @@ export function SceneViewport({
   }
 
   const confirmCamera = async (): Promise<void> => {
-    if (frame === null) {
+    if (frame === null || !frameMatchesCamera) {
       onError('请先等待最新场景预览。')
       return
     }
@@ -251,6 +306,9 @@ export function SceneViewport({
       onError(error instanceof Error ? error : '初始机位确认失败。')
     }
   }
+
+  const frameMatchesCamera = frame !== null
+    && frameCameraFingerprint === cameraFingerprint(camera)
 
   return (
     <div className="viewport-layout">
@@ -264,7 +322,6 @@ export function SceneViewport({
         onPointerCancel={pointerUp}
         onWheel={updateDistance}
         ref={viewportRef}
-        role="application"
         tabIndex={0}
       >
         {frameUrl === null ? (
@@ -302,14 +359,14 @@ export function SceneViewport({
           />
           <output>{camera.fov_y_degrees.toFixed(0)}°</output>
         </label>
-        <button disabled={!canConfirm || frame === null || loading} onClick={() => void confirmCamera()} type="button">
+        <button disabled={!canConfirm || !frameMatchesCamera || loading} onClick={() => void confirmCamera()} type="button">
           确认初始机位
         </button>
         <fieldset>
           <legend>无鼠标落脚点输入</legend>
           <label>落脚点 X 坐标<input aria-label="落脚点 X 坐标" inputMode="numeric" onChange={(event) => setFootX(event.currentTarget.value)} value={footX} /></label>
           <label>落脚点 Y 坐标<input aria-label="落脚点 Y 坐标" inputMode="numeric" onChange={(event) => setFootY(event.currentTarget.value)} value={footY} /></label>
-          <button disabled={frame === null} onClick={() => void submitFootPoint()} type="button">确认场景落脚点</button>
+          <button disabled={!frameMatchesCamera} onClick={() => void submitFootPoint()} type="button">确认场景落脚点</button>
         </fieldset>
       </aside>
     </div>

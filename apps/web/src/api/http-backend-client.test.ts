@@ -588,7 +588,8 @@ describe('recoverable task store', () => {
   it('converges through REST when the live event source observes a revision jump', async () => {
     vi.useFakeTimers()
     const sockets: FakeWebSocket[] = []
-    const client = fakeBackendClient(task(3))
+    const newerTask = { ...task(3), id: 'other-task' }
+    const client = fakeBackendClient(newerTask)
     const store = createTaskStore(client, { retryDelayMs: 50 })
     const source = new WebSocketTaskEventSource({
       origin: 'http://127.0.0.1:49152',
@@ -628,10 +629,10 @@ describe('recoverable task store', () => {
     await store.whenIdle()
 
     expect(client.getTask).toHaveBeenCalledOnce()
-    expect(client.getTask).toHaveBeenCalledWith('t1')
+    expect(client.getTask).toHaveBeenCalledWith('other-task')
     expect(store.snapshot()).toMatchObject({
       revision: 3,
-      task: task(3),
+      task: newerTask,
       pendingResyncRevision: null,
       latestEvent: {
         type: 'resync_required',
@@ -645,68 +646,70 @@ describe('recoverable task store', () => {
     expect(vi.getTimerCount()).toBe(0)
   })
 
-  it('retries one backend-shaped resync without acknowledging it before REST succeeds', async () => {
-    vi.useFakeTimers()
-    const sockets: FakeWebSocket[] = []
+  it('does not guess an old owner for an identifier-free backend resync', async () => {
     const client = fakeBackendClient(task(9))
-    vi.mocked(client.getTask)
-      .mockRejectedValueOnce(new Error('offline'))
-      .mockResolvedValueOnce(task(9))
-    const store = createTaskStore(client, { retryDelayMs: 50 })
-    const source = new WebSocketTaskEventSource({
-      origin: 'http://127.0.0.1:49152',
-      token: 'memory-only-secret',
-      reconnectDelayMs: 10,
-      createWebSocket: (url) => {
-        const socket = new FakeWebSocket(url)
-        sockets.push(socket)
-        return socket
-      },
-    })
-    const unsubscribe = source.subscribe({
-      afterRevision: 0,
-      getResumeRevision: () => store.snapshot().revision,
-      onEvent: store.onEvent,
-      onConnectionChange: store.onConnectionChange,
-    })
+    const store = createTaskStore(client)
+    store.replaceFromRest(task(1))
 
-    sockets[0]?.emit('open')
-    sockets[0]?.message({ type: 'authenticated', revision: 9 })
-    sockets[0]?.message({
-      type: 'task_event',
-      task_id: 't1',
-      revision: 1,
-      stage: 'segment',
-      progress: 0.1,
-      error: null,
-    })
-    sockets[0]?.message({ type: 'resync_required', revision: 9 })
-    await vi.waitFor(() => expect(client.getTask).toHaveBeenCalledOnce())
-
-    expect(store.snapshot()).toMatchObject({
-      revision: 1,
-      pendingResyncRevision: 9,
-    })
-    sockets[0]?.emit('close')
-    await vi.advanceTimersByTimeAsync(10)
-    sockets[1]?.emit('open')
-    sockets[1]?.message({ type: 'authenticated', revision: 9 })
-    expect(sockets[1]?.sent.map((payload) => JSON.parse(payload))).toEqual([
-      { type: 'authenticate', token: 'memory-only-secret' },
-      { type: 'resume', after_revision: 1 },
-    ])
-
-    await vi.advanceTimersByTimeAsync(40)
+    store.onEvent({ type: 'resync_required', revision: 9 })
     await store.whenIdle()
-    expect(client.getTask).toHaveBeenCalledTimes(2)
+
+    expect(client.getTask).not.toHaveBeenCalled()
+    expect(store.snapshot()).toMatchObject({ revision: 1, pendingResyncRevision: 9 })
+
+    store.acknowledgeResync(9, task(9))
     expect(store.snapshot()).toMatchObject({
       revision: 9,
       task: task(9),
       pendingResyncRevision: null,
     })
 
-    unsubscribe()
-    expect(vi.getTimerCount()).toBe(0)
+    store.onEvent({ type: 'resync_required', revision: 10 })
+    store.acknowledgeResync(10, null)
+    expect(store.snapshot()).toMatchObject({
+      revision: 10,
+      task: null,
+      pendingResyncRevision: null,
+    })
+  })
+
+  it('never publishes an old owner whose REST response loses an in-flight owner race', async () => {
+    let resolveOld: ((value: TaskDto) => void) | undefined
+    const nextTask = { ...task(10), id: 'task-new', target_stage: 'render' as const }
+    const client = fakeBackendClient(nextTask)
+    vi.mocked(client.getTask).mockImplementation((id) => id === 'task-old'
+      ? new Promise((resolve) => { resolveOld = resolve })
+      : Promise.resolve(nextTask))
+    const store = createTaskStore(client)
+
+    store.onEvent({ type: 'resync_required', taskId: 'task-old', revision: 9 })
+    await vi.waitFor(() => expect(client.getTask).toHaveBeenCalledWith('task-old'))
+    store.onEvent({ type: 'resync_required', taskId: 'task-new', revision: 10 })
+    resolveOld?.({ ...task(9), id: 'task-old' })
+    await store.whenIdle()
+
+    expect(client.getTask).toHaveBeenCalledWith('task-new')
+    expect(store.snapshot()).toMatchObject({ task: nextTask, pendingResyncRevision: null })
+  })
+
+  it('never lets an older same-owner recovery overwrite a newer REST acknowledgement', async () => {
+    let resolveRecovery: ((value: TaskDto) => void) | undefined
+    const client = fakeBackendClient()
+    vi.mocked(client.getTask).mockImplementation(
+      () => new Promise((resolve) => { resolveRecovery = resolve }),
+    )
+    const store = createTaskStore(client)
+    const succeeded: TaskDto = {
+      id: 'task-new', target_stage: 'render', status: 'succeeded', revision: 11, error: null,
+    }
+
+    store.onEvent({ type: 'resync_required', taskId: 'task-new', revision: 10 })
+    await vi.waitFor(() => expect(client.getTask).toHaveBeenCalledWith('task-new'))
+    store.acknowledgeResync(11, succeeded)
+    resolveRecovery?.({ ...succeeded, status: 'queued', revision: 10 })
+    await store.whenIdle()
+
+    expect(store.snapshot()).toMatchObject({ task: succeeded, revision: 11, pendingResyncRevision: null })
   })
 
   it('resyncs authoritative task state after an event gap', async () => {

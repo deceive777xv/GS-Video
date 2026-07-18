@@ -210,6 +210,7 @@ export interface TaskStore {
   readonly onEvent: (event: TaskEvent) => void
   readonly onConnectionChange: (state: TaskEventConnection) => void
   readonly replaceFromRest: (task: TaskDto) => void
+  readonly acknowledgeResync: (revision: number, task: TaskDto | null) => void
   readonly whenIdle: () => Promise<void>
   readonly dispose: () => void
 }
@@ -249,10 +250,28 @@ export function createTaskStore(
   const replaceFromRest = (task: TaskDto): void => {
     if (disposed) return
     trackedTaskId = task.id
+    const pendingResyncRevision = state.pendingResyncRevision !== null
+      && task.revision >= state.pendingResyncRevision
+      ? null
+      : state.pendingResyncRevision
     publish({
       ...state,
       task,
       revision: Math.max(state.revision, task.revision),
+      pendingResyncRevision,
+    })
+  }
+  const acknowledgeResync = (revision: number, task: TaskDto | null): void => {
+    if (disposed) return
+    trackedTaskId = task?.id
+    publish({
+      ...state,
+      task,
+      revision: Math.max(state.revision, revision, task?.revision ?? 0),
+      pendingResyncRevision: state.pendingResyncRevision !== null
+        && revision < state.pendingResyncRevision
+        ? state.pendingResyncRevision
+        : null,
     })
   }
   const retryDelay = (): Promise<void> =>
@@ -276,15 +295,27 @@ export function createTaskStore(
       trackedTaskId !== undefined
     ) {
       const recoveringRevision = state.pendingResyncRevision
+      const queriedTaskId = trackedTaskId
       const result = await Promise.race([
-        client.getTask(trackedTaskId).then(
+        client.getTask(queriedTaskId).then(
           (task) => ({ kind: 'task' as const, task }),
           () => ({ kind: 'failed' as const }),
         ),
         disposal.then(() => ({ kind: 'disposed' as const })),
       ])
       if (disposed || result.kind === 'disposed') return
+      if (trackedTaskId !== queriedTaskId) continue
       if (result.kind === 'failed') {
+        await retryDelay()
+        continue
+      }
+      if (result.task.id !== queriedTaskId) {
+        await retryDelay()
+        continue
+      }
+      if (state.pendingResyncRevision === null) continue
+      if (state.task?.id === queriedTaskId
+        && state.task.revision > result.task.revision) {
         await retryDelay()
         continue
       }
@@ -314,11 +345,7 @@ export function createTaskStore(
   const onEvent = (event: TaskEvent): void => {
     if (disposed) return
     if (event.type === 'resync_required') {
-      trackedTaskId =
-        state.task?.id ??
-        trackedTaskId ??
-        event.taskId ??
-        event.task_id
+      trackedTaskId = event.taskId ?? event.task_id
       const pendingResyncRevision = Math.max(
         state.pendingResyncRevision ?? 0,
         event.revision,
@@ -328,7 +355,7 @@ export function createTaskStore(
       return
     }
     if (event.revision <= state.revision) return
-    trackedTaskId ??= event.task_id
+    trackedTaskId = event.task_id
     publish({ ...state, revision: event.revision, latestEvent: event })
   }
 
@@ -345,6 +372,7 @@ export function createTaskStore(
       if (connection !== state.connection) publish({ ...state, connection })
     },
     replaceFromRest,
+    acknowledgeResync,
     whenIdle: () => recovery ?? Promise.resolve(),
     dispose: () => {
       if (disposed) return

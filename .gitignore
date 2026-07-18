@@ -14,3 +14,5 @@ node_modules/
 /apps/web/dist/
 /apps/web/coverage/
 /apps/web/.vite/
+.playwright-cli/
+/output/playwright/
