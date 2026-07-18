@@ -61,6 +61,7 @@ from gs_video.domain.models import (
 )
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.pipeline.cancellation import CancellationToken
+from gs_video.pipeline.events import ProgressEmitter, discard_progress
 from gs_video.pipeline.workflow import ChangeKind, invalidate_for_change
 from gs_video.scene.camera import OrbitCamera
 
@@ -80,7 +81,12 @@ class EnvironmentDoctorLike(Protocol):
 
 
 class PipelineRunnerLike(Protocol):
-    def run(self, name: StageName, token: CancellationToken) -> StageState: ...
+    def run(
+        self,
+        name: StageName,
+        token: CancellationToken,
+        emit: ProgressEmitter = discard_progress,
+    ) -> StageState: ...
 
     def supports(self, name: StageName) -> bool: ...
 

@@ -5,6 +5,8 @@ import secrets
 from collections import deque
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
+from math import isfinite
+from time import monotonic
 from typing import Protocol
 from uuid import uuid4
 
@@ -14,10 +16,16 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from gs_video.api.schemas import ApiError, ApiSettings, TaskEvent, TaskSnapshot, TaskStatus
 from gs_video.domain.models import StageName, StageState, StageStatus
 from gs_video.pipeline.cancellation import CancellationToken
+from gs_video.pipeline.events import ProgressEmitter, discard_progress
 
 
 class PipelineRunnerLike(Protocol):
-    def run(self, name: StageName, token: CancellationToken) -> StageState: ...
+    def run(
+        self,
+        name: StageName,
+        token: CancellationToken,
+        emit: ProgressEmitter = discard_progress,
+    ) -> StageState: ...
 
 
 class EventSubscription:
@@ -64,6 +72,11 @@ class EventBus:
         task_id: str,
         stage: StageName,
         progress: float,
+        current: int | None = None,
+        total: int | None = None,
+        message: str | None = None,
+        elapsed_seconds: float = 0.0,
+        eta_seconds: float | None = None,
         error: dict[str, object] | None = None,
         commit: Callable[[TaskEvent], Awaitable[bool]] | None = None,
     ) -> TaskEvent | None:
@@ -73,6 +86,11 @@ class EventBus:
                 revision=self._revision + 1,
                 stage=stage.value,
                 progress=progress,
+                current=current,
+                total=total,
+                message=message,
+                elapsed_seconds=elapsed_seconds,
+                eta_seconds=eta_seconds,
                 error=error,
             )
             if commit is not None and not await commit(event):
@@ -129,6 +147,7 @@ class TaskService:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gs-video-task")
         self._snapshots: dict[str, TaskSnapshot] = {}
         self._tokens: dict[str, CancellationToken] = {}
+        self._started_at: dict[str, float] = {}
         self._jobs: set[asyncio.Task[None]] = set()
         self._started = False
         self._transition_lock = asyncio.Lock()
@@ -167,6 +186,12 @@ class TaskService:
                     target_stage=target_stage.value,
                     status=TaskStatus.QUEUED.value,
                     revision=event.revision,
+                    progress=event.progress,
+                    current=event.current,
+                    total=event.total,
+                    message=event.message,
+                    elapsed_seconds=event.elapsed_seconds,
+                    eta_seconds=event.eta_seconds,
                 )
                 self._snapshots[task_id] = committed
                 self._tokens[task_id] = token
@@ -203,6 +228,8 @@ class TaskService:
         status: TaskStatus,
         progress: float,
         error: str | None = None,
+        *,
+        elapsed_seconds: float | None = None,
     ) -> TaskSnapshot:
         committed: TaskSnapshot | None = None
         event_error = (
@@ -227,24 +254,99 @@ class TaskService:
                 if current.status not in legal_sources:
                     committed = current
                     return False
-                committed = current.model_copy(
+                updates: dict[str, object] = {
+                    "status": status.value,
+                    "revision": event.revision,
+                    "error": error,
+                    "progress": event.progress,
+                    "current": event.current,
+                    "total": event.total,
+                    "message": event.message,
+                    "elapsed_seconds": event.elapsed_seconds,
+                    "eta_seconds": event.eta_seconds,
+                }
+                committed = current.model_copy(update=updates)
+                self._snapshots[task_id] = committed
+                return True
+
+        current_snapshot = self._snapshots[task_id]
+        event_current = current_snapshot.current
+        event_total = current_snapshot.total
+        event_message = current_snapshot.message
+        event_eta = current_snapshot.eta_seconds
+        if status is TaskStatus.SUCCEEDED and event_total is not None:
+            event_current = event_total
+            progress = 1.0
+            event_eta = 0.0
+        elif status in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            progress = current_snapshot.progress
+            event_eta = None
+        elapsed = (
+            current_snapshot.elapsed_seconds
+            if elapsed_seconds is None
+            else elapsed_seconds
+        )
+        event = await self._events.publish(
+            task_id=task_id,
+            stage=stage,
+            progress=progress,
+            current=event_current,
+            total=event_total,
+            message=event_message,
+            elapsed_seconds=elapsed,
+            eta_seconds=event_eta,
+            error=event_error,
+            commit=commit,
+        )
+        del event
+        assert committed is not None
+        return committed
+
+    async def _commit_progress(
+        self,
+        task_id: str,
+        stage: StageName,
+        *,
+        current: int,
+        total: int,
+        message: str,
+        elapsed_seconds: float,
+        eta_seconds: float | None,
+    ) -> TaskSnapshot:
+        committed: TaskSnapshot | None = None
+
+        async def commit(event: TaskEvent) -> bool:
+            nonlocal committed
+            async with self._transition_lock:
+                snapshot = self._snapshots[task_id]
+                if snapshot.status != TaskStatus.RUNNING.value:
+                    committed = snapshot
+                    return False
+                committed = snapshot.model_copy(
                     update={
-                        "status": status.value,
                         "revision": event.revision,
-                        "error": error,
+                        "progress": event.progress,
+                        "current": event.current,
+                        "total": event.total,
+                        "message": event.message,
+                        "elapsed_seconds": event.elapsed_seconds,
+                        "eta_seconds": event.eta_seconds,
                     }
                 )
                 self._snapshots[task_id] = committed
                 return True
 
-        event = await self._events.publish(
+        await self._events.publish(
             task_id=task_id,
             stage=stage,
-            progress=progress,
-            error=event_error,
+            progress=current / total,
+            current=current,
+            total=total,
+            message=message,
+            elapsed_seconds=elapsed_seconds,
+            eta_seconds=eta_seconds,
             commit=commit,
         )
-        del event
         assert committed is not None
         return committed
 
@@ -254,10 +356,61 @@ class TaskService:
             return
         loop = asyncio.get_running_loop()
         token = self._tokens[task_id]
+        started_at = monotonic()
+        self._started_at[task_id] = started_at
+
+        def relay(current: int, total: int, message: str) -> None:
+            if (
+                type(current) is not int
+                or type(total) is not int
+                or total <= 0
+                or current < 0
+                or current > total
+                or not isinstance(message, str)
+                or any(
+                    (ord(character) < 32 and character != "\t")
+                    or ord(character) == 127
+                    for character in message
+                )
+            ):
+                raise ValueError("invalid stage progress event")
+            token.raise_if_cancelled()
+            elapsed = monotonic() - started_at
+            if not isfinite(elapsed) or elapsed < 0:
+                raise ValueError("invalid stage progress time")
+            eta = (
+                elapsed * (total - current) / current
+                if current > 0 and current < total
+                else 0.0 if current == total
+                else None
+            )
+            future = asyncio.run_coroutine_threadsafe(
+                self._commit_progress(
+                    task_id,
+                    stage,
+                    current=current,
+                    total=total,
+                    message=message[:512],
+                    elapsed_seconds=elapsed,
+                    eta_seconds=eta,
+                ),
+                loop,
+            )
+            future.result()
+            token.raise_if_cancelled()
         try:
-            result = await loop.run_in_executor(self._executor, self._runner.run, stage, token)
+            result = await loop.run_in_executor(
+                self._executor, self._runner.run, stage, token, relay
+            )
         except Exception:
-            await self._update(task_id, stage, TaskStatus.FAILED, 1.0, "task_failed")
+            await self._update(
+                task_id,
+                stage,
+                TaskStatus.FAILED,
+                0.0,
+                "task_failed",
+                elapsed_seconds=monotonic() - started_at,
+            )
             return
         mapped = {
             StageStatus.SUCCEEDED: TaskStatus.SUCCEEDED,
@@ -268,7 +421,14 @@ class TaskService:
             StageStatus.RUNNING: TaskStatus.CANCELLED,
         }[result.status]
         error = result.error_code if mapped is TaskStatus.FAILED else None
-        await self._update(task_id, stage, mapped, 1.0, error)
+        await self._update(
+            task_id,
+            stage,
+            mapped,
+            1.0,
+            error,
+            elapsed_seconds=monotonic() - started_at,
+        )
 
     async def cancel(self, task_id: str) -> TaskSnapshot:
         snapshot = self.get(task_id)
@@ -286,22 +446,25 @@ class TaskService:
             1.0,
         )
 
-    async def cancel_all(self) -> None:
+    async def request_cancel_all(self) -> None:
         async with self._transition_lock:
             self._started = False
-        for task_id in tuple(self._tokens):
-            await self.cancel(task_id)
+        for token in tuple(self._tokens.values()):
+            token.cancel()
+
+    async def finish_shutdown(self) -> None:
         if self._jobs:
             await asyncio.wait(self._jobs, timeout=self._shutdown_timeout)
         if not self._shutdown:
-            await asyncio.to_thread(
-                self._executor.shutdown,
-                wait=True,
-                cancel_futures=True,
-            )
+            self._executor.shutdown(wait=False, cancel_futures=True)
             self._shutdown = True
-        if self._jobs:
-            await asyncio.gather(*tuple(self._jobs), return_exceptions=True)
+        completed = tuple(job for job in self._jobs if job.done())
+        if completed:
+            await asyncio.gather(*completed, return_exceptions=True)
+
+    async def cancel_all(self) -> None:
+        await self.request_cancel_all()
+        await self.finish_shutdown()
 
 
 async def _wait_for_disconnect(websocket: WebSocket) -> None:

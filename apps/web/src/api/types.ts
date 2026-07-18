@@ -229,6 +229,12 @@ export interface TaskDto {
   status: TaskStatus
   revision: number
   error: string | null
+  progress?: number
+  current?: number | null
+  total?: number | null
+  message?: string | null
+  elapsed_seconds?: number
+  eta_seconds?: number | null
 }
 
 export interface ErrorEnvelopeDto {
@@ -244,6 +250,11 @@ export interface TaskProgressEvent {
   revision: number
   stage: StageName
   progress: number
+  current?: number | null
+  total?: number | null
+  message?: string | null
+  elapsed_seconds?: number
+  eta_seconds?: number | null
   error: Record<string, unknown> | null
 }
 

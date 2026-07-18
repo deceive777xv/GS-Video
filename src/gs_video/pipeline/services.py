@@ -5,7 +5,7 @@ import json
 import os
 import re
 import stat
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -26,11 +26,17 @@ from gs_video.camera.serialization import (
     write_mapped_trajectory,
 )
 from gs_video.composite.alpha import composite_frame
-from gs_video.domain.contracts import MaskSequence, Prompt, StageResult
+from gs_video.domain.contracts import (
+    MaskSequence,
+    Prompt,
+    SegmentationBackend,
+    StageResult,
+)
 from gs_video.domain.errors import RepairableError
 from gs_video.domain.models import (
     ArtifactRole,
     Project,
+    SceneSummary,
     StageName,
     StageState,
     StageStatus,
@@ -43,6 +49,8 @@ from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
 from gs_video.project.cache import cache_key
 from gs_video.scene.camera import OrbitCamera
+from gs_video.scene.worker_client import RendererWorkerClient
+from gs_video.scene.worker_protocol import RenderSequenceRequest
 from gs_video.segmentation.paths import has_reparse_component
 
 
@@ -52,6 +60,7 @@ CAMERA_IMPLEMENTATION_VERSION = "opencv-camera-adapter-v1"
 TRAJECTORY_IMPLEMENTATION_VERSION = "trajectory-map-v1"
 COMPOSITE_IMPLEMENTATION_VERSION = "full-resolution-composite-v1"
 EXPORT_IMPLEMENTATION_VERSION = "verified-export-v1"
+RENDER_IMPLEMENTATION_VERSION = "renderer-worker-adapter-v1"
 _FRAME_NAME = re.compile(r"^(\d{6})\.(png|jpg)$")
 
 
@@ -92,8 +101,8 @@ class MediaIngestBackend(Protocol):
 
 
 class ForegroundSegmenterLike(Protocol):
-    backend: object
-    worker_prefix: Sequence[str]
+    backend: SegmentationBackend
+    worker_prefix: tuple[str, ...]
     model_config: Path
     checkpoint: Path
 
@@ -258,6 +267,37 @@ def _source_material(
     if snapshot != _FileSnapshot(summary.size, summary.sha256):
         raise RepairableError("源视频与已登记摘要不一致")
     return source, summary, snapshot
+
+
+def _scene_material(
+    paths: WorkflowPaths,
+    project: Project,
+    token: CancellationToken,
+) -> tuple[Path, SceneSummary, _FileSnapshot]:
+    summary = project.workflow.scene_summary
+    if project.scene_ply is None or summary is None:
+        raise RepairableError("尚未导入 Gaussian 场景")
+    relative = Path(project.scene_ply)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise RepairableError("Gaussian 场景路径无效")
+    scene = (paths.root / relative).absolute()
+    source_root = (paths.root / "source").absolute()
+    try:
+        resolved = scene.resolve(strict=True)
+        resolved_source = source_root.resolve(strict=True)
+    except OSError as exc:
+        raise RepairableError("Gaussian 场景不可用") from exc
+    if (
+        resolved != scene
+        or not resolved.is_relative_to(resolved_source)
+        or resolved.name != summary.filename
+        or has_reparse_component(resolved)
+    ):
+        raise RepairableError("Gaussian 场景 authority 无效")
+    snapshot = _file_snapshot(resolved, "Gaussian 场景", token)
+    if snapshot.size != summary.size or snapshot.sha256 != summary.sha256:
+        raise RepairableError("Gaussian 场景与已登记摘要不一致")
+    return resolved, summary, snapshot
 
 
 def _require_exportable_dimensions(summary: VideoSummary) -> None:
@@ -1113,6 +1153,175 @@ class TrajectoryMapWorkflowService:
             output_paths=(relative,),
             cache_key=result_key,
             artifacts={ArtifactRole.MAPPED_TRAJECTORY: relative},
+        )
+
+
+class RendererWorkflowService:
+    def __init__(
+        self,
+        paths: WorkflowPaths,
+        worker: RendererWorkerClient,
+        *,
+        sh_degree: int = 3,
+        available_vram_limit_mb: int = 8192,
+    ) -> None:
+        if type(sh_degree) is not int or not 0 <= sh_degree <= 3:
+            raise ValueError("sh_degree must be an integer between 0 and 3")
+        if (
+            type(available_vram_limit_mb) is not int
+            or not 1024 <= available_vram_limit_mb <= 8192
+        ):
+            raise ValueError("available_vram_limit_mb must be between 1024 and 8192")
+        self.paths = paths
+        self.worker = worker
+        self.sh_degree = sh_degree
+        self.available_vram_limit_mb = available_vram_limit_mb
+
+    def run(
+        self,
+        project: Project,
+        namespace: object,
+        token: CancellationToken,
+        emit: ProgressEmitter,
+    ) -> StageResult:
+        token.raise_if_cancelled()
+        namespace_value = getattr(namespace, "value", namespace)
+        if namespace_value not in {"preview", "final"}:
+            raise RepairableError("渲染缓存 namespace 无效")
+        scene, scene_summary, scene_snapshot = _scene_material(
+            self.paths, project, token
+        )
+        mapped = _stage_state(project, StageName.MAP_TRAJECTORY)
+        trajectory_path = _artifact_path(
+            self.paths,
+            mapped,
+            ArtifactRole.MAPPED_TRAJECTORY,
+            "trajectories",
+            filename="trajectory.json",
+        )
+        trajectory_snapshot = _file_snapshot(
+            trajectory_path, "映射轨迹", token
+        )
+        trajectory = read_mapped_trajectory(trajectory_path)
+        summary = project.workflow.source_summary
+        if summary is None:
+            raise RepairableError("源视频摘要不可用")
+        frame_count = len(trajectory.camera_to_world)
+        if frame_count <= 0 or (
+            summary.frame_count is not None and frame_count != summary.frame_count
+        ):
+            raise RepairableError("映射轨迹帧数与源视频不一致")
+        preview_stride = (
+            1
+            if namespace_value == "final"
+            else max(1, (frame_count + 149) // 150)
+        )
+        if namespace_value == "final":
+            width, height = summary.width, summary.height
+        else:
+            width, height = _preview_size(
+                (summary.width, summary.height), project.workflow.preview_height
+            )
+        extra_framebuffer_bytes = (
+            max(0, width * height - 1920 * 1080) * 24
+        )
+        estimated_vram_mb = scene_summary.estimated_vram_mb + (
+            extra_framebuffer_bytes + 1024**2 - 1
+        ) // 1024**2
+        if estimated_vram_mb * 5 > self.available_vram_limit_mb * 4:
+            raise RepairableError("Gaussian 场景超过配置的保守显存预算")
+        identity = self.worker.probe(token=token)
+        result_key = cache_key(
+            StageName.RENDER.value,
+            {
+                "mapped_cache_key": mapped.cache_key,
+                "trajectory_sha256": trajectory_snapshot.sha256,
+                "scene_sha256": scene_snapshot.sha256,
+            },
+            {
+                "namespace": namespace_value,
+                "width": width,
+                "height": height,
+                "sh_degree": self.sh_degree,
+                "preview_stride": preview_stride,
+                "worker": {
+                    "torch": identity.torch,
+                    "gsplat": identity.gsplat,
+                    "device": identity.device,
+                },
+            },
+            RENDER_IMPLEMENTATION_VERSION,
+        )
+        expected_count = len(range(0, frame_count, preview_stride))
+
+        def build(staging: Path) -> None:
+            token.raise_if_cancelled()
+            worker_output = staging / "worker-output"
+            rendered = self.worker.render_sequence(
+                RenderSequenceRequest(
+                    type="render_sequence",
+                    scene_path=scene,
+                    camera_manifest=trajectory_path,
+                    output_dir=worker_output,
+                    width=width,
+                    height=height,
+                    sh_degree=self.sh_degree,
+                    background=(0.0, 0.0, 0.0),
+                    preview_stride=preview_stride,
+                ),
+                emit,
+                token,
+            )
+            if (
+                rendered.frame_dir.absolute() != worker_output.absolute()
+                or rendered.frame_count != expected_count
+                or rendered.width != width
+                or rendered.height != height
+                or not rendered.implementation_version
+            ):
+                raise RepairableError("渲染 worker 返回的帧序列无效")
+            for frame in rendered.frame_paths:
+                frame.replace(staging / frame.name)
+            try:
+                worker_output.rmdir()
+            except OSError as exc:
+                raise RepairableError("渲染 worker 输出包含未登记成员") from exc
+            _frame_inventory(
+                staging,
+                suffix="png",
+                image_format="PNG",
+                mode="RGB",
+                label="渲染",
+                expected_count=expected_count,
+                expected_size=(width, height),
+                token=token,
+            )
+            _assert_file_snapshot(scene, scene_snapshot, "Gaussian 场景", token)
+            _assert_file_snapshot(
+                trajectory_path, trajectory_snapshot, "映射轨迹", token
+            )
+            token.raise_if_cancelled()
+
+        output = self.paths.publisher.publish_tree("renders", result_key, build)
+        _frame_inventory(
+            output,
+            suffix="png",
+            image_format="PNG",
+            mode="RGB",
+            label="渲染",
+            expected_count=expected_count,
+            expected_size=(width, height),
+            token=token,
+        )
+        _assert_file_snapshot(scene, scene_snapshot, "Gaussian 场景", token)
+        _assert_file_snapshot(
+            trajectory_path, trajectory_snapshot, "映射轨迹", token
+        )
+        relative = self.paths.relative(output)
+        return StageResult(
+            output_paths=(relative,),
+            cache_key=result_key,
+            artifacts={ArtifactRole.RENDER_FRAMES: relative},
         )
 
 

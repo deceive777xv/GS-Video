@@ -17,7 +17,7 @@ from gs_video.domain.models import Project, StageName, StageState, StageStatus
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.domain.errors import CancelledError
 from gs_video.pipeline.cancellation import CancellationToken
-from gs_video.pipeline.events import ProgressEmitter
+from gs_video.pipeline.events import ProgressEmitter, discard_progress
 from gs_video.pipeline.runner import PipelineRunner
 from gs_video.project.repository import ProjectRepository
 
@@ -32,13 +32,24 @@ class StaticDoctor:
 
 
 class SucceedingRunner:
-    def run(self, name: StageName, token: CancellationToken) -> StageState:
+    def run(
+        self,
+        name: StageName,
+        token: CancellationToken,
+        emit: ProgressEmitter = discard_progress,
+    ) -> StageState:
+        del emit
         token.raise_if_cancelled()
         return StageState(status=StageStatus.SUCCEEDED, cache_key=f"{name.value}-key")
 
 
 class RunnerLike(Protocol):
-    def run(self, name: StageName, token: CancellationToken) -> StageState: ...
+    def run(
+        self,
+        name: StageName,
+        token: CancellationToken,
+        emit: ProgressEmitter = discard_progress,
+    ) -> StageState: ...
 
 
 class CancelAwareRunner:
@@ -46,7 +57,13 @@ class CancelAwareRunner:
         self.started = Event()
         self.cancelled = Event()
 
-    def run(self, name: StageName, token: CancellationToken) -> StageState:
+    def run(
+        self,
+        name: StageName,
+        token: CancellationToken,
+        emit: ProgressEmitter = discard_progress,
+    ) -> StageState:
+        del emit
         del name
         self.started.set()
         while True:
@@ -64,8 +81,13 @@ class SlowShutdownRunner:
         self.started = Event()
         self.finished = Event()
 
-    def run(self, name: StageName, token: CancellationToken) -> StageState:
-        del name, token
+    def run(
+        self,
+        name: StageName,
+        token: CancellationToken,
+        emit: ProgressEmitter = discard_progress,
+    ) -> StageState:
+        del name, token, emit
         self.started.set()
         self.finished.wait(self.delay)
         self.finished.set()
@@ -76,8 +98,13 @@ class SupersededRunner:
     def __init__(self, status: StageStatus = StageStatus.STALE) -> None:
         self.status = status
 
-    def run(self, name: StageName, token: CancellationToken) -> StageState:
-        del name, token
+    def run(
+        self,
+        name: StageName,
+        token: CancellationToken,
+        emit: ProgressEmitter = discard_progress,
+    ) -> StageState:
+        del name, token, emit
         return StageState(status=self.status)
 
 
@@ -108,6 +135,59 @@ class RecordingWorkerRegistry:
         self.terminate_calls += 1
 
 
+class FakePreviewService:
+    def render_pick(self, *args: object) -> object:
+        del args
+        raise AssertionError("preview rendering is outside this test")
+
+
+class RecordingProgressRunner:
+    def __init__(self) -> None:
+        self.emitted = Event()
+        self.release = Event()
+
+    def run(
+        self,
+        name: StageName,
+        token: CancellationToken,
+        emit: ProgressEmitter = discard_progress,
+    ) -> StageState:
+        emit(12, 30, "渲染背景 12/30")
+        self.emitted.set()
+        self.release.wait(2)
+        token.raise_if_cancelled()
+        return StageState(status=StageStatus.SUCCEEDED)
+
+
+class RegistryBoundRunner:
+    def __init__(self) -> None:
+        self.started = Event()
+        self.worker_terminated = Event()
+        self.finished = Event()
+
+    def run(
+        self,
+        name: StageName,
+        token: CancellationToken,
+        emit: ProgressEmitter = discard_progress,
+    ) -> StageState:
+        del name, token, emit
+        self.started.set()
+        assert self.worker_terminated.wait(2)
+        self.finished.set()
+        return StageState(status=StageStatus.CANCELLED)
+
+
+class ReleasingWorkerRegistry(RecordingWorkerRegistry):
+    def __init__(self, release: Event) -> None:
+        super().__init__()
+        self._release = release
+
+    async def terminate_all(self) -> None:
+        await super().terminate_all()
+        self._release.set()
+
+
 def make_app(
     tmp_path: Path,
     *,
@@ -123,6 +203,7 @@ def make_app(
         environment_doctor=StaticDoctor(),
         pipeline_runner=runner or SucceedingRunner(),
         worker_registry=registry,
+        preview_service=FakePreviewService(),
     )
     settings = ApiSettings(
         bind_host="127.0.0.1",
@@ -162,6 +243,44 @@ def test_task_state_is_recoverable_without_websocket(tmp_path: Path) -> None:
     assert snapshot["status"] in {"queued", "running", "succeeded"}
     assert snapshot["target_stage"] == "segment"
     assert snapshot["revision"] >= 1
+
+
+def test_stage_progress_is_recoverable_from_rest_and_matches_event(
+    tmp_path: Path,
+) -> None:
+    runner = RecordingProgressRunner()
+    app, _ = make_app(tmp_path, runner=runner)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    try:
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/v1/tasks", json={"target_stage": "render"}, headers=headers
+            ).json()
+            assert runner.emitted.wait(1)
+            snapshot = client.get(
+                f"/api/v1/tasks/{created['id']}", headers=headers
+            ).json()
+            events = app.state.event_bus.after(snapshot["revision"] - 1)
+            assert events is not None
+            matching = events[-1].model_dump(mode="json")
+
+            assert snapshot["current"] == 12
+            assert snapshot["total"] == 30
+            assert snapshot["progress"] == pytest.approx(0.4)
+            assert snapshot["message"] == "渲染背景 12/30"
+            assert snapshot["elapsed_seconds"] >= 0
+            assert snapshot["eta_seconds"] is None or snapshot["eta_seconds"] >= 0
+            for field in (
+                "current",
+                "total",
+                "progress",
+                "message",
+                "elapsed_seconds",
+                "eta_seconds",
+            ):
+                assert matching[field] == snapshot[field]
+    finally:
+        runner.release.set()
 
 
 @pytest.mark.parametrize("stage_status", [StageStatus.STALE, StageStatus.RUNNING])
@@ -245,6 +364,11 @@ def test_websocket_authenticates_then_resumes_events(tmp_path: Path) -> None:
         "revision",
         "stage",
         "progress",
+        "current",
+        "total",
+        "message",
+        "elapsed_seconds",
+        "eta_seconds",
         "error",
     }
 
@@ -280,6 +404,59 @@ def test_lifespan_terminates_registered_worker_processes(tmp_path: Path) -> None
         assert registry.terminate_calls == 0
 
     assert registry.terminate_calls == 1
+
+
+def test_lifespan_terminates_worker_before_waiting_for_blocked_task(
+    tmp_path: Path,
+) -> None:
+    repository = ProjectRepository(tmp_path / "shutdown-order")
+    repository.save(repository.create("shutdown-order"))
+    runner = RegistryBoundRunner()
+    registry = ReleasingWorkerRegistry(runner.worker_terminated)
+    services = ApiServices(
+        project_repository=repository,
+        environment_doctor=StaticDoctor(),
+        pipeline_runner=runner,
+        worker_registry=registry,
+        preview_service=FakePreviewService(),
+    )
+    settings = ApiSettings(
+        bind_host="127.0.0.1",
+        port=0,
+        session_token=TOKEN,
+        allowed_origins=(ORIGIN,),
+        shutdown_timeout=0.1,
+    )
+    with TestClient(create_app(settings, services)) as client:
+        client.post(
+            "/api/v1/tasks",
+            json={"target_stage": "render"},
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        assert runner.started.wait(1)
+
+    assert registry.terminate_calls == 1
+    assert runner.finished.is_set()
+
+
+def test_create_app_rejects_missing_explicit_preview_service(tmp_path: Path) -> None:
+    repository = ProjectRepository(tmp_path / "missing-preview")
+    repository.save(repository.create("missing-preview"))
+    services = ApiServices(
+        project_repository=repository,
+        environment_doctor=StaticDoctor(),
+        pipeline_runner=SucceedingRunner(),
+        worker_registry=RecordingWorkerRegistry(),
+    )
+    settings = ApiSettings(
+        bind_host="127.0.0.1",
+        port=0,
+        session_token=TOKEN,
+        allowed_origins=(ORIGIN,),
+    )
+
+    with pytest.raises(ValueError, match="preview service"):
+        create_app(settings, services)
 
 
 def test_task_cancel_maps_to_pipeline_cancellation_token(tmp_path: Path) -> None:
@@ -427,7 +604,9 @@ def test_event_subscription_queue_is_bounded_and_requests_resync() -> None:
     asyncio.run(exercise())
 
 
-def test_lifespan_waits_for_task_thread_before_worker_cleanup(tmp_path: Path) -> None:
+def test_lifespan_bounds_task_thread_cleanup_after_worker_termination(
+    tmp_path: Path,
+) -> None:
     runner = SlowShutdownRunner()
     app, registry = make_app(
         tmp_path, runner=runner, shutdown_timeout=0.05
@@ -440,5 +619,5 @@ def test_lifespan_waits_for_task_thread_before_worker_cleanup(tmp_path: Path) ->
         )
         assert runner.started.wait(1)
 
-    assert runner.finished.is_set()
     assert registry.terminate_calls == 1
+    assert runner.finished.wait(1)

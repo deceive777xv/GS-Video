@@ -2,10 +2,18 @@ from __future__ import annotations
 
 from enum import StrEnum
 from ipaddress import ip_address
+from math import isfinite
 from pathlib import Path, PurePath, PureWindowsPath
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 from gs_video.domain.models import Project, StageName
 from gs_video.environment.doctor import EnvironmentReport
@@ -244,6 +252,17 @@ class TaskSnapshot(StrictModel):
     status: str
     revision: int
     error: str | None = None
+    progress: float = Field(default=0.0, ge=0.0, le=1.0, allow_inf_nan=False)
+    current: int | None = Field(default=None, ge=0)
+    total: int | None = Field(default=None, gt=0)
+    message: str | None = Field(default=None, max_length=512)
+    elapsed_seconds: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+    eta_seconds: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_progress_authority(self) -> TaskSnapshot:
+        _validate_task_progress_fields(self)
+        return self
 
 
 class TaskEvent(StrictModel):
@@ -252,7 +271,37 @@ class TaskEvent(StrictModel):
     revision: int
     stage: str
     progress: float = Field(ge=0.0, le=1.0)
+    current: int | None = Field(default=None, ge=0)
+    total: int | None = Field(default=None, gt=0)
+    message: str | None = Field(default=None, max_length=512)
+    elapsed_seconds: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+    eta_seconds: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     error: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def validate_progress_authority(self) -> TaskEvent:
+        _validate_task_progress_fields(self)
+        return self
+
+
+def _validate_task_progress_fields(value: TaskSnapshot | TaskEvent) -> None:
+    if (value.current is None) != (value.total is None):
+        raise ValueError("current and total must be reported together")
+    if value.current is not None and value.total is not None:
+        if value.current > value.total:
+            raise ValueError("current must not exceed total")
+        expected = value.current / value.total
+        if abs(value.progress - expected) > 1e-12:
+            raise ValueError("progress must equal current / total")
+    if not isfinite(value.elapsed_seconds) or (
+        value.eta_seconds is not None and not isfinite(value.eta_seconds)
+    ):
+        raise ValueError("task times must be finite")
+    if value.message is not None and any(
+        (ord(character) < 32 and character != "\t") or ord(character) == 127
+        for character in value.message
+    ):
+        raise ValueError("task messages must not contain control characters")
 
 
 class UploadCreateRequest(StrictModel):

@@ -64,8 +64,45 @@ function taskEvent(value: unknown): TaskEvent | null {
     typeof candidate.task_id === 'string' &&
     Number.isSafeInteger(candidate.revision) &&
     typeof candidate.stage === 'string' &&
-    typeof candidate.progress === 'number'
+    typeof candidate.progress === 'number' &&
+    Number.isFinite(candidate.progress) &&
+    (candidate.error === null || (
+      typeof candidate.error === 'object' && candidate.error !== null
+    ))
   ) {
+    const detailFields = [
+      'current', 'total', 'message', 'elapsed_seconds', 'eta_seconds',
+    ]
+    const presentDetails = detailFields.filter((field) => field in candidate)
+    if (presentDetails.length === 0) return candidate as unknown as TaskEvent
+    if (presentDetails.length !== detailFields.length) return null
+    if (
+      !(candidate.current === null || Number.isSafeInteger(candidate.current)) ||
+      !(candidate.total === null || Number.isSafeInteger(candidate.total)) ||
+      !(candidate.message === null || typeof candidate.message === 'string') ||
+      typeof candidate.elapsed_seconds !== 'number' ||
+      !Number.isFinite(candidate.elapsed_seconds) ||
+      candidate.elapsed_seconds < 0 ||
+      !(candidate.eta_seconds === null || (
+        typeof candidate.eta_seconds === 'number' &&
+        Number.isFinite(candidate.eta_seconds) &&
+        candidate.eta_seconds >= 0
+      ))
+    ) return null
+    const current = candidate.current as number | null
+    const total = candidate.total as number | null
+    const message = candidate.message as string | null
+    if ((current === null) !== (total === null)) return null
+    if (current !== null && total !== null && (
+      current < 0 || total <= 0 || current > total ||
+      Math.abs(candidate.progress - current / total) > 1e-12
+    )) return null
+    if (message !== null && (
+      message.length > 512 || [...message].some((character) => {
+        const code = character.charCodeAt(0)
+        return (code < 32 && character !== '\t') || code === 127
+      })
+    )) return null
     return candidate as unknown as TaskEvent
   }
   return null
@@ -247,6 +284,29 @@ export function createTaskStore(
     state = Object.freeze(next)
     for (const listener of listeners) listener()
   }
+  const eventFromRest = (task: TaskDto): TaskEvent | null => {
+    if (
+      typeof task.progress !== 'number' ||
+      task.current === undefined ||
+      task.total === undefined ||
+      task.message === undefined ||
+      typeof task.elapsed_seconds !== 'number' ||
+      task.eta_seconds === undefined
+    ) return null
+    return taskEvent({
+      type: 'task_event',
+      task_id: task.id,
+      revision: task.revision,
+      stage: task.target_stage,
+      progress: task.progress,
+      current: task.current,
+      total: task.total,
+      message: task.message,
+      elapsed_seconds: task.elapsed_seconds,
+      eta_seconds: task.eta_seconds,
+      error: null,
+    })
+  }
   const replaceFromRest = (task: TaskDto): void => {
     if (disposed) return
     trackedTaskId = task.id
@@ -259,6 +319,7 @@ export function createTaskStore(
       task,
       revision: Math.max(state.revision, task.revision),
       pendingResyncRevision,
+      latestEvent: eventFromRest(task) ?? state.latestEvent,
     })
   }
   const acknowledgeResync = (revision: number, task: TaskDto | null): void => {
@@ -272,6 +333,9 @@ export function createTaskStore(
         && revision < state.pendingResyncRevision
         ? state.pendingResyncRevision
         : null,
+      latestEvent: task === null
+        ? state.latestEvent
+        : eventFromRest(task) ?? state.latestEvent,
     })
   }
   const retryDelay = (): Promise<void> =>
@@ -332,6 +396,7 @@ export function createTaskStore(
           recoveringRevision,
         ),
         pendingResyncRevision: stillPending,
+        latestEvent: eventFromRest(result.task) ?? state.latestEvent,
       })
     }
   }

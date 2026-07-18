@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import os
 import subprocess
@@ -494,6 +495,32 @@ def test_client_terminates_process_tree_before_parent_exits(tmp_path: Path) -> N
         )
 
     assert tree_calls == [False]
+
+
+def test_terminate_all_stops_an_active_segmentation_worker(tmp_path: Path) -> None:
+    class RecordingGuard:
+        def terminate(self, *, force: bool) -> bool:
+            tree_calls.append(force)
+            return False
+
+        def close(self) -> None:
+            return
+
+    process = FakeProcess([])
+    tree_calls: list[bool] = []
+    client = _client(tmp_path, process, tree_guard_factory=lambda _: RecordingGuard())
+    frames = _frames(tmp_path, ("000001.jpg",))
+    actual_process, guard, gate = client._start_worker(
+        frames[0].parent, tmp_path / "masks", Prompt(0, 1, 1)
+    )
+
+    asyncio.run(client.terminate_all())
+
+    assert actual_process is process
+    assert tree_calls == [False]
+    assert process.terminated and process.returncode is not None
+    client._cleanup_process(process, guard, (None, None), [])
+    client._remove_startup_gate(gate)
 
 
 def test_client_reaps_worker_when_tree_guard_assignment_fails(tmp_path: Path) -> None:

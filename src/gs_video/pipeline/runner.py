@@ -111,7 +111,13 @@ class PipelineRunner:
         self.project = result.project
         return self.project.stages.get(name, StageState()), result.applied
 
-    def run(self, name: StageName, token: CancellationToken) -> StageState:
+    def run(
+        self,
+        name: StageName,
+        token: CancellationToken,
+        emit: ProgressEmitter | None = None,
+    ) -> StageState:
+        run_emit = self.emit if emit is None else emit
         if name not in self.stages:
             raise ValueError(f"unregistered target stage: {name.value}")
         state = self.project.stages.setdefault(name, StageState())
@@ -123,7 +129,7 @@ class PipelineRunner:
             return state
 
         for dependency in self.dependencies.get(name, ()):
-            dependency_state = self.run(dependency, token)
+            dependency_state = self.run(dependency, token, run_emit)
             if dependency_state.status is not StageStatus.SUCCEEDED:
                 return state
 
@@ -157,7 +163,7 @@ class PipelineRunner:
 
         try:
             token.raise_if_cancelled()
-            result = self.stages[name].execute(self.project, token, self.emit)
+            result = self.stages[name].execute(self.project, token, run_emit)
             token.raise_if_cancelled()
             terminal = state.model_copy(deep=True)
             terminal.status = StageStatus.SUCCEEDED

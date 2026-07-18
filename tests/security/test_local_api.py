@@ -22,6 +22,7 @@ from gs_video.app import create_app
 from gs_video.domain.models import StageName, StageState, StageStatus
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.pipeline.cancellation import CancellationToken
+from gs_video.pipeline.events import ProgressEmitter, discard_progress
 from gs_video.project.repository import ProjectRepository
 
 
@@ -35,13 +36,25 @@ class StaticDoctor:
 
 
 class SucceedingRunner:
-    def run(self, name: StageName, token: CancellationToken) -> StageState:
+    def run(
+        self,
+        name: StageName,
+        token: CancellationToken,
+        emit: ProgressEmitter = discard_progress,
+    ) -> StageState:
+        del name, token, emit
         return StageState(status=StageStatus.SUCCEEDED)
 
 
 class NoopWorkerRegistry:
     async def terminate_all(self) -> None:
         return None
+
+
+class UnusedPreviewService:
+    def render_pick(self, *args: object) -> object:
+        del args
+        raise AssertionError("preview rendering is outside this test")
 
 
 def make_security_app(root: Path, *, max_active_uploads: int = 64) -> FastAPI:
@@ -52,6 +65,7 @@ def make_security_app(root: Path, *, max_active_uploads: int = 64) -> FastAPI:
         environment_doctor=StaticDoctor(),
         pipeline_runner=SucceedingRunner(),
         worker_registry=NoopWorkerRegistry(),
+        preview_service=UnusedPreviewService(),
     )
     settings = ApiSettings(
         bind_host="127.0.0.1",
@@ -747,6 +761,7 @@ def test_upload_completion_can_retry_after_project_update_failure(tmp_path: Path
         environment_doctor=StaticDoctor(),
         pipeline_runner=SucceedingRunner(),
         worker_registry=NoopWorkerRegistry(),
+        preview_service=UnusedPreviewService(),
     )
     settings = ApiSettings(
         bind_host="127.0.0.1",
@@ -1163,7 +1178,7 @@ def test_disk_full_has_stable_non_retryable_storage_error(
     }
 
 
-def test_run_api_validates_loopback_before_invoking_uvicorn(
+def test_run_api_rejects_empty_launcher_token_before_invoking_uvicorn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = 0
@@ -1175,30 +1190,52 @@ def test_run_api_validates_loopback_before_invoking_uvicorn(
 
     monkeypatch.setattr(uvicorn, "run", fake_run)
 
-    with pytest.raises(ValidationError):
-        local_app.run_api("0.0.0.0", 8000)
+    with pytest.raises(ValueError, match="session token"):
+        local_app.run_api(object(), "")  # type: ignore[arg-type]
 
     assert calls == 0
 
 
-def test_run_api_generates_private_token_and_uses_bounded_uvicorn_options(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_run_api_uses_launcher_token_and_bounded_uvicorn_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     captured: dict[str, object] = {}
+    repository = ProjectRepository(tmp_path / "run-api")
+    repository.save(repository.create("run-api"))
+    settings = ApiSettings(
+        bind_host="127.0.0.1",
+        port=0,
+        session_token=TOKEN,
+        allowed_origins=(ORIGIN,),
+    )
+    services = ApiServices(
+        project_repository=repository,
+        environment_doctor=StaticDoctor(),
+        pipeline_runner=SucceedingRunner(),
+        worker_registry=NoopWorkerRegistry(),
+        preview_service=UnusedPreviewService(),
+    )
 
     def fake_run(app: FastAPI, **kwargs: object) -> None:
         captured["app"] = app
         captured.update(kwargs)
 
     monkeypatch.setattr(uvicorn, "run", fake_run)
+    monkeypatch.setattr(
+        local_app,
+        "assemble_api_services",
+        lambda config, session_token: (settings, services),
+    )
 
-    exit_code = local_app.run_api("127.0.0.1", 0)
+    exit_code = local_app.run_api(object(), TOKEN)  # type: ignore[arg-type]
 
     assert exit_code == 0
     api = captured.pop("app")
     assert isinstance(api, FastAPI)
     token = api.state.settings.session_token.get_secret_value()
-    assert len(token) >= 32
+    assert token == TOKEN
     assert captured == {
         "host": "127.0.0.1",
         "port": 0,

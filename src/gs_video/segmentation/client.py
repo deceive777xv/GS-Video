@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import queue
@@ -8,6 +9,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO, cast
 
@@ -25,6 +27,12 @@ from gs_video.segmentation.tree_guard import (
 
 ProcessFactory = Callable[..., Any]
 TreeGuardFactory = Callable[[Any], ProcessTreeGuard]
+
+
+@dataclass(frozen=True)
+class _ActiveWorker:
+    process: Any
+    guard: ProcessTreeGuard
 
 
 class VideoSegmenterClient:
@@ -48,6 +56,8 @@ class VideoSegmenterClient:
         self._process_factory = process_factory
         self._tree_guard_factory = tree_guard_factory
         self.log_path = log_path or self.model_config.parent / "logs" / "segmentation-worker.log"
+        self._active: set[_ActiveWorker] = set()
+        self._active_lock = threading.Lock()
 
     def _command(
         self, frames_dir: Path, output_dir: Path, prompt: Prompt, startup_gate: Path
@@ -143,9 +153,14 @@ class VideoSegmenterClient:
             self._reap_direct_best_effort(process)
             self._remove_startup_gate(gate)
             raise GsVideoError("无法建立 segmentation worker 进程树隔离") from exc
+        active = _ActiveWorker(process, guard)
+        with self._active_lock:
+            self._active.add(active)
         try:
             self._release_startup_gate(gate)
         except BaseException as exc:
+            with self._active_lock:
+                self._active.discard(active)
             try:
                 guard.close()
             except BaseException:
@@ -214,6 +229,8 @@ class VideoSegmenterClient:
         except BaseException as exc:
             truncated = True
             stderr_chunks.append(f"\n[segmentation tree guard close error: {exc}]\n")
+        with self._active_lock:
+            self._active.discard(_ActiveWorker(process, guard))
         live = [thread for thread in threads if thread is not None]
         for thread in live:
             thread.join(timeout=0.5)
@@ -236,6 +253,18 @@ class VideoSegmenterClient:
             self._write_stderr(stderr_chunks)
         except OSError:
             return
+
+    def _terminate_all_sync(self) -> None:
+        with self._active_lock:
+            workers = tuple(self._active)
+        for worker in workers:
+            try:
+                self._stop(worker.process, worker.guard)
+            except BaseException:
+                continue
+
+    async def terminate_all(self) -> None:
+        await asyncio.to_thread(self._terminate_all_sync)
 
     @staticmethod
     def _overlaps(first: Path, second: Path) -> bool:

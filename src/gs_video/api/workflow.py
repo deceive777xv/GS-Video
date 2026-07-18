@@ -25,10 +25,14 @@ from gs_video.domain.models import (
     StageStatus,
     SubjectPromptState,
 )
+from gs_video.domain.errors import GsVideoError
 from gs_video.pipeline.artifacts import validate_cache_key
 from gs_video.scene.camera import OrbitCamera
 from gs_video.scene.gsplat_renderer import GsplatRenderer
 from gs_video.scene.ply import load_gaussian_ply
+from gs_video.scene.worker_client import RendererWorkerClient
+from gs_video.scene.worker_protocol import OrbitCameraPayload, RenderPickRequest
+from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.segmentation.paths import has_reparse_component
 
 
@@ -668,6 +672,141 @@ class GsplatPreviewService:
             return self._renderer.render_pick(
                 self._cached_scene, camera, width=width, height=height  # type: ignore[arg-type]
             )
+
+
+class WorkerPreviewService:
+    """Render API pick buffers through the isolated renderer worker."""
+
+    def __init__(
+        self,
+        worker: RendererWorkerClient,
+        *,
+        available_vram_limit_mb: int = 8192,
+    ) -> None:
+        if (
+            type(available_vram_limit_mb) is not int
+            or not 1024 <= available_vram_limit_mb <= 8192
+        ):
+            raise ValueError("available_vram_limit_mb must be between 1024 and 8192")
+        self._worker = worker
+        self._available_vram_limit_mb = available_vram_limit_mb
+
+    def render_pick(
+        self,
+        project_root: Path,
+        scene_path: str,
+        scene_summary: SceneSummary,
+        camera: OrbitCamera,
+        width: int,
+        height: int,
+    ) -> PickBuffer:
+        extra_framebuffer_bytes = (
+            max(0, width * height - 1920 * 1080) * 24
+        )
+        estimated_vram_mb = scene_summary.estimated_vram_mb + (
+            extra_framebuffer_bytes + 1024**2 - 1
+        ) // 1024**2
+        if estimated_vram_mb * 5 > self._available_vram_limit_mb * 4:
+            raise ApiError(
+                422,
+                code="scene_vram_limit_exceeded",
+                category="resource",
+                message="The Gaussian scene exceeds the configured VRAM admission limit.",
+            )
+        try:
+            root = project_root.resolve(strict=True)
+            scene = (root / scene_path).resolve(strict=True)
+            source_root = (root / "source").resolve(strict=True)
+            before = scene.stat()
+        except OSError as error:
+            raise ApiError(
+                409,
+                code="scene_unavailable",
+                category="project",
+                message="The Gaussian scene is unavailable.",
+            ) from error
+        if (
+            not scene.is_relative_to(source_root)
+            or not scene.is_file()
+            or has_reparse_component(scene)
+            or not stat.S_ISREG(before.st_mode)
+            or (int(before.st_dev), int(before.st_ino)) == (0, 0)
+            or before.st_nlink != 1
+            or before.st_size != scene_summary.size
+            or scene.name != scene_summary.filename
+        ):
+            raise ApiError(
+                409,
+                code="scene_unavailable",
+                category="project",
+                message="The Gaussian scene is unavailable.",
+            )
+        if (
+            _stable_file_sha256(scene, before, expected_size=scene_summary.size)
+            != scene_summary.sha256
+        ):
+            raise ApiError(
+                409,
+                code="scene_changed",
+                category="conflict",
+                message="The Gaussian scene no longer matches its imported summary.",
+                retryable=True,
+            )
+        preview_root = root / "previews"
+        output = preview_root / f".worker-pick-{uuid4().hex}.npz"
+        try:
+            buffer = self._worker.render_pick(
+                RenderPickRequest(
+                    type="render_pick",
+                    scene_path=scene,
+                    output_npz=output,
+                    camera=OrbitCameraPayload(
+                        target=camera.target,
+                        distance=camera.distance,
+                        yaw=camera.yaw,
+                        pitch=camera.pitch,
+                        fov_y_degrees=camera.fov_y_degrees,
+                    ),
+                    width=width,
+                    height=height,
+                ),
+                CancellationToken(),
+            )
+            try:
+                after = scene.stat()
+            except OSError as error:
+                raise ApiError(
+                    409,
+                    code="scene_changed",
+                    category="conflict",
+                    message="The Gaussian scene changed while the preview was rendered.",
+                    retryable=True,
+                ) from error
+            if (
+                _file_fingerprint(after) != _file_fingerprint(before)
+                or _stable_file_sha256(
+                    scene, after, expected_size=scene_summary.size
+                )
+                != scene_summary.sha256
+            ):
+                raise ApiError(
+                    409,
+                    code="scene_changed",
+                    category="conflict",
+                    message="The Gaussian scene changed while the preview was rendered.",
+                    retryable=True,
+                )
+            return buffer
+        except GsVideoError as error:
+            raise ApiError(
+                500,
+                code="preview_worker_failed",
+                category="render",
+                message="The isolated preview renderer failed.",
+                retryable=True,
+            ) from error
+        finally:
+            output.unlink(missing_ok=True)
 
 
 class PreviewArtifactStore:

@@ -31,6 +31,7 @@ from gs_video.domain.models import (
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.media.ffmpeg import VideoMetadata
 from gs_video.pipeline.cancellation import CancellationToken
+from gs_video.pipeline.events import ProgressEmitter, discard_progress
 from gs_video.project.repository import ProjectRepository
 from gs_video.scene.camera import OrbitCamera
 
@@ -47,7 +48,13 @@ class StaticDoctor:
 
 
 class SucceedingRunner:
-    def run(self, name: StageName, token: CancellationToken) -> StageState:
+    def run(
+        self,
+        name: StageName,
+        token: CancellationToken,
+        emit: ProgressEmitter = discard_progress,
+    ) -> StageState:
+        del emit
         token.raise_if_cancelled()
         return StageState(status=StageStatus.SUCCEEDED, cache_key=f"{name.value}-key")
 

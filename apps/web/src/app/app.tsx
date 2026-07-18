@@ -477,7 +477,17 @@ export function App({
           {activeTask === null ? (
             <span className="task-copy"><strong>准备就绪</strong><small>阶段状态保存在项目中</small></span>
           ) : (
-            <span className="task-copy"><strong>{activeTask.target_stage} · {activeTask.status}</strong><small>revision {activeTask.revision} · {taskState.connection}</small></span>
+            <span className="task-copy">
+              <strong>{activeTask.target_stage} · {activeTask.status}</strong>
+              <small>
+                {progressEvent?.message ?? `revision ${activeTask.revision}`}
+                {progressEvent?.eta_seconds !== null
+                  && progressEvent?.eta_seconds !== undefined
+                  ? ` · ETA ${Math.ceil(progressEvent.eta_seconds)}s`
+                  : ''}
+                {` · ${taskState.connection}`}
+              </small>
+            </span>
           )}
           {progressEvent !== null && progressPercent !== null ? (
             <div

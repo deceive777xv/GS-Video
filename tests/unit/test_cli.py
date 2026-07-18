@@ -1,4 +1,6 @@
+import io
 import json
+from pathlib import Path
 
 import pytest
 
@@ -49,16 +51,40 @@ def test_no_option_prints_help_and_returns_zero(capsys: pytest.CaptureFixture[st
     assert "usage:" in capsys.readouterr().out
 
 
-def test_serve_uses_default_host_and_port(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, int]] = []
+def test_serve_refuses_missing_runtime_configuration(tmp_path: Path) -> None:
+    missing = (tmp_path / "runtime.json").absolute()
 
-    def fake_run_api(host: str, port: int) -> int:
-        calls.append((host, port))
+    with pytest.raises(SystemExit, match="runtime configuration"):
+        cli.main(["--serve", "--runtime-config", str(missing), "--session-token-stdin"])
+
+
+def test_serve_loads_runtime_and_reads_one_bounded_private_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    runtime = (tmp_path / "runtime.json").absolute()
+    runtime.write_text("{}", encoding="utf-8")
+    loaded = object()
+    calls: list[tuple[object, str]] = []
+
+    def fake_run_api(config: object, token: str) -> int:
+        calls.append((config, token))
         return 7
 
+    monkeypatch.setattr(cli, "load_runtime_config", lambda path: loaded)
     monkeypatch.setattr("gs_video.app.run_api", fake_run_api)
+    monkeypatch.setattr("sys.stdin", io.StringIO("private-token\nignored\n"))
 
-    exit_code = cli.main(["--serve"])
+    exit_code = cli.main(
+        ["--serve", "--runtime-config", str(runtime), "--session-token-stdin"]
+    )
 
     assert exit_code == 7
-    assert calls == [("127.0.0.1", 0)]
+    assert calls == [(loaded, "private-token")]
+    captured = capsys.readouterr()
+    assert "private-token" not in captured.out
+    assert "private-token" not in captured.err
+
+
+def test_serve_requires_runtime_config_and_private_stdin_token() -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["--serve"])

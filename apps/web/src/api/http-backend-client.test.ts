@@ -585,6 +585,35 @@ describe('WebSocketTaskEventSource', () => {
 })
 
 describe('recoverable task store', () => {
+  it('restores determinate progress from REST without fabricating an ETA', () => {
+    const store = createTaskStore(fakeBackendClient())
+    const restored: TaskDto = {
+      ...task(12),
+      progress: 0.4,
+      current: 12,
+      total: 30,
+      message: '渲染背景 12/30',
+      elapsed_seconds: 4.5,
+      eta_seconds: null,
+    }
+
+    store.replaceFromRest(restored)
+
+    expect(store.snapshot().latestEvent).toEqual({
+      type: 'task_event',
+      task_id: restored.id,
+      revision: 12,
+      stage: 'segment',
+      progress: 0.4,
+      current: 12,
+      total: 30,
+      message: '渲染背景 12/30',
+      elapsed_seconds: 4.5,
+      eta_seconds: null,
+      error: null,
+    })
+  })
+
   it('converges through REST when the live event source observes a revision jump', async () => {
     vi.useFakeTimers()
     const sockets: FakeWebSocket[] = []

@@ -12,6 +12,7 @@ from gs_video.app import create_app
 from gs_video.domain.models import StageName, StageState, StageStatus
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.pipeline.cancellation import CancellationToken
+from gs_video.pipeline.events import ProgressEmitter, discard_progress
 from gs_video.pipeline.runner import PipelineRunner
 from gs_video.project.repository import ProjectRepository
 
@@ -37,7 +38,13 @@ class BlockingDoctor:
 
 
 class SucceedingRunner:
-    def run(self, name: StageName, token: CancellationToken) -> StageState:
+    def run(
+        self,
+        name: StageName,
+        token: CancellationToken,
+        emit: ProgressEmitter = discard_progress,
+    ) -> StageState:
+        del emit
         token.raise_if_cancelled()
         return StageState(status=StageStatus.SUCCEEDED, cache_key=f"{name.value}-key")
 
@@ -50,6 +57,12 @@ class RecordingWorkerRegistry:
         self.terminate_calls += 1
 
 
+class UnusedPreviewService:
+    def render_pick(self, *args: object) -> object:
+        del args
+        raise AssertionError("preview rendering is outside this test")
+
+
 @pytest.fixture
 def api_client(tmp_path: Path) -> Iterator[TestClient]:
     repository = ProjectRepository(tmp_path / "project")
@@ -59,6 +72,7 @@ def api_client(tmp_path: Path) -> Iterator[TestClient]:
         environment_doctor=StaticDoctor(),
         pipeline_runner=SucceedingRunner(),
         worker_registry=RecordingWorkerRegistry(),
+        preview_service=UnusedPreviewService(),
     )
     settings = ApiSettings(
         bind_host="127.0.0.1",
@@ -159,6 +173,7 @@ def test_blocked_environment_probe_does_not_stall_other_rest_requests(
         environment_doctor=doctor,
         pipeline_runner=SucceedingRunner(),
         worker_registry=RecordingWorkerRegistry(),
+        preview_service=UnusedPreviewService(),
     )
     settings = ApiSettings(
         bind_host="127.0.0.1",
@@ -205,6 +220,7 @@ def test_unassembled_production_workflow_is_rejected_before_task_admission(
             compare_and_set_stage=repository.compare_and_set_stage,
         ),
         worker_registry=RecordingWorkerRegistry(),
+        preview_service=UnusedPreviewService(),
     )
     settings = ApiSettings(
         bind_host="127.0.0.1", port=0, session_token=TOKEN,

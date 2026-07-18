@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import secrets
-import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -16,19 +13,13 @@ from pydantic import SecretStr
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from gs_video.api.events import EventBus, TaskService
-from gs_video.api.assets import AssetInspector, ExportInspector
+from gs_video.api.assets import ExportInspector
 from gs_video.api.middleware import LocalSecurityBoundary
 from gs_video.api.routes import ApiServices, build_router
 from gs_video.api.schemas import ApiError, ApiSettings, ErrorEnvelope
 from gs_video.api.uploads import UploadManager
-from gs_video.api.workflow import (
-    GsplatPreviewService,
-    PreviewArtifactStore,
-    PreviewCoordinator,
-)
-from gs_video.environment.doctor import EnvironmentDoctor
-from gs_video.pipeline.runner import PipelineRunner
-from gs_video.project.repository import ProjectRepository
+from gs_video.api.workflow import PreviewArtifactStore, PreviewCoordinator
+from gs_video.runtime import WorkflowRuntimeConfig, assemble_api_services
 
 
 def _error_response(status_code: int, envelope: ErrorEnvelope) -> JSONResponse:
@@ -36,6 +27,8 @@ def _error_response(status_code: int, envelope: ErrorEnvelope) -> JSONResponse:
 
 
 def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
+    if services.preview_service is None:
+        raise ValueError("production API services require an explicit preview service")
     event_bus = EventBus(settings.event_window)
     task_service = TaskService(
         services.pipeline_runner,
@@ -57,12 +50,15 @@ def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
             yield
         finally:
             try:
-                await app.state.task_service.cancel_all()
+                await app.state.task_service.request_cancel_all()
             finally:
                 try:
                     await app.state.services.worker_registry.terminate_all()
                 finally:
-                    await asyncio.to_thread(app.state.upload_manager.close)
+                    try:
+                        await app.state.task_service.finish_shutdown()
+                    finally:
+                        await asyncio.to_thread(app.state.upload_manager.close)
 
     app = FastAPI(
         title="GS Video local API",
@@ -77,7 +73,7 @@ def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
     app.state.event_bus = event_bus
     app.state.task_service = task_service
     app.state.upload_manager = upload_manager
-    app.state.preview_service = services.preview_service or GsplatPreviewService()
+    app.state.preview_service = services.preview_service
     app.state.preview_artifacts = PreviewArtifactStore(
         services.project_repository.root
     )
@@ -147,45 +143,20 @@ def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
     return app
 
 
-def run_api(host: str, port: int) -> int:
-    settings = ApiSettings(
-        bind_host=host,
-        port=port,
-        session_token=SecretStr(secrets.token_urlsafe(32)),
-        allowed_origins=(),
+def run_api(config: WorkflowRuntimeConfig, session_token: str) -> int:
+    if (
+        not session_token
+        or len(session_token) > 4096
+        or any(ord(character) < 32 or ord(character) == 127 for character in session_token)
+    ):
+        raise ValueError("session token must contain between 1 and 4096 characters")
+    settings, services = assemble_api_services(config, SecretStr(session_token))
+    app = create_app(settings, services)
+    uvicorn.run(
+        app,
+        host=settings.bind_host,
+        port=settings.port,
+        access_log=False,
+        log_config=None,
     )
-    with tempfile.TemporaryDirectory(prefix="gs-video-api-") as temporary:
-        repository = ProjectRepository(Path(temporary) / "project")
-        project = repository.create("GS Video session")
-        repository.save(project)
-        services = ApiServices(
-            project_repository=repository,
-            environment_doctor=EnvironmentDoctor(),
-            pipeline_runner=PipelineRunner(
-                project,
-                {},
-                save=repository.save,
-                persist_stage=repository.update_stage,
-                compare_and_set_stage=repository.compare_and_set_stage,
-                claim_stage=repository.claim_stage,
-            ),
-            worker_registry=_NoopWorkerRegistry(),
-            asset_inspector=AssetInspector(),
-        )
-        app = create_app(settings, services)
-        try:
-            uvicorn.run(
-                app,
-                host=settings.bind_host,
-                port=settings.port,
-                access_log=False,
-                log_config=None,
-            )
-        finally:
-            app.state.upload_manager.close()
     return 0
-
-
-class _NoopWorkerRegistry:
-    async def terminate_all(self) -> None:
-        return None
