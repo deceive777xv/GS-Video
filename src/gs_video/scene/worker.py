@@ -22,7 +22,9 @@ from gs_video.scene.worker_protocol import (
     RenderSequenceRequest,
     WorkerEvent,
     WorkerRequest,
+    assert_safe_directory,
     encode_worker_event,
+    ensure_safe_directory,
     read_worker_request,
 )
 from gs_video.segmentation.paths import has_reparse_component
@@ -79,11 +81,10 @@ def _require_owned_output(path: Path, *, directory: bool) -> None:
     del directory
     requested = Path(path).absolute()
     parent = requested.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    if has_reparse_component(parent):
-        raise ValueError("renderer output parent contains a link or reparse point")
+    parent_identity = ensure_safe_directory(parent)
     if requested.exists() or requested.is_symlink():
         raise ValueError("renderer output must not exist before rendering")
+    assert_safe_directory(parent, parent_identity)
 
 
 @dataclass(frozen=True)
@@ -219,8 +220,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--request", type=Path, required=True)
     parser.add_argument("--startup-gate", type=Path, required=True)
     arguments = parser.parse_args(argv)
+    explicit_argv = argv is not None
     previous_protocol_stream = _PROTOCOL_STREAM
-    _PROTOCOL_STREAM = sys.stdout.buffer
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_stdout_fd = os.dup(1)
+    protocol_stream = os.fdopen(os.dup(saved_stdout_fd), "wb", closefd=True)
+    os.dup2(2, 1)
+    _PROTOCOL_STREAM = protocol_stream
     try:
         request = read_worker_request(arguments.request)
         _wait_for_startup_gate(arguments.startup_gate)
@@ -238,7 +245,16 @@ def main(argv: list[str] | None = None) -> int:
             pass
         return 1 if code == "system_error" else 0
     finally:
-        _PROTOCOL_STREAM = previous_protocol_stream
+        try:
+            protocol_stream.flush()
+        finally:
+            _PROTOCOL_STREAM = previous_protocol_stream
+            if explicit_argv:
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os.dup2(saved_stdout_fd, 1)
+            protocol_stream.close()
+            os.close(saved_stdout_fd)
 
 
 if __name__ == "__main__":

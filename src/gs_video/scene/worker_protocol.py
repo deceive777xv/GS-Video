@@ -24,6 +24,7 @@ from gs_video.segmentation.paths import has_reparse_component
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 MAX_EVENT_BYTES = 64 * 1024
 MAX_EVENT_MESSAGE_CHARS = 512
+DirectoryIdentity: TypeAlias = tuple[int, int]
 
 
 class _StrictModel(BaseModel):
@@ -222,6 +223,59 @@ def _identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
     )
 
 
+def _directory_identity(metadata: os.stat_result) -> DirectoryIdentity:
+    return int(metadata.st_dev), int(metadata.st_ino)
+
+
+def _directory_chain(path: Path) -> tuple[Path, ...]:
+    absolute = Path(path).absolute()
+    parts = absolute.parts
+    if not parts:
+        raise OSError("directory path is empty")
+    current = Path(parts[0])
+    chain = [current]
+    for part in parts[1:]:
+        current /= part
+        chain.append(current)
+    return tuple(chain)
+
+
+def _validate_existing_directory_chain(path: Path) -> None:
+    for component in _directory_chain(path):
+        try:
+            metadata = component.lstat()
+        except FileNotFoundError:
+            continue
+        if has_reparse_component(component) or not stat.S_ISDIR(metadata.st_mode):
+            raise OSError("directory chain contains a link, reparse point, or non-directory")
+
+
+def ensure_safe_directory(path: Path) -> DirectoryIdentity:
+    directory = Path(path).absolute()
+    _validate_existing_directory_chain(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    _validate_existing_directory_chain(directory)
+    metadata = directory.lstat()
+    if has_reparse_component(directory) or not stat.S_ISDIR(metadata.st_mode):
+        raise OSError("created directory is not an ordinary non-reparse directory")
+    identity = _directory_identity(metadata)
+    if _directory_identity(directory.lstat()) != identity:
+        raise OSError("directory identity changed during validation")
+    return identity
+
+
+def assert_safe_directory(path: Path, expected: DirectoryIdentity) -> None:
+    directory = Path(path).absolute()
+    _validate_existing_directory_chain(directory)
+    metadata = directory.lstat()
+    if (
+        has_reparse_component(directory)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or _directory_identity(metadata) != expected
+    ):
+        raise OSError("directory identity changed during operation")
+
+
 def read_worker_request(path: Path) -> WorkerRequest:
     requested = Path(path).absolute()
     if has_reparse_component(requested):
@@ -262,9 +316,7 @@ def write_worker_request(path: Path, request: WorkerRequest) -> None:
     if not encoded or len(encoded) > MAX_REQUEST_BYTES:
         raise ValueError("renderer request exceeds the 16 MiB limit")
     destination = Path(path).absolute()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if has_reparse_component(destination.parent):
-        raise OSError("renderer request parent contains a link or reparse point")
+    parent_identity = ensure_safe_directory(destination.parent)
     temporary = destination.parent / f".{destination.name}.staging-{uuid.uuid4().hex}"
     try:
         with temporary.open("xb") as stream:
@@ -272,6 +324,7 @@ def write_worker_request(path: Path, request: WorkerRequest) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, destination)
+        assert_safe_directory(destination.parent, parent_identity)
     finally:
         temporary.unlink(missing_ok=True)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import queue
 import stat
@@ -10,7 +11,7 @@ import time
 import uuid
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, cast
 
 import numpy as np
@@ -32,15 +33,19 @@ from gs_video.scene.worker_protocol import (
     RenderSequenceRequest,
     WorkerEvent,
     WorkerRequest,
+    assert_safe_directory,
+    ensure_safe_directory,
     parse_worker_event,
     write_worker_request,
 )
-from gs_video.segmentation.paths import has_reparse_component, is_wsl_prefix, worker_path
+from gs_video.segmentation.paths import has_reparse_component, worker_path
 from gs_video.segmentation.tree_guard import ProcessTreeGuard, create_process_tree_guard
 
 
 MAX_DIAGNOSTIC_BYTES = 1024 * 1024
 MAX_PICK_BYTES = 512 * 1024 * 1024
+MAX_STDOUT_EVENTS = 64
+PNG_OVERHEAD_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -54,6 +59,12 @@ class RendererWorkerIdentity:
 class _ActiveWorker:
     process: Any
     guard: ProcessTreeGuard
+
+
+@dataclass(frozen=True)
+class _FrameSnapshot:
+    identity: tuple[int, int, int, int, int, int]
+    sha256: str
 
 
 def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
@@ -78,7 +89,8 @@ class RendererWorkerClient:
     ) -> None:
         if not worker_prefix or any(not item for item in worker_prefix):
             raise ValueError("worker prefix must contain nonempty argv entries")
-        if is_wsl_prefix(worker_prefix):
+        executable_name = PureWindowsPath(worker_prefix[0]).name.lower()
+        if executable_name in {"wsl", "wsl.exe"}:
             raise ValueError(
                 "WSL renderer worker is unsupported until JSON payload paths are translated"
             )
@@ -94,18 +106,23 @@ class RendererWorkerClient:
     @staticmethod
     def _create_control_file(parent: Path, label: str, contents: bytes) -> Path:
         root = Path(parent).absolute()
-        root.mkdir(parents=True, exist_ok=True)
-        if has_reparse_component(root):
-            raise GsVideoError(f"renderer {label} parent contains a link or reparse point")
+        try:
+            root_identity = ensure_safe_directory(root)
+        except OSError as exc:
+            raise GsVideoError(
+                f"renderer {label} parent contains a link or reparse point"
+            ) from exc
         path = root / f".gs-video-renderer-{label}-{uuid.uuid4().hex}"
         with path.open("xb") as stream:
             stream.write(contents)
             stream.flush()
             os.fsync(stream.fileno())
+        assert_safe_directory(root, root_identity)
         return path
 
     @staticmethod
     def _release_gate(gate: Path) -> None:
+        parent_identity = ensure_safe_directory(gate.parent)
         release = gate.parent / f".{gate.name}.release-{uuid.uuid4().hex}"
         try:
             with release.open("xb") as stream:
@@ -113,6 +130,7 @@ class RendererWorkerClient:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(release, gate)
+            assert_safe_directory(gate.parent, parent_identity)
         finally:
             release.unlink(missing_ok=True)
 
@@ -200,7 +218,19 @@ class RendererWorkerClient:
         return process, guard
 
     @staticmethod
-    def _stdout_reader(stream: Any, target: queue.Queue[bytes | None]) -> None:
+    def _stdout_reader(
+        stream: Any,
+        target: queue.Queue[bytes | None],
+        overflow: threading.Event,
+    ) -> None:
+        def enqueue(payload: bytes | None) -> bool:
+            try:
+                target.put(payload, timeout=0.05)
+            except queue.Full:
+                overflow.set()
+                return False
+            return True
+
         try:
             while True:
                 chunk = stream.readline(MAX_EVENT_BYTES + 1)
@@ -208,18 +238,21 @@ class RendererWorkerClient:
                     return
                 payload = chunk.encode("utf-8") if isinstance(chunk, str) else bytes(chunk)
                 if len(payload) > MAX_EVENT_BYTES or not payload.endswith(b"\n"):
-                    target.put(b"x" * (MAX_EVENT_BYTES + 1))
+                    if not overflow.is_set():
+                        enqueue(b"x" * (MAX_EVENT_BYTES + 1))
                     while payload and not payload.endswith(b"\n"):
                         more = stream.readline(MAX_EVENT_BYTES + 1)
                         if more in (b"", ""):
                             break
                         payload = more.encode("utf-8") if isinstance(more, str) else bytes(more)
                     continue
-                target.put(payload)
+                if not overflow.is_set():
+                    enqueue(payload)
         except (OSError, ValueError):
             return
         finally:
-            target.put(None)
+            if not overflow.is_set():
+                enqueue(None)
 
     @staticmethod
     def _stderr_reader(stream: Any, chunks: list[bytes], truncated: list[bool]) -> None:
@@ -263,8 +296,9 @@ class RendererWorkerClient:
         marker = b"\n[renderer worker diagnostics truncated]\n"
         if truncated:
             payload = payload[: max(0, MAX_DIAGNOSTIC_BYTES - len(marker))] + marker
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        if has_reparse_component(self.log_path.parent):
+        try:
+            parent_identity = ensure_safe_directory(self.log_path.parent)
+        except OSError:
             return
         temporary = self.log_path.parent / (
             f".{self.log_path.name}.staging-{uuid.uuid4().hex}"
@@ -282,6 +316,7 @@ class RendererWorkerClient:
             ):
                 raise OSError("renderer diagnostic staging file is unsafe")
             os.replace(temporary, self.log_path)
+            assert_safe_directory(self.log_path.parent, parent_identity)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -339,9 +374,12 @@ class RendererWorkerClient:
     def _validate_before_start(request: WorkerRequest, log_path: Path) -> None:
         if isinstance(request, ProbeRequest):
             parent = log_path.parent.absolute()
-            parent.mkdir(parents=True, exist_ok=True)
-            if has_reparse_component(parent):
-                raise GsVideoError("renderer log parent contains a link or reparse point")
+            try:
+                ensure_safe_directory(parent)
+            except OSError as exc:
+                raise GsVideoError(
+                    "renderer log parent contains a link or reparse point"
+                ) from exc
             return
         RendererWorkerClient._require_owned_file(request.scene_path, "Gaussian scene")
         inputs: tuple[Path, ...]
@@ -353,8 +391,11 @@ class RendererWorkerClient:
             output = request.output_npz
             inputs = (request.scene_path,)
         parent = output.parent.absolute()
-        parent.mkdir(parents=True, exist_ok=True)
-        if has_reparse_component(parent) or output.exists() or output.is_symlink():
+        try:
+            ensure_safe_directory(parent)
+        except OSError as exc:
+            raise GsVideoError("renderer output parent contains a link or reparse point") from exc
+        if output.exists() or output.is_symlink():
             raise GsVideoError("renderer output must be a new path beneath an ordinary parent")
         output_resolved = output.absolute()
         for input_path in inputs:
@@ -391,9 +432,12 @@ class RendererWorkerClient:
             process, guard = self._start_worker(request_path, gate)
             if process.stdout is None or process.stderr is None:
                 raise GsVideoError("renderer worker pipes are unavailable")
-            lines: queue.Queue[bytes | None] = queue.Queue()
+            lines: queue.Queue[bytes | None] = queue.Queue(maxsize=MAX_STDOUT_EVENTS)
+            stdout_overflow = threading.Event()
             stdout_thread = threading.Thread(
-                target=self._stdout_reader, args=(process.stdout, lines), daemon=True
+                target=self._stdout_reader,
+                args=(process.stdout, lines, stdout_overflow),
+                daemon=True,
             )
             stderr_thread = threading.Thread(
                 target=self._stderr_reader,
@@ -411,6 +455,8 @@ class RendererWorkerClient:
             exit_drain_deadline: float | None = None
             while True:
                 token.raise_if_cancelled()
+                if stdout_overflow.is_set():
+                    raise GsVideoError("renderer worker stdout queue overflow")
                 if process.poll() is not None and exit_drain_deadline is None:
                     exit_drain_deadline = time.monotonic() + 1.0
                 timeout = 0.05
@@ -471,8 +517,11 @@ class RendererWorkerClient:
             self._safe_unlink(gate)
 
     @staticmethod
-    def _validate_png(path: Path, width: int, height: int) -> None:
-        RendererWorkerClient._require_owned_file(path, "render frame")
+    def _validate_png(path: Path, width: int, height: int) -> _FrameSnapshot:
+        maximum = width * height * 4 + height + PNG_OVERHEAD_BYTES
+        RendererWorkerClient._require_owned_file(
+            path, "render frame size", maximum=maximum
+        )
         before = _file_identity(path.lstat())
         try:
             with path.open("rb") as stream:
@@ -482,6 +531,10 @@ class RendererWorkerClient:
                     if image.format != "PNG" or image.mode != "RGB" or image.size != (width, height):
                         raise GsVideoError("render frame PNG format, mode, or dimensions are invalid")
                     image.load()
+                stream.seek(0)
+                digest = hashlib.sha256()
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
                 if _file_identity(os.fstat(stream.fileno())) != before:
                     raise GsVideoError("render frame identity changed during validation")
         except (OSError, ValueError) as exc:
@@ -490,6 +543,29 @@ class RendererWorkerClient:
             raise GsVideoError("render frame is unreadable") from exc
         if _file_identity(path.lstat()) != before:
             raise GsVideoError("render frame path identity changed during validation")
+        return _FrameSnapshot(identity=before, sha256=digest.hexdigest())
+
+    @staticmethod
+    def _assert_frame_snapshot(path: Path, expected: _FrameSnapshot) -> None:
+        try:
+            before = _file_identity(path.lstat())
+            if before != expected.identity or has_reparse_component(path):
+                raise GsVideoError("render frame changed after validation")
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                if _file_identity(os.fstat(stream.fileno())) != expected.identity:
+                    raise GsVideoError("render frame changed after validation")
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+                if _file_identity(os.fstat(stream.fileno())) != expected.identity:
+                    raise GsVideoError("render frame changed after validation")
+            if (
+                _file_identity(path.lstat()) != expected.identity
+                or digest.hexdigest() != expected.sha256
+            ):
+                raise GsVideoError("render frame changed after validation")
+        except OSError as exc:
+            raise GsVideoError("render frame changed after validation") from exc
 
     def render_sequence(
         self,
@@ -514,8 +590,11 @@ class RendererWorkerClient:
         entries = tuple(sorted(request.output_dir.iterdir(), key=lambda item: item.name))
         if tuple(path.name for path in entries) != expected_names:
             raise GsVideoError("renderer output inventory differs from terminal event")
-        for path in entries:
-            self._validate_png(path, request.width, request.height)
+        snapshots = tuple(
+            self._validate_png(path, request.width, request.height) for path in entries
+        )
+        for path, snapshot in zip(entries, snapshots, strict=True):
+            self._assert_frame_snapshot(path, snapshot)
         directory_after = request.output_dir.lstat()
         if (
             has_reparse_component(request.output_dir)

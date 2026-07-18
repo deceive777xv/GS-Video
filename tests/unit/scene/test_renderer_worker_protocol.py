@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -131,7 +132,7 @@ def test_probe_request_has_no_token_field() -> None:
 
 
 def test_worker_redirects_dependency_stdout_away_from_jsonl_protocol(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
 ) -> None:
     request_path = tmp_path / "request.json"
     gate = tmp_path / "gate"
@@ -140,6 +141,7 @@ def test_worker_redirects_dependency_stdout_away_from_jsonl_protocol(
 
     def noisy_dependency(_request: object) -> ProbeEvent:
         print("dependency noise")
+        os.write(1, b"native dependency noise\n")
         return ProbeEvent(type="probe", torch="2.7", gsplat="1.5", device="cuda")
 
     monkeypatch.setattr(worker_module, "_run_validated_request", noisy_dependency)
@@ -147,9 +149,43 @@ def test_worker_redirects_dependency_stdout_away_from_jsonl_protocol(
         "--request", str(request_path), "--startup-gate", str(gate)
     ]) == 0
 
-    captured = capsys.readouterr()
+    os.write(1, b"stdout restored\n")
+    captured = capfd.readouterr()
     assert "dependency noise" not in captured.out
-    assert captured.err.strip() == "dependency noise"
-    assert json.loads(captured.out) == {
+    assert captured.err.splitlines() == ["dependency noise", "native dependency noise"]
+    stdout_lines = captured.out.splitlines()
+    assert stdout_lines[-1] == "stdout restored"
+    assert json.loads(stdout_lines[0]) == {
         "type": "probe", "torch": "2.7", "gsplat": "1.5", "device": "cuda"
     }
+
+
+def test_request_writer_does_not_create_through_symlinked_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = tmp_path / "linked"
+    try:
+        linked.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    destination = linked / "created" / "request.json"
+    with pytest.raises(OSError, match="reparse|link"):
+        write_worker_request(destination, ProbeRequest(type="probe"))
+    assert not (outside / "created").exists()
+
+
+def test_worker_output_validation_does_not_create_through_symlinked_parent(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "worker-outside"
+    outside.mkdir()
+    linked = tmp_path / "worker-linked"
+    try:
+        linked.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    with pytest.raises(OSError, match="reparse|link"):
+        worker_module._require_owned_output(linked / "created" / "frames", directory=True)
+    assert not (outside / "created").exists()

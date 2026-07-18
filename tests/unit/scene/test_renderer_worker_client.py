@@ -7,6 +7,7 @@ import os
 import subprocess
 import threading
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -261,8 +262,14 @@ def test_worker_is_registered_before_startup_gate_release(tmp_path: Path) -> Non
 
 
 def test_renderer_client_rejects_wsl_prefix_until_json_paths_are_translated() -> None:
-    with pytest.raises(ValueError, match="WSL"):
-        RendererWorkerClient(worker_prefix=("wsl.exe", "--", "python"))
+    prefixes = (
+        ("wsl",),
+        ("wsl.exe", "python"),
+        (r"C:\Windows\System32\WSL.EXE", "--", "python"),
+    )
+    for prefix in prefixes:
+        with pytest.raises(ValueError, match="WSL"):
+            RendererWorkerClient(worker_prefix=prefix)
 
 
 def test_sequence_rejects_output_path_escape_and_wrong_dimensions(tmp_path: Path) -> None:
@@ -313,9 +320,9 @@ def test_sequence_rejects_output_directory_replacement_during_validation(
     original_validate = client._validate_png
     calls = 0
 
-    def replacing_validate(path: Path, width: int, height: int) -> None:
+    def replacing_validate(path: Path, width: int, height: int) -> object:
         nonlocal calls
-        original_validate(path, width, height)
+        snapshot = original_validate(path, width, height)
         calls += 1
         if calls == 1:
             old = request.output_dir.with_name("old-frames")
@@ -323,10 +330,171 @@ def test_sequence_rejects_output_directory_replacement_during_validation(
             request.output_dir.mkdir()
             Image.new("RGB", (64, 36)).save(request.output_dir / "000001.png")
             Image.new("RGB", (64, 36)).save(request.output_dir / "000002.png")
+        return snapshot
 
     client._validate_png = replacing_validate  # type: ignore[method-assign]
-    with pytest.raises(GsVideoError, match="directory identity"):
+    with pytest.raises(GsVideoError, match="changed after validation|directory identity"):
         client.render_sequence(request, lambda *_: None, CancellationToken())
+
+
+def test_sequence_rechecks_first_frame_after_later_frame_validation(
+    tmp_path: Path,
+) -> None:
+    request = _sequence_request(tmp_path)
+    first_pose = read_mapped_trajectory(request.camera_manifest).camera_to_world[0]
+    second_pose = OrbitCamera(
+        target=(0.0, 0.0, 1.0), distance=1.0, yaw=5.0,
+        pitch=0.0, fov_y_degrees=60.0,
+    ).camera_to_world()
+    write_mapped_trajectory(
+        request.camera_manifest,
+        MappedTrajectory(fov_y_degrees=60.0, camera_to_world=(first_pose, second_pose)),
+    )
+    process = FakeProcess([
+        '{"type":"progress","current":1,"total":2,"message":"one"}\n',
+        '{"type":"progress","current":2,"total":2,"message":"two"}\n',
+        '{"type":"complete","implementation_version":"v","outputs":["000001.png","000002.png"]}\n',
+    ])
+
+    def factory(*_args: object, **_kwargs: object) -> FakeProcess:
+        request.output_dir.mkdir()
+        Image.new("RGB", (64, 36), "red").save(request.output_dir / "000001.png")
+        Image.new("RGB", (64, 36), "green").save(request.output_dir / "000002.png")
+        return process
+
+    client = _client(tmp_path, factory)
+    original_validate = client._validate_png
+    calls = 0
+
+    def rewrite_first_after_validation(path: Path, width: int, height: int) -> object:
+        nonlocal calls
+        snapshot = original_validate(path, width, height)
+        calls += 1
+        if calls == 1:
+            Image.new("RGB", (64, 36), "blue").save(path)
+        return snapshot
+
+    client._validate_png = rewrite_first_after_validation  # type: ignore[method-assign]
+    with pytest.raises(GsVideoError, match="changed after validation"):
+        client.render_sequence(request, lambda *_: None, CancellationToken())
+
+
+def test_png_validation_rejects_oversized_file_before_decode(tmp_path: Path) -> None:
+    frame = tmp_path / "frame.png"
+    Image.new("RGB", (4, 4)).save(frame)
+    with frame.open("ab") as stream:
+        stream.write(b"x" * (128 * 1024))
+
+    with pytest.raises(GsVideoError, match="size|ordinary"):
+        RendererWorkerClient._validate_png(frame, 4, 4)
+
+
+def test_png_validation_checks_header_dimensions_before_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frame = tmp_path / "frame.png"
+    frame.write_bytes(b"header")
+
+    @dataclass
+    class HeaderOnlyImage:
+        format: str = "PNG"
+        mode: str = "RGB"
+        size: tuple[int, int] = (8000, 8000)
+
+        def __enter__(self) -> HeaderOnlyImage:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return
+
+        def load(self) -> None:
+            raise AssertionError("wrong-size PNG must not be decoded")
+
+    monkeypatch.setattr(worker_client_module.Image, "open", lambda *_args: HeaderOnlyImage())
+    with pytest.raises(GsVideoError, match="dimensions"):
+        RendererWorkerClient._validate_png(frame, 4, 4)
+
+
+def test_stdout_flood_is_bounded_and_closes_tree_guard(tmp_path: Path) -> None:
+    request = _sequence_request(tmp_path)
+    pose = read_mapped_trajectory(request.camera_manifest).camera_to_world[0]
+    write_mapped_trajectory(
+        request.camera_manifest,
+        MappedTrajectory(fov_y_degrees=60.0, camera_to_world=(pose,) * 500),
+    )
+    flood = [
+        json.dumps({
+            "type": "progress", "current": index + 1, "total": 500,
+            "message": "flood",
+        }) + "\n"
+        for index in range(500)
+    ]
+    process = FakeProcess(flood)
+    guard = RecordingGuard(process)
+    client = _client(
+        tmp_path,
+        lambda *_args, **_kwargs: process,
+        guard_factory=lambda _process: guard,
+    )
+
+    with pytest.raises(GsVideoError, match="overflow"):
+        client.render_sequence(
+            request, lambda *_args: threading.Event().wait(0.1), CancellationToken()
+        )
+
+    assert guard.closed is True
+
+
+def test_client_does_not_create_output_parent_through_symlink(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = tmp_path / "linked"
+    try:
+        linked.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    scene, _manifest = _inputs(tmp_path)
+    request = RenderPickRequest(
+        type="render_pick",
+        scene_path=scene,
+        output_npz=(linked / "created" / "pick.npz").absolute(),
+        camera=OrbitCameraPayload(
+            target=(0.0, 0.0, 1.0), distance=1.0, yaw=0.0,
+            pitch=0.0, fov_y_degrees=60.0,
+        ),
+        width=4,
+        height=4,
+    )
+    client = _client(tmp_path, lambda *_args, **_kwargs: pytest.fail("must not spawn"))
+
+    with pytest.raises(GsVideoError, match="reparse|link"):
+        client.render_pick(request, CancellationToken())
+    assert not (outside / "created").exists()
+
+
+def test_control_and_log_parents_do_not_create_through_symlink(tmp_path: Path) -> None:
+    outside = tmp_path / "control-outside"
+    outside.mkdir()
+    linked = tmp_path / "control-linked"
+    try:
+        linked.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    with pytest.raises(GsVideoError, match="reparse|link"):
+        RendererWorkerClient._create_control_file(
+            linked / "control-created", "gate", b"WAIT\n"
+        )
+    client = RendererWorkerClient(
+        worker_prefix=("renderer-python",),
+        process_factory=lambda *_args, **_kwargs: pytest.fail("must not spawn"),
+        log_path=linked / "log-created" / "renderer.log",
+    )
+    with pytest.raises(GsVideoError, match="reparse|link"):
+        client.probe()
+
+    assert not (outside / "control-created").exists()
+    assert not (outside / "log-created").exists()
 
 
 @pytest.mark.parametrize("bad_depth", [np.nan, np.inf, -1.0])

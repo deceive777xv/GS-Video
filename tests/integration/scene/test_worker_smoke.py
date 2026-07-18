@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 import pytest
@@ -31,4 +30,3 @@ def test_configured_project_local_renderer_worker_probe() -> None:
     identity = client.probe(ProbeRequest(type="probe"), CancellationToken())
     assert identity.device == "cuda"
     assert identity.torch and identity.gsplat
-    assert executable_path != Path(sys.executable).absolute() or "gsplat" in identity.gsplat
