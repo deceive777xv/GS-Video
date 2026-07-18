@@ -202,7 +202,7 @@ class OpenCvCameraSolver:
             "intrinsics_prior": "square pixels, centered principal point, assumed 60 degree vertical FOV",
             "coordinate_convention": "camera-to-world; OpenCV x-right/y-down/z-forward",
             "pair_failures": sum(pair is None for pair in pairs),
-            "pairs": tuple({} if pair is None else dict(pair.diagnostics) for pair in pairs),
+            "pairs": [{} if pair is None else dict(pair.diagnostics) for pair in pairs],
         }
         return CameraSolution(intrinsics, poses, kind, confidence, diagnostics)
 

@@ -25,6 +25,7 @@ from gs_video.domain.models import (
     StageStatus,
     SubjectPromptState,
 )
+from gs_video.pipeline.artifacts import validate_cache_key
 from gs_video.scene.camera import OrbitCamera
 from gs_video.scene.gsplat_renderer import GsplatRenderer
 from gs_video.scene.ply import load_gaussian_ply
@@ -322,10 +323,11 @@ def _subject_artifact_inventory(
             message="The requested subject media is not ready.",
         )
     registered = stage.artifacts.get(definition.artifact_role)
-    if (
-        stage.cache_key is None
-        or registered != f"{definition.directory_name}/{stage.cache_key}"
-    ):
+    try:
+        cache_key = validate_cache_key(stage.cache_key or "")
+    except ValueError:
+        cache_key = None
+    if cache_key is None or registered != f"{definition.directory_name}/{cache_key}":
         raise ApiError(
             409,
             code="subject_media_contract_missing",
@@ -340,7 +342,7 @@ def _subject_artifact_inventory(
         root = requested_root.resolve(strict=True)
         requested_category_root = root / definition.directory_name
         allowed_root = requested_category_root.resolve(strict=True)
-        requested_artifact_root = allowed_root / stage.cache_key
+        requested_artifact_root = allowed_root / cache_key
         artifact_root = requested_artifact_root.resolve(strict=True)
         entries = tuple(sorted(artifact_root.iterdir(), key=lambda path: path.name))
     except OSError as error:
@@ -353,6 +355,7 @@ def _subject_artifact_inventory(
     if (
         allowed_root != requested_category_root
         or artifact_root != requested_artifact_root
+        or artifact_root.parent != allowed_root
         or not artifact_root.is_dir()
         or has_reparse_component(artifact_root)
         or not entries

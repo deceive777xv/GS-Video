@@ -37,6 +37,8 @@ from gs_video.scene.camera import OrbitCamera
 
 TOKEN = "workflow-session-token"
 ORIGIN = "http://127.0.0.1:5173"
+INGEST_CACHE_KEY = "1" * 64
+SEGMENT_CACHE_KEY = "2" * 64
 
 
 class StaticDoctor:
@@ -103,8 +105,8 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
         estimated_vram_mb=1,
     )
     (repository.root / "exports" / "final.mp4").write_bytes(b"verified-video")
-    proxy_root = repository.root / "proxies" / "ingest-key"
-    mask_root = repository.root / "masks" / "segment-key"
+    proxy_root = repository.root / "proxies" / INGEST_CACHE_KEY
+    mask_root = repository.root / "masks" / SEGMENT_CACHE_KEY
     proxy_root.mkdir()
     mask_root.mkdir()
     for index in range(1, 6):
@@ -119,13 +121,13 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
     )
     project.stages[StageName.INGEST] = StageState(
         status=StageStatus.SUCCEEDED,
-        cache_key="ingest-key",
-        artifacts={ArtifactRole.PROXY_FRAMES: "proxies/ingest-key"},
+        cache_key=INGEST_CACHE_KEY,
+        artifacts={ArtifactRole.PROXY_FRAMES: f"proxies/{INGEST_CACHE_KEY}"},
     )
     project.stages[StageName.SEGMENT] = StageState(
         status=StageStatus.SUCCEEDED,
-        cache_key="segment-key",
-        artifacts={ArtifactRole.SUBJECT_MASKS: "masks/segment-key"},
+        cache_key=SEGMENT_CACHE_KEY,
+        artifacts={ArtifactRole.SUBJECT_MASKS: f"masks/{SEGMENT_CACHE_KEY}"},
     )
     project.stages[StageName.EXPORT] = StageState(
         status=StageStatus.SUCCEEDED,
@@ -600,7 +602,7 @@ def test_subject_prompt_requires_authoritative_proxy_bounds(
 def test_subject_prompt_can_be_cleared_without_proxy_validation(
     workflow_client: TestClient, auth_headers: dict[str, str], tmp_path: Path
 ) -> None:
-    for proxy in (tmp_path / "project" / "proxies" / "ingest-key").glob("*.jpg"):
+    for proxy in (tmp_path / "project" / "proxies" / INGEST_CACHE_KEY).glob("*.jpg"):
         proxy.unlink()
 
     response = workflow_client.patch(
@@ -914,7 +916,7 @@ def test_subject_alpha_requires_a_successful_prompt_bound_segment(
     "stage_mutation",
     [
         {"cache_key": None},
-        {"artifacts": {ArtifactRole.PROXY_FRAMES: "./proxies/ingest-key"}},
+        {"artifacts": {ArtifactRole.PROXY_FRAMES: f"./proxies/{INGEST_CACHE_KEY}"}},
     ],
 )
 def test_subject_proxy_requires_exact_typed_stage_authority(
@@ -938,14 +940,51 @@ def test_subject_proxy_requires_exact_typed_stage_authority(
     assert response.status_code == 409
 
 
+def test_subject_proxy_rejects_noncanonical_cache_keys_even_when_target_exists(
+    workflow_client: TestClient,
+    auth_headers: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    repository = workflow_client.app.state.services.project_repository
+    project_root = tmp_path / "project"
+    canonical_root = project_root / "proxies" / INGEST_CACHE_KEY
+    cases = (
+        (str(canonical_root), canonical_root),
+        (f"../proxies/{INGEST_CACHE_KEY}", canonical_root),
+        ("abc", project_root / "proxies" / "abc"),
+        ("A" * 64, project_root / "proxies" / ("A" * 64)),
+    )
+
+    for cache_key, target in cases:
+        if target != canonical_root:
+            target.mkdir(parents=True)
+            for source in canonical_root.glob("*.jpg"):
+                (target / source.name).write_bytes(source.read_bytes())
+
+        def mutate(project: object) -> None:
+            stage = project.stages[StageName.INGEST]  # type: ignore[attr-defined]
+            stage.cache_key = cache_key
+            stage.artifacts = {
+                ArtifactRole.PROXY_FRAMES: f"proxies/{cache_key}"
+            }
+
+        repository.update(mutate)
+        response = workflow_client.get(
+            "/api/v1/projects/current/subject-media/proxy",
+            headers=auth_headers,
+        )
+        assert response.status_code == 409, cache_key
+        assert response.json()["code"] == "subject_media_contract_missing"
+
+
 def test_subject_media_rejects_noncanonical_inventory_and_dimensions(
     workflow_client: TestClient,
     auth_headers: dict[str, str],
     tmp_path: Path,
 ) -> None:
     project_root = tmp_path / "project"
-    proxy_root = project_root / "proxies" / "ingest-key"
-    mask_root = project_root / "masks" / "segment-key"
+    proxy_root = project_root / "proxies" / INGEST_CACHE_KEY
+    mask_root = project_root / "masks" / SEGMENT_CACHE_KEY
     (proxy_root / "extra.jpg").write_bytes(b"not a frame")
 
     invalid_inventory = workflow_client.get(
@@ -972,7 +1011,7 @@ def test_subject_media_descriptor_becomes_stale_when_bytes_change(
         "/api/v1/projects/current/subject-media/proxy", headers=auth_headers
     ).json()
     Image.new("RGB", (16, 9), (200, 10, 30)).save(
-        tmp_path / "project" / "proxies" / "ingest-key" / "000005.jpg"
+        tmp_path / "project" / "proxies" / INGEST_CACHE_KEY / "000005.jpg"
     )
 
     stale = workflow_client.get(

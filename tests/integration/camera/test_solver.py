@@ -8,6 +8,7 @@ import pytest
 
 from gs_video.camera.classify import CameraKind
 from gs_video.camera.opencv_solver import OpenCvCameraSolver, smooth_translations
+from gs_video.camera.serialization import read_camera_solution, write_camera_solution
 from gs_video.domain.errors import CancelledError, UnsupportedMaterialError
 from gs_video.pipeline.cancellation import CancellationToken
 
@@ -89,6 +90,26 @@ def test_pure_fixed_sequence_is_solved_without_essential_translation(tmp_path: P
     for frame_pose in solution.camera_to_world:
         np.testing.assert_allclose(frame_pose, np.eye(4), atol=1e-8)
     assert "60" in solution.diagnostics["intrinsics_prior"]
+
+
+def test_solver_diagnostics_are_json_native_and_round_trip(tmp_path: Path) -> None:
+    image = _texture()
+    solution = OpenCvCameraSolver().solve(
+        _write_frames(tmp_path / "frames", [image, image.copy()]),
+        lambda *_: None,
+        CancellationToken(),
+    )
+
+    assert isinstance(solution.diagnostics["pairs"], list)
+    destination = tmp_path / "camera" / "solution.json"
+    write_camera_solution(destination, solution)
+    restored = read_camera_solution(destination)
+
+    assert restored.diagnostics == solution.diagnostics
+    for actual, expected in zip(
+        restored.camera_to_world, solution.camera_to_world, strict=True
+    ):
+        np.testing.assert_allclose(actual, expected)
 
 
 def test_fixed_pair_uses_measured_homography_support(

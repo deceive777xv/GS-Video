@@ -28,6 +28,12 @@ PathIdentity = tuple[int, int, int | None]
 _DIRECTORY_MODE = 0o777 if os.name == "nt" else 0o700
 
 
+def validate_cache_key(cache_key: str) -> str:
+    if len(cache_key) != 64 or any(character not in _HEX for character in cache_key):
+        raise ValueError("artifact cache key must be 64 lowercase hexadecimal characters")
+    return cache_key
+
+
 def _identity(metadata: os.stat_result) -> PathIdentity:
     device = int(metadata.st_dev)
     inode = int(metadata.st_ino)
@@ -198,8 +204,7 @@ class ArtifactPublisher:
     ) -> Path:
         if category not in PUBLISHABLE_CATEGORIES:
             raise ValueError("artifact category is not publishable")
-        if len(cache_key) != 64 or any(character not in _HEX for character in cache_key):
-            raise ValueError("artifact cache key must be 64 lowercase hexadecimal characters")
+        validate_cache_key(cache_key)
         if _ordinary_directory(self.root) != self._root_identity:
             raise OSError("artifact root identity changed")
 
