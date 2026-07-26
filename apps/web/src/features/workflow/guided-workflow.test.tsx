@@ -178,6 +178,8 @@ function createHarness(initial = project()) {
       has_audio: true, verified: true,
     })),
     fetchExportArtifact: vi.fn(async () => new Blob(['mp4'], { type: 'video/mp4' })),
+    getCompositePreview: vi.fn(),
+    fetchCompositePreviewArtifact: vi.fn(),
     copyVerifiedExport: vi.fn(async () => undefined),
     getSubjectMedia: vi.fn(async (role: SubjectMediaRole): Promise<SubjectMediaDto> => ({
       role, artifact_id: `${role}-1`, frame_index: 0,

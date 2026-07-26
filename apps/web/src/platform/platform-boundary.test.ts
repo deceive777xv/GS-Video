@@ -64,6 +64,8 @@ const fakeClient = (): BackendClient => ({
   confirmCamera: vi.fn(),
   getVerifiedExport: vi.fn(),
   fetchExportArtifact: vi.fn(),
+  getCompositePreview: vi.fn(),
+  fetchCompositePreviewArtifact: vi.fn(),
   copyVerifiedExport: vi.fn(),
   getSubjectMedia: vi.fn(),
   fetchSubjectMediaArtifact: vi.fn(),

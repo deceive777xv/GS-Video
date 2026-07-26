@@ -27,6 +27,12 @@ class ExportInspectorLike(Protocol):
     def probe(self, path: Path) -> VideoMetadata: ...
 
 
+class CompositePreviewInspectorLike(Protocol):
+    """Read-only MP4 metadata probe used for published composite previews."""
+
+    def probe(self, path: Path) -> VideoMetadata: ...
+
+
 class ExportInspector:
     def probe(self, path: Path) -> VideoMetadata:
         return probe_video(path)

@@ -18,6 +18,7 @@ import type {
   UploadStatusDto,
   UploadCompleteDto,
   VerifiedExportDto,
+  CompositePreviewDto,
   SubjectMediaDto,
   SubjectMediaRole,
 } from './types'
@@ -276,6 +277,19 @@ export class HttpBackendClient implements BackendClient {
     if (signal !== undefined) options.signal = signal
     return this.#request(
       `/projects/current/exports/${encodeURIComponent(id)}`,
+      options,
+    )
+  }
+
+  getCompositePreview(): Promise<CompositePreviewDto> {
+    return this.#request('/projects/current/composite-preview')
+  }
+
+  fetchCompositePreviewArtifact(id: string, signal?: AbortSignal): Promise<Blob> {
+    const options: RequestOptions = { response: 'blob' }
+    if (signal !== undefined) options.signal = signal
+    return this.#request(
+      `/artifacts/composite-previews/${encodeURIComponent(id)}`,
       options,
     )
   }

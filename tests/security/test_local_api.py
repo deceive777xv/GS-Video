@@ -19,7 +19,7 @@ from gs_video.api.routes import ApiServices
 from gs_video.api.schemas import ApiError, ApiSettings
 from gs_video.api.uploads import CHUNK_LIMIT
 from gs_video.app import create_app
-from gs_video.domain.models import StageName, StageState, StageStatus
+from gs_video.domain.models import ArtifactRole, StageName, StageState, StageStatus
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter, discard_progress
@@ -121,6 +121,56 @@ def test_rest_authentication_accepts_only_bearer_header(client_and_root) -> None
     assert query.status_code == 401
     assert wrong_scheme.status_code == 401
     assert correct.status_code == 200
+
+
+def test_composite_preview_blob_revalidates_current_stage_authority(
+    client_and_root,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    client, root = client_and_root
+    cache_key = "composite-security-key"
+    relative = f"previews/{cache_key}/composite-preview.mp4"
+    preview = root / relative
+    preview.parent.mkdir()
+    preview.write_bytes(b"composite-preview")
+    repository = client.app.state.services.project_repository
+    repository.update(
+        lambda project: project.stages.__setitem__(
+            StageName.COMPOSITE,
+            StageState(
+                status=StageStatus.SUCCEEDED,
+                cache_key=cache_key,
+                output_paths=[relative],
+                artifacts={ArtifactRole.COMPOSITE_PREVIEW: relative},
+            ),
+        )
+    )
+
+    class Inspector:
+        def probe(self, path: Path):  # type: ignore[no-untyped-def]
+            assert path == preview
+            from gs_video.media.ffmpeg import VideoMetadata
+
+            return VideoMetadata(16, 9, 1.0, "30", frame_count=30)
+
+    monkeypatch.setattr(client.app.state, "export_inspector", Inspector())
+    descriptor = client.get(
+        "/api/v1/projects/current/composite-preview", headers=auth_headers()
+    )
+    assert descriptor.status_code == 200
+    repository.update(
+        lambda project: setattr(
+            project.stages[StageName.COMPOSITE], "status", StageStatus.STALE
+        )
+    )
+
+    stale = client.get(
+        "/api/v1/artifacts/composite-previews/"
+        f"{descriptor.json()['artifact_id']}",
+        headers=auth_headers(),
+    )
+
+    assert_stable_error(stale, status_code=409, code="composite_preview_changed")
 
 
 def test_outer_boundary_rejects_unauthorized_body_without_consuming_it(

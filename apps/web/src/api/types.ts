@@ -127,6 +127,16 @@ export type VerifiedExportDto = Omit<
   'sha256'
 >
 
+export interface CompositePreviewDto {
+  artifact_id: string
+  filename: 'composite-preview.mp4'
+  size: number
+  sha256: string
+  duration_seconds: number
+  fps: string
+  frame_count: number
+}
+
 export type SubjectMediaRole = 'proxy' | 'alpha'
 
 export interface SubjectMediaDto {

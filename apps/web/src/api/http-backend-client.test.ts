@@ -38,6 +38,8 @@ const fakeBackendClient = (currentTask = task()): BackendClient => ({
   confirmCamera: vi.fn(),
   getVerifiedExport: vi.fn(),
   fetchExportArtifact: vi.fn(),
+  getCompositePreview: vi.fn(),
+  fetchCompositePreviewArtifact: vi.fn(),
   copyVerifiedExport: vi.fn(),
   getSubjectMedia: vi.fn(),
   fetchSubjectMediaArtifact: vi.fn(),
@@ -393,6 +395,49 @@ describe('HttpBackendClient', () => {
       Blob,
     )
     expect(String(fetchImpl.mock.calls[1]?.[0])).not.toContain('secret')
+  })
+
+  it('fetches the current opaque composite preview', async () => {
+    const descriptor = {
+      artifact_id: 'composite-preview-1',
+      filename: 'composite-preview.mp4',
+      size: 14,
+      sha256: 'a'.repeat(64),
+      duration_seconds: 1,
+      fps: '30',
+      frame_count: 30,
+    }
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(descriptor), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(new Blob(['video'], { type: 'video/mp4' }), {
+          status: 200,
+          headers: { 'Content-Type': 'video/mp4' },
+        }),
+      )
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152',
+      token: 'secret',
+      fetchImpl,
+    })
+
+    await expect(client.getCompositePreview()).resolves.toEqual(descriptor)
+    await expect(
+      client.fetchCompositePreviewArtifact(descriptor.artifact_id),
+    ).resolves.toBeInstanceOf(Blob)
+    expect(fetchImpl).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining(
+        `/artifacts/composite-previews/${descriptor.artifact_id}`,
+      ),
+      expect.objectContaining({ headers: expect.any(Headers) }),
+    )
   })
 
   it('requests a local copy only for the current opaque export id', async () => {

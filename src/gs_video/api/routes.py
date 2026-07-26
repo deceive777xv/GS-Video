@@ -16,6 +16,7 @@ from gs_video.api.auth import require_session
 from gs_video.api.assets import AssetInspectorLike, ExportInspectorLike
 from gs_video.api.events import EventBus, TaskService, serve_events
 from gs_video.api.export_routes import build_export_router
+from gs_video.api.preview_routes import build_composite_preview_router
 from gs_video.api.schemas import (
     API_VERSION,
     ApiError,
@@ -821,5 +822,6 @@ def build_router() -> APIRouter:
 
     protected.include_router(build_subject_router())
     protected.include_router(build_export_router())
+    protected.include_router(build_composite_preview_router())
     router.include_router(protected)
     return router

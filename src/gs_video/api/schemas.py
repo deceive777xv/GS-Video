@@ -182,6 +182,16 @@ class VerifiedExportResponse(StrictModel):
     verified: bool
 
 
+class CompositePreviewResponse(StrictModel):
+    artifact_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    filename: Literal["composite-preview.mp4"]
+    size: int = Field(gt=0, le=256 * 1024 * 1024)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    duration_seconds: float = Field(gt=0, allow_inf_nan=False)
+    fps: str
+    frame_count: int = Field(gt=0)
+
+
 class ExportCopyRequest(StrictModel):
     destination: str = Field(min_length=1, max_length=32767)
 

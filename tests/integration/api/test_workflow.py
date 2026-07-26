@@ -86,7 +86,7 @@ class PreviewService:
 
 class ExportInspector:
     def probe(self, path: Path) -> VideoMetadata:
-        assert path.read_bytes() == b"verified-video"
+        assert path.read_bytes() in {b"verified-video", b"composite-preview"}
         return VideoMetadata(
             width=1920,
             height=1080,
@@ -112,6 +112,15 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
         estimated_vram_mb=1,
     )
     (repository.root / "exports" / "final.mp4").write_bytes(b"verified-video")
+    composite_cache_key = "composite-key"
+    preview_path = (
+        repository.root
+        / "previews"
+        / composite_cache_key
+        / "composite-preview.mp4"
+    )
+    preview_path.parent.mkdir()
+    preview_path.write_bytes(b"composite-preview")
     proxy_root = repository.root / "proxies" / INGEST_CACHE_KEY
     mask_root = repository.root / "masks" / SEGMENT_CACHE_KEY
     proxy_root.mkdir()
@@ -141,6 +150,16 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
         cache_key="export-key",
         output_paths=["exports/final.mp4"],
         artifacts={ArtifactRole.EXPORT_VIDEO: "exports/final.mp4"},
+    )
+    project.stages[StageName.COMPOSITE] = StageState(
+        status=StageStatus.SUCCEEDED,
+        cache_key=composite_cache_key,
+        output_paths=[f"previews/{composite_cache_key}/composite-preview.mp4"],
+        artifacts={
+            ArtifactRole.COMPOSITE_PREVIEW: (
+                f"previews/{composite_cache_key}/composite-preview.mp4"
+            )
+        },
     )
     repository.save(project)
     services = ApiServices(
@@ -741,6 +760,35 @@ def test_export_result_is_ffprobe_verified_persisted_and_opaque(
     assert persisted["workflow"]["export_result"]["artifact_id"] == result[
         "artifact_id"
     ]
+
+
+def test_composite_preview_is_opaque_authenticated_and_cache_bound(
+    workflow_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    descriptor = workflow_client.get(
+        "/api/v1/projects/current/composite-preview", headers=auth_headers
+    )
+
+    assert descriptor.status_code == 200
+    payload = descriptor.json()
+    assert set(payload) == {
+        "artifact_id",
+        "filename",
+        "size",
+        "sha256",
+        "duration_seconds",
+        "fps",
+        "frame_count",
+    }
+    assert "path" not in payload
+    video = workflow_client.get(
+        f"/api/v1/artifacts/composite-previews/{payload['artifact_id']}",
+        headers=auth_headers,
+    )
+
+    assert video.status_code == 200
+    assert video.content == b"composite-preview"
+    assert video.headers["content-type"] == "video/mp4"
 
 
 def test_verified_export_can_be_safely_copied_to_caller_destination(
