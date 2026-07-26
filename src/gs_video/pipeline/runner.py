@@ -168,9 +168,9 @@ class PipelineRunner:
             terminal = state.model_copy(deep=True)
             terminal.status = StageStatus.SUCCEEDED
             terminal.cache_key = result.cache_key
-            terminal.output_paths = [str(path) for path in result.output_paths]
+            terminal.output_paths = [path.as_posix() for path in result.output_paths]
             terminal.artifacts = {
-                role: str(path) for role, path in result.artifacts.items()
+                role: path.as_posix() for role, path in result.artifacts.items()
             }
         except CancelledError:
             terminal = state.model_copy(deep=True)

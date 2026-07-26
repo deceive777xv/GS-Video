@@ -162,7 +162,7 @@ def test_runner_registers_outputs_only_after_stage_returns_successfully() -> Non
     ]
     assert state.status is StageStatus.SUCCEEDED
     assert state.cache_key == "render-key"
-    assert state.output_paths == [str(Path("renders/a.png")), str(Path("renders/b.png"))]
+    assert state.output_paths == ["renders/a.png", "renders/b.png"]
     assert state.error_code is None
 
 
@@ -468,7 +468,7 @@ def test_runner_clears_stale_error_on_retry_and_success() -> None:
     assert saved[0].stages[StageName.RENDER].error_code is None
     assert state.status is StageStatus.SUCCEEDED
     assert state.error_code is None
-    assert state.output_paths == [str(Path("renders/final.png"))]
+    assert state.output_paths == ["renders/final.png"]
 
 
 def test_runner_rejects_unregistered_target_without_mutating_or_saving() -> None:

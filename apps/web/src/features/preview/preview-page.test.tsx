@@ -1,9 +1,11 @@
 import { render, screen, waitFor } from '@testing-library/react'
-import { expect, it, vi } from 'vitest'
+import { afterEach, expect, it, vi } from 'vitest'
 
 import type { BackendClient } from '../../api/backend-client'
 import type { ProjectDto, TaskDto } from '../../api/types'
 import { PreviewPage } from './preview-page'
+
+afterEach(() => vi.restoreAllMocks())
 
 it('does not admit a second composite task while the authoritative owner is active', () => {
   const project = {
@@ -134,13 +136,174 @@ it('revokes and removes a displayed frame when preview authority becomes null', 
     onStartStage: vi.fn(),
   }
   const view = render(<PreviewPage {...props} project={initial} />)
-  expect(await screen.findByRole('img', { name: '最近验证的合成参考帧' })).toHaveAttribute('src', 'blob:preview')
+  expect(await screen.findByRole('img', { name: '相机参考帧（非合成视频）' })).toHaveAttribute('src', 'blob:preview')
 
   const revoked = failedProject()
   revoked.workflow.preview = null
   view.rerender(<PreviewPage {...props} project={revoked} />)
 
-  await waitFor(() => expect(screen.queryByRole('img', { name: '最近验证的合成参考帧' })).toBeNull())
+  await waitFor(() => expect(screen.queryByRole('img', { name: '相机参考帧（非合成视频）' })).toBeNull())
   expect(createUrl).toHaveBeenCalledOnce()
   expect(revokeUrl).toHaveBeenCalledWith('blob:preview')
+})
+
+const compositeDescriptor = (artifactId: string) => ({
+  artifact_id: artifactId,
+  filename: 'composite-preview.mp4' as const,
+  size: 12,
+  sha256: artifactId.padEnd(64, 'a'),
+  duration_seconds: 2,
+  fps: '24/1',
+  frame_count: 48,
+})
+
+function compositeProject(cacheKey: string | null, status: 'pending' | 'succeeded') {
+  const current = failedProject()
+  current.stages.composite = {
+    status,
+    cache_key: cacheKey,
+    output_paths: [],
+    error_code: null,
+    artifacts: {},
+  }
+  current.workflow.preview = {
+    artifact_id: 'camera-preview', generation: 1, width: 640, height: 360,
+    camera_revision: 1, pick_buffer_revision: 1,
+    artifact_size: 7, artifact_sha256: 'b'.repeat(64),
+  }
+  return current
+}
+
+function compositeProps(backend: BackendClient, project: ProjectDto) {
+  return {
+    activeTask: null,
+    backend,
+    busy: false,
+    latestEvent: null,
+    onBackToCamera: vi.fn(),
+    onError: vi.fn(),
+    onProjectChange: vi.fn(),
+    onReselectSubject: vi.fn(),
+    onStartStage: vi.fn(),
+    project,
+  }
+}
+
+it('shows only the composite video registered by the succeeded stage', async () => {
+  vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:composite-preview')
+  vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+  const descriptor = compositeDescriptor('composite-1')
+  const backend = {
+    getCompositePreview: vi.fn(async () => descriptor),
+    fetchCompositePreviewArtifact: vi.fn(async () => new Blob(['mp4'], { type: 'video/mp4' })),
+    fetchPreviewArtifact: vi.fn(async () => new Blob(['camera'], { type: 'image/png' })),
+  } as unknown as BackendClient
+
+  render(<PreviewPage {...compositeProps(backend, compositeProject('cache-1', 'succeeded'))} />)
+
+  const video = await screen.findByLabelText('低分辨率合成预览')
+  expect(video).toHaveAttribute('controls')
+  expect(video).toHaveAttribute('playsinline')
+  expect(video).toHaveAttribute('preload', 'metadata')
+  expect(video).toHaveAttribute('src', 'blob:composite-preview')
+  expect(screen.queryByRole('img')).toBeNull()
+  expect(backend.getCompositePreview).toHaveBeenCalledOnce()
+  expect(backend.fetchCompositePreviewArtifact).toHaveBeenCalledWith(
+    descriptor.artifact_id,
+    expect.any(AbortSignal),
+  )
+})
+
+it('labels the static Gaussian frame as a camera reference only before composite success', async () => {
+  vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:camera-reference')
+  vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+  const backend = {
+    fetchPreviewArtifact: vi.fn(async () => new Blob(['camera'], { type: 'image/png' })),
+    getCompositePreview: vi.fn(),
+    fetchCompositePreviewArtifact: vi.fn(),
+  } as unknown as BackendClient
+
+  render(<PreviewPage {...compositeProps(backend, compositeProject(null, 'pending'))} />)
+
+  expect(await screen.findByRole('img', { name: '相机参考帧（非合成视频）' })).toBeVisible()
+  expect(screen.getByText('相机参考 · 非合成视频')).toBeVisible()
+  expect(screen.queryByLabelText('低分辨率合成预览')).toBeNull()
+  expect(backend.getCompositePreview).not.toHaveBeenCalled()
+})
+
+it('aborts stale composite fetches and publishes only the latest descriptor authority', async () => {
+  const createUrl = vi.spyOn(URL, 'createObjectURL')
+    .mockReturnValueOnce('blob:composite-2')
+  const revokeUrl = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+  const first = compositeDescriptor('composite-1')
+  const second = compositeDescriptor('composite-2')
+  let resolveFirst!: (blob: Blob) => void
+  let firstSignal: AbortSignal | undefined
+  const backend = {
+    getCompositePreview: vi.fn()
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(second),
+    fetchCompositePreviewArtifact: vi.fn((id: string, signal?: AbortSignal) => {
+      if (id === first.artifact_id) {
+        firstSignal = signal
+        return new Promise<Blob>((resolve) => { resolveFirst = resolve })
+      }
+      return Promise.resolve(new Blob(['new'], { type: 'video/mp4' }))
+    }),
+    fetchPreviewArtifact: vi.fn(async () => new Blob(['camera'], { type: 'image/png' })),
+  } as unknown as BackendClient
+  const firstProps = compositeProps(backend, compositeProject('cache-1', 'succeeded'))
+  const view = render(<PreviewPage {...firstProps} />)
+  await waitFor(() => expect(backend.fetchCompositePreviewArtifact).toHaveBeenCalledWith(
+    first.artifact_id,
+    expect.any(AbortSignal),
+  ))
+
+  view.rerender(
+    <PreviewPage {...firstProps} project={compositeProject('cache-2', 'succeeded')} />,
+  )
+  expect(await screen.findByLabelText('低分辨率合成预览')).toHaveAttribute(
+    'src',
+    'blob:composite-2',
+  )
+  resolveFirst(new Blob(['old'], { type: 'video/mp4' }))
+  await Promise.resolve()
+
+  expect(firstSignal?.aborted).toBe(true)
+  expect(createUrl).toHaveBeenCalledOnce()
+  expect(screen.getByLabelText('低分辨率合成预览')).toHaveAttribute(
+    'src',
+    'blob:composite-2',
+  )
+  view.unmount()
+  expect(revokeUrl).toHaveBeenCalledWith('blob:composite-2')
+})
+
+it('revokes the composite URL when authority becomes null or replacement loading fails', async () => {
+  vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:composite-1')
+  const revokeUrl = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+  const backend = {
+    getCompositePreview: vi.fn()
+      .mockResolvedValueOnce(compositeDescriptor('composite-1'))
+      .mockRejectedValueOnce(new Error('descriptor unavailable')),
+    fetchCompositePreviewArtifact: vi.fn(async () => new Blob(['first'], { type: 'video/mp4' })),
+    fetchPreviewArtifact: vi.fn(async () => new Blob(['camera'], { type: 'image/png' })),
+  } as unknown as BackendClient
+  const initialProps = compositeProps(backend, compositeProject('cache-1', 'succeeded'))
+  const view = render(<PreviewPage {...initialProps} />)
+  expect(await screen.findByLabelText('低分辨率合成预览')).toBeVisible()
+
+  view.rerender(
+    <PreviewPage {...initialProps} project={compositeProject('cache-2', 'succeeded')} />,
+  )
+  await waitFor(() => expect(initialProps.onError).toHaveBeenCalledWith(
+    expect.objectContaining({ message: 'descriptor unavailable' }),
+  ))
+  expect(screen.queryByLabelText('低分辨率合成预览')).toBeNull()
+  expect(revokeUrl).toHaveBeenCalledWith('blob:composite-1')
+
+  view.rerender(
+    <PreviewPage {...initialProps} project={compositeProject(null, 'pending')} />,
+  )
+  expect(screen.queryByLabelText('低分辨率合成预览')).toBeNull()
 })

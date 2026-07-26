@@ -21,33 +21,111 @@ export function PreviewPage({
   onBackToCamera, onReselectSubject,
 }: PreviewPageProps) {
   const [frameUrl, setFrameUrl] = useState<string | null>(null)
+  const [compositeVideo, setCompositeVideo] = useState<{
+    authority: string
+    artifactId: string
+    url: string
+  } | null>(null)
   const [motionScale, setMotionScale] = useState(String(project.workflow.motion_scale))
   const [running, setRunning] = useState(false)
-  const url = useRef<string | null>(null)
+  const frameObjectUrl = useRef<string | null>(null)
+  const compositeObjectUrl = useRef<string | null>(null)
+  const compositeRequest = useRef(0)
+  const descriptorAuthority = useRef<string | null>(null)
   const preview = project.workflow.preview
+  const composite = project.stages.composite
+  const compositeAuthority = composite?.status === 'succeeded'
+    && composite.cache_key !== null
+    && composite.cache_key !== undefined
+    ? composite.cache_key
+    : null
 
   useEffect(() => {
-    if (url.current !== null) {
-      URL.revokeObjectURL(url.current)
-      url.current = null
+    if (frameObjectUrl.current !== null) {
+      URL.revokeObjectURL(frameObjectUrl.current)
+      frameObjectUrl.current = null
     }
     setFrameUrl(null)
-    if (preview === null) return
+    if (preview === null || compositeAuthority !== null) return
     const controller = new AbortController()
     void backend.fetchPreviewArtifact(preview.artifact_id, controller.signal).then((blob) => {
       if (controller.signal.aborted) return
-      if (url.current !== null) URL.revokeObjectURL(url.current)
-      url.current = URL.createObjectURL(blob)
-      setFrameUrl(url.current)
+      if (frameObjectUrl.current !== null) URL.revokeObjectURL(frameObjectUrl.current)
+      frameObjectUrl.current = URL.createObjectURL(blob)
+      setFrameUrl(frameObjectUrl.current)
     }).catch((error: unknown) => {
       if (!controller.signal.aborted) onError(error instanceof Error ? error : '无法载入已验证的场景帧。')
     })
     return () => controller.abort()
-  }, [backend, onError, preview?.artifact_id])
+  }, [backend, compositeAuthority, onError, preview?.artifact_id])
 
   useEffect(() => () => {
-    if (url.current !== null) URL.revokeObjectURL(url.current)
+    if (frameObjectUrl.current !== null) URL.revokeObjectURL(frameObjectUrl.current)
   }, [])
+
+  useEffect(() => {
+    const request = ++compositeRequest.current
+    descriptorAuthority.current = null
+    if (compositeObjectUrl.current !== null) {
+      URL.revokeObjectURL(compositeObjectUrl.current)
+      compositeObjectUrl.current = null
+    }
+    setCompositeVideo(null)
+    if (compositeAuthority === null) return
+
+    const controller = new AbortController()
+    void backend.getCompositePreview().then(async (descriptor) => {
+      if (controller.signal.aborted || compositeRequest.current !== request) return
+      descriptorAuthority.current = descriptor.artifact_id
+      const blob = await backend.fetchCompositePreviewArtifact(
+        descriptor.artifact_id,
+        controller.signal,
+      )
+      if (
+        controller.signal.aborted
+        || compositeRequest.current !== request
+        || descriptorAuthority.current !== descriptor.artifact_id
+      ) return
+      const nextUrl = URL.createObjectURL(blob)
+      if (
+        controller.signal.aborted
+        || compositeRequest.current !== request
+        || descriptorAuthority.current !== descriptor.artifact_id
+      ) {
+        URL.revokeObjectURL(nextUrl)
+        return
+      }
+      if (compositeObjectUrl.current !== null) {
+        URL.revokeObjectURL(compositeObjectUrl.current)
+      }
+      compositeObjectUrl.current = nextUrl
+      setCompositeVideo({
+        authority: compositeAuthority,
+        artifactId: descriptor.artifact_id,
+        url: nextUrl,
+      })
+    }).catch((error: unknown) => {
+      if (controller.signal.aborted || compositeRequest.current !== request) return
+      descriptorAuthority.current = null
+      if (compositeObjectUrl.current !== null) {
+        URL.revokeObjectURL(compositeObjectUrl.current)
+        compositeObjectUrl.current = null
+      }
+      setCompositeVideo(null)
+      onError(error instanceof Error ? error : '无法载入后端验证的合成预览。')
+    })
+
+    return () => {
+      controller.abort()
+      if (compositeRequest.current === request) {
+        descriptorAuthority.current = null
+      }
+      if (compositeObjectUrl.current !== null) {
+        URL.revokeObjectURL(compositeObjectUrl.current)
+        compositeObjectUrl.current = null
+      }
+    }
+  }, [backend, compositeAuthority, onError])
 
   const patchMotion = async (): Promise<void> => {
     const value = Number(motionScale)
@@ -67,7 +145,9 @@ export function PreviewPage({
     finally { setRunning(false) }
   }
 
-  const composite = project.stages.composite
+  const displayedComposite = compositeVideo?.authority === compositeAuthority
+    ? compositeVideo
+    : null
   const compositeRunning = activeTask?.target_stage === 'composite'
     && ['queued', 'running'].includes(activeTask.status)
   const stageRows = ['map_trajectory', 'render', 'composite'] as const
@@ -107,8 +187,25 @@ export function PreviewPage({
       </div>
       <div className="preview-layout">
         <article className="preview-card">
-          {frameUrl === null ? <div className="viewport-empty">暂无场景预览帧</div> : <img alt="最近验证的合成参考帧" src={frameUrl} />}
+          {compositeAuthority !== null ? (
+            displayedComposite === null
+              ? <div className="viewport-empty">正在验证合成预览…</div>
+              : (
+                  <video
+                    aria-label="低分辨率合成预览"
+                    controls
+                    playsInline
+                    preload="metadata"
+                    src={displayedComposite.url}
+                  />
+                )
+          ) : (
+            frameUrl === null
+              ? <div className="viewport-empty">暂无相机参考帧</div>
+              : <img alt="相机参考帧（非合成视频）" src={frameUrl} />
+          )}
           <div className="preview-caption">
+            <span>{compositeAuthority === null ? '相机参考 · 非合成视频' : '后端验证 · 低分辨率合成'}</span>
             <span>垂直 FOV {project.workflow.target_camera?.fov_y_degrees.toFixed(0) ?? '—'}°</span>
             <span>焦点距离 {project.workflow.target_camera?.distance.toFixed(2) ?? '—'}</span>
           </div>
@@ -127,8 +224,10 @@ export function PreviewPage({
         </aside>
       </div>
       <div className="honest-state">
-        <strong>{composite?.status === 'succeeded' ? '合成阶段已由后端确认' : '等待真实合成任务'}</strong>
-        <p>当前 API 公开的是最近验证的静态场景帧；低分辨率合成视频尚未暴露。完整预览仍需要 Task 15 前完成具体 WorkflowServices 组装。</p>
+        <strong>{compositeAuthority === null ? '等待真实合成任务' : '合成阶段已由后端确认'}</strong>
+        <p>{compositeAuthority === null
+          ? '当前静态 Gaussian 画面仅用于机位参考，不是合成结果。'
+          : '播放器只使用当前成功合成缓存对应的后端验证视频。'}</p>
       </div>
       {recoveryFailed ? (
         <div className="recovery-actions">

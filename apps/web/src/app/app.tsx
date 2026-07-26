@@ -382,9 +382,32 @@ export function App({
     && taskState.latestEvent.task_id === activeTask?.id
     ? taskState.latestEvent
     : null
-  const progressPercent = progressEvent === null || !Number.isFinite(progressEvent.progress)
+  const restProgress = activeTask !== null
+    && typeof activeTask.progress === 'number'
+    && activeTask.current !== undefined
+    && activeTask.total !== undefined
+    && activeTask.message !== undefined
+    && typeof activeTask.elapsed_seconds === 'number'
+    && activeTask.eta_seconds !== undefined
+    ? {
+        stage: activeTask.target_stage,
+        revision: activeTask.revision,
+        progress: activeTask.progress,
+        current: activeTask.current,
+        total: activeTask.total,
+        message: activeTask.message,
+        elapsed_seconds: activeTask.elapsed_seconds,
+        eta_seconds: activeTask.eta_seconds,
+      }
+    : null
+  const authoritativeProgress = progressEvent !== null
+    && (restProgress === null || progressEvent.revision >= restProgress.revision)
+    ? progressEvent
+    : restProgress
+  const progressPercent = authoritativeProgress === null
+    || !Number.isFinite(authoritativeProgress.progress)
     ? null
-    : Math.round(Math.min(1, Math.max(0, progressEvent.progress)) * 100)
+    : Math.round(Math.min(1, Math.max(0, authoritativeProgress.progress)) * 100)
   const retryableTask = activeTask?.status === 'failed'
     && progressEvent?.error?.retryable === true
 
@@ -479,19 +502,31 @@ export function App({
           ) : (
             <span className="task-copy">
               <strong>{activeTask.target_stage} · {activeTask.status}</strong>
-              <small>
-                {progressEvent?.message ?? `revision ${activeTask.revision}`}
-                {progressEvent?.eta_seconds !== null
-                  && progressEvent?.eta_seconds !== undefined
-                  ? ` · ETA ${Math.ceil(progressEvent.eta_seconds)}s`
-                  : ''}
-                {` · ${taskState.connection}`}
+              <small className="task-message">
+                {authoritativeProgress?.message
+                  ?? (authoritativeProgress === null ? `revision ${activeTask.revision}` : '')}
+              </small>
+              <small className="task-timing">
+                {authoritativeProgress?.current !== null
+                  && authoritativeProgress?.current !== undefined
+                  && authoritativeProgress.total !== null
+                  && authoritativeProgress.total !== undefined
+                  ? <span>{authoritativeProgress.current} / {authoritativeProgress.total}</span>
+                  : null}
+                {authoritativeProgress?.elapsed_seconds !== undefined
+                  ? <span>已用时 {authoritativeProgress.elapsed_seconds} 秒</span>
+                  : null}
+                {authoritativeProgress?.eta_seconds !== null
+                  && authoritativeProgress?.eta_seconds !== undefined
+                  ? <span>预计剩余 {authoritativeProgress.eta_seconds} 秒</span>
+                  : null}
+                <span>{taskState.connection}</span>
               </small>
             </span>
           )}
-          {progressEvent !== null && progressPercent !== null ? (
+          {authoritativeProgress !== null && progressPercent !== null ? (
             <div
-              aria-label={`${progressEvent.stage} 进度`}
+              aria-label={`${authoritativeProgress.stage} 进度`}
               aria-valuemax={100}
               aria-valuemin={0}
               aria-valuenow={progressPercent}

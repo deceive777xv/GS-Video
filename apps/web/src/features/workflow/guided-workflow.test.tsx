@@ -178,8 +178,11 @@ function createHarness(initial = project()) {
       has_audio: true, verified: true,
     })),
     fetchExportArtifact: vi.fn(async () => new Blob(['mp4'], { type: 'video/mp4' })),
-    getCompositePreview: vi.fn(),
-    fetchCompositePreviewArtifact: vi.fn(),
+    getCompositePreview: vi.fn(async () => ({
+      artifact_id: 'composite-1', filename: 'composite-preview.mp4' as const, size: 12,
+      sha256: 'c'.repeat(64), duration_seconds: 2, fps: '24/1', frame_count: 48,
+    })),
+    fetchCompositePreviewArtifact: vi.fn(async () => new Blob(['composite'], { type: 'video/mp4' })),
     copyVerifiedExport: vi.fn(async () => undefined),
     getSubjectMedia: vi.fn(async (role: SubjectMediaRole): Promise<SubjectMediaDto> => ({
       role, artifact_id: `${role}-1`, frame_index: 0,
@@ -856,5 +859,75 @@ describe('guided workflow', () => {
     expect(progress).toHaveAttribute('aria-valuenow', '42')
     expect(progress).toHaveTextContent('42%')
     expect(screen.getByText('render · running').parentElement).toHaveClass('task-copy')
+  })
+
+  it('shows backend current-frame timing from the latest matching WebSocket event', () => {
+    const current = project()
+    current.workflow.active_task_id = 'task-render'
+    const harness = createHarness(current)
+    const task = {
+      id: 'task-render', target_stage: 'render' as const, status: 'running' as const,
+      revision: 8, error: null,
+    }
+    const snapshot = {
+      task, revision: 8, pendingResyncRevision: null, connection: 'connected' as const,
+      latestEvent: {
+        type: 'task_event' as const,
+        task_id: task.id,
+        revision: 8,
+        stage: 'render' as const,
+        progress: 0.4,
+        current: 12,
+        total: 30,
+        message: '渲染背景 12/30',
+        elapsed_seconds: 8,
+        eta_seconds: 12,
+        error: null,
+      },
+    }
+    const createOwnedTaskStore = () => ({
+      subscribe: () => () => undefined, snapshot: () => snapshot,
+      onEvent: vi.fn(), onConnectionChange: vi.fn(), replaceFromRest: vi.fn(), acknowledgeResync: vi.fn(),
+      whenIdle: async () => undefined, dispose: vi.fn(),
+    })
+
+    render(<App backend={harness.client} createOwnedTaskStore={createOwnedTaskStore} initialBootstrap={bootstrap(current)} platform={harness.platform} />)
+
+    expect(screen.getByText('渲染背景 12/30')).toBeVisible()
+    expect(screen.getByText('12 / 30')).toBeVisible()
+    expect(screen.getByText('已用时 8 秒')).toBeVisible()
+    expect(screen.getByText('预计剩余 12 秒')).toBeVisible()
+  })
+
+  it('uses the matching REST task snapshot and omits a null ETA without inventing one', () => {
+    const current = project()
+    current.workflow.active_task_id = 'task-render'
+    const harness = createHarness(current)
+    const task = {
+      id: 'task-render', target_stage: 'render' as const, status: 'running' as const,
+      revision: 9, error: null, progress: 0.5, current: 15, total: 30,
+      message: 'REST 恢复渲染 15/30', elapsed_seconds: 10, eta_seconds: null,
+    }
+    const snapshot = {
+      task, revision: 9, pendingResyncRevision: null, connection: 'disconnected' as const,
+      latestEvent: {
+        type: 'task_event' as const, task_id: 'task-stale', revision: 10,
+        stage: 'render' as const, progress: 0.9, current: 27, total: 30,
+        message: '过期事件', elapsed_seconds: 20, eta_seconds: 2, error: null,
+      },
+    }
+    const createOwnedTaskStore = () => ({
+      subscribe: () => () => undefined, snapshot: () => snapshot,
+      onEvent: vi.fn(), onConnectionChange: vi.fn(), replaceFromRest: vi.fn(), acknowledgeResync: vi.fn(),
+      whenIdle: async () => undefined, dispose: vi.fn(),
+    })
+
+    render(<App backend={harness.client} createOwnedTaskStore={createOwnedTaskStore} initialBootstrap={bootstrap(current)} platform={harness.platform} />)
+
+    expect(screen.getByText('REST 恢复渲染 15/30')).toBeVisible()
+    expect(screen.getByText('15 / 30')).toBeVisible()
+    expect(screen.getByText('已用时 10 秒')).toBeVisible()
+    expect(screen.queryByText(/预计剩余/)).toBeNull()
+    expect(screen.queryByText('过期事件')).toBeNull()
   })
 })

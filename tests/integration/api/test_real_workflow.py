@@ -1,0 +1,506 @@
+from collections.abc import Callable
+from dataclasses import dataclass
+from fractions import Fraction
+from pathlib import Path
+import time
+
+from fastapi.testclient import TestClient
+import numpy as np
+from PIL import Image
+import pytest
+from pydantic import SecretStr
+
+from gs_video.api.routes import ApiServices
+from gs_video.api.schemas import ApiSettings
+from gs_video.app import create_app
+from gs_video.camera.classify import CameraKind
+from gs_video.camera.opencv_solver import CameraSolution
+from gs_video.domain.contracts import (
+    MaskSequence,
+    PickBuffer,
+    Prompt,
+    SegmentationBackend,
+    StageResult,
+)
+from gs_video.domain.models import (
+    ArtifactRole,
+    Project,
+    SceneSummary,
+    StageName,
+    StageStatus,
+    VideoSummary,
+)
+from gs_video.environment.doctor import EnvironmentReport
+from gs_video.media.export import ExportResult
+from gs_video.media.ffmpeg import VideoMetadata
+from gs_video.pipeline.artifacts import ArtifactPublisher
+from gs_video.pipeline.cancellation import CancellationToken
+from gs_video.pipeline.events import ProgressEmitter
+from gs_video.pipeline.services import (
+    CameraSolveWorkflowService,
+    CompositeWorkflowService,
+    ExportWorkflowService,
+    MediaIngestService,
+    SegmentWorkflowService,
+    TrajectoryMapWorkflowService,
+    WorkflowPaths,
+)
+from gs_video.pipeline.workflow import (
+    RenderCacheNamespace,
+    WorkflowServices,
+    build_mvp_workflow,
+)
+from gs_video.project.cache import cache_key
+from gs_video.project.repository import ProjectRepository
+
+
+TOKEN = "real-workflow-session-token"
+ORIGIN = "http://127.0.0.1:5173"
+
+
+def _write_rgb(path: Path, size: tuple[int, int], value: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", size, (value, value, value)).save(path)
+
+
+class FakeAssetInspector:
+    def inspect(
+        self,
+        kind: str,
+        path: Path,
+        *,
+        size: int,
+        sha256: str,
+    ) -> VideoSummary | SceneSummary:
+        if kind == "source_video":
+            return VideoSummary(
+                filename=path.name,
+                size=size,
+                sha256=sha256,
+                width=8,
+                height=6,
+                duration_seconds=2 / 24,
+                fps="24/1",
+                has_audio=True,
+                frame_count=2,
+            )
+        return SceneSummary(
+            filename=path.name,
+            size=size,
+            sha256=sha256,
+            gaussian_count=1,
+            estimated_vram_mb=1,
+        )
+
+
+class FakeMediaBackend:
+    identity = "fake-media-v1"
+
+    def extract_source_frames(self, source: Path, output_dir: Path) -> list[Path]:
+        assert source.is_file()
+        frames: list[Path] = []
+        for index, value in enumerate((40, 80), start=1):
+            frame = output_dir / f"{index:06d}.png"
+            _write_rgb(frame, (8, 6), value)
+            frames.append(frame)
+        return frames
+
+    def extract_proxy_frames(
+        self,
+        source: Path,
+        output_dir: Path,
+        max_height: int,
+    ) -> list[Path]:
+        assert source.is_file()
+        assert max_height > 0
+        frames: list[Path] = []
+        for index, value in enumerate((40, 80), start=1):
+            frame = output_dir / f"{index:06d}.jpg"
+            _write_rgb(frame, (4, 3), value)
+            frames.append(frame)
+        return frames
+
+
+class FakeSegmenter:
+    backend = SegmentationBackend.EDGETAM
+    worker_prefix = ("deterministic-fake-segmenter",)
+
+    def __init__(self, root: Path) -> None:
+        self.model_config = root / "models" / "segment.yaml"
+        self.checkpoint = root / "models" / "segment.pt"
+        self.model_config.parent.mkdir(parents=True)
+        self.model_config.write_text("model: fake", encoding="utf-8")
+        self.checkpoint.write_bytes(b"fake-checkpoint")
+
+    def segment(
+        self,
+        frames: list[Path],
+        prompt: Prompt,
+        output_dir: Path,
+        emit: ProgressEmitter,
+        token: CancellationToken,
+    ) -> MaskSequence:
+        assert prompt.frame_index == 0
+        output_dir.mkdir()
+        for index, frame in enumerate(frames, start=1):
+            token.raise_if_cancelled()
+            with Image.open(frame) as image:
+                Image.new("L", image.size, 255).save(
+                    output_dir / f"{index:06d}.png"
+                )
+            emit(index, len(frames), f"fake segment {index}/{len(frames)}")
+        return MaskSequence(output_dir, len(frames))
+
+
+class FakeCameraSolver:
+    def solve(
+        self,
+        frame_paths: list[Path] | tuple[Path, ...],
+        emit: ProgressEmitter,
+        token: CancellationToken,
+    ) -> CameraSolution:
+        poses: list[np.ndarray] = []
+        for index, _path in enumerate(frame_paths, start=1):
+            token.raise_if_cancelled()
+            pose = np.eye(4)
+            pose[0, 3] = index - 1
+            poses.append(pose)
+            emit(index, len(frame_paths), f"fake solve {index}/{len(frame_paths)}")
+        return CameraSolution(
+            np.array([[3.0, 0.0, 2.0], [0.0, 3.0, 1.5], [0.0, 0.0, 1.0]]),
+            poses,
+            CameraKind.SIX_DOF,
+            0.9,
+        )
+
+
+class FakeRenderer:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.publisher = ArtifactPublisher(root)
+
+    def run(
+        self,
+        project: Project,
+        namespace: RenderCacheNamespace,
+        token: CancellationToken,
+        emit: ProgressEmitter,
+    ) -> StageResult:
+        mapped = project.stages[StageName.MAP_TRAJECTORY]
+        assert mapped.cache_key is not None
+        result_key = cache_key(
+            StageName.RENDER.value,
+            {"mapped_cache_key": mapped.cache_key},
+            {"namespace": namespace.value},
+            "fake-renderer-v1",
+        )
+
+        def build(staging: Path) -> None:
+            for index in range(1, 3):
+                token.raise_if_cancelled()
+                _write_rgb(staging / f"{index:06d}.png", (8, 6), 200)
+                emit(index, 2, f"fake render {index}/2")
+
+        output = self.publisher.publish_tree("renders", result_key, build)
+        relative = output.relative_to(self.root)
+        return StageResult(
+            (relative,),
+            result_key,
+            {ArtifactRole.RENDER_FRAMES: relative},
+        )
+
+
+class FakeExporter:
+    def __call__(
+        self,
+        frames_dir: Path,
+        source_video: Path,
+        fps: Fraction,
+        frame_count: int,
+        output: Path,
+        *,
+        cancellation_check: Callable[[], None] | None = None,
+    ) -> ExportResult:
+        if cancellation_check is not None:
+            cancellation_check()
+        assert source_video.is_file()
+        assert len(tuple(frames_dir.glob("*.png"))) == frame_count == 2
+        output.write_bytes(b"deterministic verified mp4")
+        return ExportResult(
+            output=output,
+            fps=fps,
+            frame_count=frame_count,
+            duration=Fraction(frame_count, 1) / fps,
+            has_audio=True,
+        )
+
+
+class FakeVideoProbe:
+    def __call__(
+        self,
+        path: Path,
+        *,
+        cancellation_check: Callable[[], None] | None = None,
+    ) -> ExportResult:
+        if cancellation_check is not None:
+            cancellation_check()
+        return ExportResult(
+            output=path,
+            fps=Fraction(24, 1),
+            frame_count=2,
+            duration=Fraction(1, 12),
+            has_audio=True,
+        )
+
+    def probe(self, path: Path) -> VideoMetadata:
+        assert path.read_bytes() == b"deterministic verified mp4"
+        return VideoMetadata(
+            width=8,
+            height=6,
+            duration=1 / 12,
+            fps="24/1",
+            has_audio=True,
+            frame_count=2,
+        )
+
+
+class FakePreviewService:
+    def render_pick(
+        self,
+        project_root: Path,
+        scene_path: str,
+        scene_summary: SceneSummary,
+        camera: object,
+        width: int,
+        height: int,
+    ) -> PickBuffer:
+        assert (project_root / scene_path).is_file()
+        assert scene_summary.gaussian_count == 1
+        assert camera is not None
+        return PickBuffer(
+            rgb=np.full((height, width, 3), 96, dtype=np.uint8),
+            expected_depth=np.full((height, width), 2.0, dtype=np.float32),
+        )
+
+
+class StaticDoctor:
+    def check(self) -> EnvironmentReport:
+        return EnvironmentReport(ready=True, vram_mb=0, issues=[])
+
+
+class FakeWorkerRegistry:
+    async def terminate_all(self) -> None:
+        return None
+
+
+def _wait_for_task(
+    client: TestClient,
+    task_id: str,
+    headers: dict[str, str],
+) -> dict[str, object]:
+    deadline = time.monotonic() + 5
+    while True:
+        response = client.get(f"/api/v1/tasks/{task_id}", headers=headers)
+        assert response.status_code == 200
+        snapshot = response.json()
+        if snapshot["status"] not in {"queued", "running"}:
+            return snapshot
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
+
+
+@dataclass(frozen=True)
+class ProductionHarness:
+    root: Path
+    source_fixture: Path
+    scene_fixture: Path
+
+    def run_with_fake_workers(self) -> Project:
+        repository = ProjectRepository(self.root / "project")
+        project = repository.create("deterministic production workflow")
+        repository.save(project)
+        paths = WorkflowPaths(repository.root, update_project=repository.update)
+        probe = FakeVideoProbe()
+        workflow_services = WorkflowServices(
+            media_ingest=MediaIngestService(paths, FakeMediaBackend()),
+            segmenter=SegmentWorkflowService(paths, FakeSegmenter(repository.root)),
+            camera_solver=CameraSolveWorkflowService(
+                paths,
+                FakeCameraSolver(),
+                backend_identity="fake-camera-solver-v1",
+            ),
+            trajectory_mapper=TrajectoryMapWorkflowService(paths),
+            renderer=FakeRenderer(repository.root),
+            compositor=CompositeWorkflowService(
+                paths,
+                exporter=FakeExporter(),
+                exporter_identity="fake-composite-exporter-v1",
+                prober=probe,
+            ),
+            exporter=ExportWorkflowService(
+                paths,
+                exporter=FakeExporter(),
+                exporter_identity="fake-final-exporter-v1",
+                prober=probe,
+            ),
+        )
+        runner = build_mvp_workflow(
+            workflow_services,
+            project,
+            save=repository.save,
+            persist_stage=repository.update_stage,
+            compare_and_set_stage=repository.compare_and_set_stage,
+            claim_stage=repository.claim_stage,
+        )
+        services = ApiServices(
+            project_repository=repository,
+            environment_doctor=StaticDoctor(),
+            pipeline_runner=runner,
+            worker_registry=FakeWorkerRegistry(),
+            preview_service=FakePreviewService(),
+            asset_inspector=FakeAssetInspector(),
+            export_inspector=probe,
+        )
+        settings = ApiSettings(
+            bind_host="127.0.0.1",
+            port=0,
+            session_token=SecretStr(TOKEN),
+            allowed_origins=(ORIGIN,),
+            task_workers=1,
+        )
+        headers = {"Authorization": f"Bearer {TOKEN}"}
+
+        with TestClient(create_app(settings, services)) as client:
+            for kind, path in (
+                ("source_video", self.source_fixture),
+                ("scene_ply", self.scene_fixture),
+            ):
+                imported = client.post(
+                    "/api/v1/assets/import",
+                    json={"kind": kind, "path": str(path)},
+                    headers=headers,
+                )
+                assert imported.status_code == 201
+
+            ingest = client.post(
+                "/api/v1/tasks",
+                json={"target_stage": "ingest"},
+                headers=headers,
+            )
+            assert ingest.status_code == 202
+            assert _wait_for_task(client, ingest.json()["id"], headers)[
+                "status"
+            ] == "succeeded"
+
+            proxy = client.get(
+                "/api/v1/projects/current/subject-media/proxy",
+                headers=headers,
+            )
+            assert proxy.status_code == 200, proxy.json()
+
+            prompt = client.patch(
+                "/api/v1/projects/current",
+                json={"subject_prompt": {"frame_index": 0, "x": 1, "y": 1}},
+                headers=headers,
+            )
+            assert prompt.status_code == 200, prompt.json()
+
+            preview = client.post(
+                "/api/v1/projects/current/preview",
+                json={
+                    "generation": 1,
+                    "width": 16,
+                    "height": 9,
+                    "camera": {
+                        "target": [0.0, 0.0, 0.0],
+                        "distance": 4.0,
+                        "yaw": 0.0,
+                        "pitch": 0.0,
+                        "fov_y_degrees": 60.0,
+                    },
+                },
+                headers=headers,
+            )
+            assert preview.status_code == 201
+            preview_descriptor = preview.json()
+            confirmed = client.post(
+                "/api/v1/projects/current/camera/confirm",
+                json={"camera_revision": preview_descriptor["camera_revision"]},
+                headers=headers,
+            )
+            assert confirmed.status_code == 200
+            picked = client.post(
+                "/api/v1/projects/current/pick",
+                json={
+                    "x": 8,
+                    "y": 4,
+                    "preview_artifact_id": preview_descriptor["artifact_id"],
+                    "camera_revision": preview_descriptor["camera_revision"],
+                    "pick_buffer_revision": preview_descriptor[
+                        "pick_buffer_revision"
+                    ],
+                },
+                headers=headers,
+            )
+            assert picked.status_code == 200
+
+            exported = client.post(
+                "/api/v1/tasks",
+                json={"target_stage": "export"},
+                headers=headers,
+            )
+            assert exported.status_code == 202
+            assert _wait_for_task(client, exported.json()["id"], headers)[
+                "status"
+            ] == "succeeded"
+
+            composite = client.get(
+                "/api/v1/projects/current/composite-preview",
+                headers=headers,
+            )
+            assert composite.status_code == 200
+            composite_video = client.get(
+                "/api/v1/artifacts/composite-previews/"
+                f"{composite.json()['artifact_id']}",
+                headers=headers,
+            )
+            assert composite_video.status_code == 200
+            assert composite_video.content == b"deterministic verified mp4"
+
+            verified = client.get(
+                "/api/v1/projects/current/export",
+                headers=headers,
+            )
+            assert verified.status_code == 200
+            export_video = client.get(
+                "/api/v1/projects/current/exports/"
+                f"{verified.json()['artifact_id']}",
+                headers=headers,
+            )
+            assert export_video.status_code == 200
+            assert export_video.content == b"deterministic verified mp4"
+
+        return repository.load()
+
+
+@pytest.fixture
+def production_harness(tmp_path: Path) -> ProductionHarness:
+    fixtures = Path(__file__).parents[2] / "fixtures"
+    return ProductionHarness(
+        root=tmp_path,
+        source_fixture=fixtures / "media" / "source.mp4",
+        scene_fixture=fixtures / "scene" / "tiny_gaussians.ply",
+    )
+
+
+def test_assembled_workflow_produces_preview_and_verified_export(
+    production_harness: ProductionHarness,
+) -> None:
+    project = production_harness.run_with_fake_workers()
+
+    assert project.stages[StageName.EXPORT].status is StageStatus.SUCCEEDED
+    assert project.stages[StageName.COMPOSITE].artifacts[
+        ArtifactRole.COMPOSITE_PREVIEW
+    ].endswith("/composite-preview.mp4")
+    assert project.workflow.export_result is not None
+    assert project.workflow.export_result.verified is True
