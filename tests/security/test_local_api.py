@@ -230,6 +230,48 @@ def test_composite_preview_rejects_unsafe_registered_files(
     assert_stable_error(response, status_code=409, code="composite_preview_changed")
 
 
+def test_composite_preview_rejects_cache_registered_path_outside_previews_root(
+    client_and_root,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    client, root = client_and_root
+    cache_key = "../escaped-preview"
+    relative = f"previews/{cache_key}/composite-preview.mp4"
+    escaped_preview = root / "escaped-preview" / "composite-preview.mp4"
+    escaped_preview.parent.mkdir()
+    escaped_preview.write_bytes(b"outside-previews-root")
+    repository = client.app.state.services.project_repository
+    repository.update(
+        lambda project: project.stages.__setitem__(
+            StageName.COMPOSITE,
+            StageState(
+                status=StageStatus.SUCCEEDED,
+                cache_key=cache_key,
+                output_paths=[relative],
+                artifacts={ArtifactRole.COMPOSITE_PREVIEW: relative},
+            ),
+        )
+    )
+
+    class Inspector:
+        def probe(self, path: Path) -> VideoMetadata:
+            raise AssertionError(f"escaped preview reached ffprobe: {path}")
+
+    monkeypatch.setattr(client.app.state, "export_inspector", Inspector())
+    descriptor = client.get(
+        "/api/v1/projects/current/composite-preview", headers=auth_headers()
+    )
+    blob = client.get(
+        "/api/v1/artifacts/composite-previews/" + "a" * 32,
+        headers=auth_headers(),
+    )
+
+    assert_stable_error(descriptor, status_code=409, code="composite_preview_changed")
+    assert_stable_error(blob, status_code=409, code="composite_preview_changed")
+    assert descriptor.content != b"outside-previews-root"
+    assert blob.content != b"outside-previews-root"
+
+
 def test_composite_preview_descriptor_revalidates_authority_after_probe(
     client_and_root,
     monkeypatch: pytest.MonkeyPatch,
