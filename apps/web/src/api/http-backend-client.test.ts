@@ -614,6 +614,50 @@ describe('recoverable task store', () => {
     })
   })
 
+  it('does not let stale REST progress overwrite a newer websocket event', () => {
+    const store = createTaskStore(fakeBackendClient())
+    const initial: TaskDto = {
+      ...task(10),
+      progress: 0.2,
+      current: 2,
+      total: 10,
+      message: 'render 2/10',
+      elapsed_seconds: 2,
+      eta_seconds: 8,
+    }
+    store.replaceFromRest(initial)
+    store.onEvent({
+      type: 'task_event',
+      task_id: initial.id,
+      revision: 12,
+      stage: 'segment',
+      progress: 0.6,
+      current: 6,
+      total: 10,
+      message: 'render 6/10',
+      elapsed_seconds: 6,
+      eta_seconds: 4,
+      error: null,
+    })
+
+    store.replaceFromRest({
+      ...initial,
+      revision: 11,
+      progress: 0.4,
+      current: 4,
+      message: 'render 4/10',
+      elapsed_seconds: 4,
+      eta_seconds: 6,
+    })
+
+    expect(store.snapshot().latestEvent).toMatchObject({
+      revision: 12,
+      progress: 0.6,
+      current: 6,
+      message: 'render 6/10',
+    })
+  })
+
   it('converges through REST when the live event source observes a revision jump', async () => {
     vi.useFakeTimers()
     const sockets: FakeWebSocket[] = []

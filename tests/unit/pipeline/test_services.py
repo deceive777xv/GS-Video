@@ -19,7 +19,12 @@ from gs_video.camera.serialization import (
     write_camera_solution,
     write_mapped_trajectory,
 )
-from gs_video.domain.contracts import MaskSequence, Prompt, SegmentationBackend
+from gs_video.domain.contracts import (
+    MaskSequence,
+    Prompt,
+    RenderSequence,
+    SegmentationBackend,
+)
 from gs_video.domain.errors import CancelledError, RepairableError, UnsupportedMaterialError
 from gs_video.domain.models import (
     ArtifactRole,
@@ -27,6 +32,7 @@ from gs_video.domain.models import (
     FootPointState,
     PreviewState,
     Project,
+    SceneSummary,
     StageName,
     StageState,
     StageStatus,
@@ -41,6 +47,7 @@ from gs_video.pipeline.services import (
     CompositeWorkflowService,
     ExportWorkflowService,
     MediaIngestService,
+    RendererWorkflowService,
     SegmentWorkflowService,
     TrajectoryMapWorkflowService,
     WorkflowPaths,
@@ -48,6 +55,8 @@ from gs_video.pipeline.services import (
     _preview_size,
     _sha256,
 )
+from gs_video.scene.worker_client import RendererWorkerIdentity
+from gs_video.scene.worker_protocol import RenderSequenceRequest
 import gs_video.pipeline.services as workflow_services
 
 
@@ -625,6 +634,75 @@ def test_trajectory_rejects_camera_replacement_during_mapping(
         )
 
     assert not any((tmp_path / "trajectories").glob("?" * 64))
+
+
+class MismatchedRendererWorker:
+    def probe(
+        self, *, token: CancellationToken | None = None
+    ) -> RendererWorkerIdentity:
+        del token
+        return RendererWorkerIdentity(torch="2.9.0", gsplat="1.5.3", device="cuda")
+
+    def render_sequence(
+        self,
+        request: RenderSequenceRequest,
+        emit: ProgressEmitter,
+        token: CancellationToken,
+    ) -> RenderSequence:
+        token.raise_if_cancelled()
+        request.output_dir.mkdir()
+        frame = request.output_dir / "000001.png"
+        write_rgb(frame, (request.width, request.height), 64)
+        emit(1, 1, "rendered")
+        return RenderSequence(
+            frame_dir=request.output_dir,
+            frame_paths=(frame,),
+            source_frame_indices=(0,),
+            width=request.width,
+            height=request.height,
+            implementation_version="gsplat-1.6.0",
+        )
+
+
+def renderer_project(root: Path) -> Project:
+    project = source_project(root, frame_count=1)
+    scene = root / "source" / "scene.ply"
+    scene.write_bytes(b"gaussian-scene")
+    project.scene_ply = "source/scene.ply"
+    project.workflow.scene_summary = SceneSummary(
+        filename="scene.ply",
+        size=scene.stat().st_size,
+        sha256="cf5fa7399fb8ae55ff379089bae93067f89c6da2437508f5e5311e5c9efc94af",
+        gaussian_count=1,
+        estimated_vram_mb=1,
+    )
+    mapped_key = key("b")
+    trajectory = root / "trajectories" / mapped_key / "trajectory.json"
+    trajectory.parent.mkdir(parents=True)
+    write_mapped_trajectory(
+        trajectory,
+        MappedTrajectory(55.0, (np.eye(4, dtype=np.float64),)),
+    )
+    project.stages[StageName.MAP_TRAJECTORY] = StageState(
+        status=StageStatus.SUCCEEDED,
+        cache_key=mapped_key,
+        artifacts={ArtifactRole.MAPPED_TRAJECTORY: str(trajectory.relative_to(root))},
+    )
+    return project
+
+
+def test_renderer_rejects_terminal_identity_that_differs_from_probe(
+    tmp_path: Path,
+) -> None:
+    project = renderer_project(tmp_path)
+    service = RendererWorkflowService(
+        WorkflowPaths(tmp_path), MismatchedRendererWorker()  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RepairableError, match="实现|identity|版本"):
+        service.run(project, "final", CancellationToken(), discard_progress)
+
+    assert not any((tmp_path / "renders").glob("?" * 64))
 
 
 class RecordingExporter:

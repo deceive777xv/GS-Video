@@ -307,6 +307,19 @@ export function createTaskStore(
       error: null,
     })
   }
+  const latestProgressFromRest = (
+    task: TaskDto,
+    latest: TaskEvent | null,
+  ): TaskEvent | null => {
+    const restored = eventFromRest(task)
+    if (restored === null) return latest
+    if (
+      latest?.type === 'task_event' &&
+      latest.task_id === task.id &&
+      latest.revision >= restored.revision
+    ) return latest
+    return restored
+  }
   const replaceFromRest = (task: TaskDto): void => {
     if (disposed) return
     trackedTaskId = task.id
@@ -319,7 +332,7 @@ export function createTaskStore(
       task,
       revision: Math.max(state.revision, task.revision),
       pendingResyncRevision,
-      latestEvent: eventFromRest(task) ?? state.latestEvent,
+      latestEvent: latestProgressFromRest(task, state.latestEvent),
     })
   }
   const acknowledgeResync = (revision: number, task: TaskDto | null): void => {
@@ -335,7 +348,7 @@ export function createTaskStore(
         : null,
       latestEvent: task === null
         ? state.latestEvent
-        : eventFromRest(task) ?? state.latestEvent,
+        : latestProgressFromRest(task, state.latestEvent),
     })
   }
   const retryDelay = (): Promise<void> =>
@@ -396,7 +409,7 @@ export function createTaskStore(
           recoveringRevision,
         ),
         pendingResyncRevision: stillPending,
-        latestEvent: eventFromRest(result.task) ?? state.latestEvent,
+        latestEvent: latestProgressFromRest(result.task, state.latestEvent),
       })
     }
   }

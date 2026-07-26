@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import stat
+from pathlib import Path, PurePosixPath
 from threading import Lock
-from pathlib import Path
 from typing import Any
 
 from pydantic import (
@@ -36,7 +36,7 @@ from gs_video.pipeline.workflow import WorkflowServices, build_mvp_workflow
 from gs_video.project.repository import ProjectRepository
 from gs_video.scene.worker_client import RendererWorkerClient
 from gs_video.segmentation.client import VideoSegmenterClient
-from gs_video.segmentation.paths import has_reparse_component
+from gs_video.segmentation.paths import has_reparse_component, is_wsl_prefix
 
 
 _TAURI_ORIGINS = (
@@ -88,8 +88,30 @@ class WorkflowRuntimeConfig(BaseModel):
             )
         ):
             raise ValueError("worker argv must contain nonempty safe entries")
+        return value
+
+    @field_validator("segmentation_worker_prefix")
+    @classmethod
+    def segmentation_worker_argv(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if is_wsl_prefix(value):
+            separator = value.index("--")
+            if (
+                value[0].lower() not in {"wsl", "wsl.exe"}
+                or value.count("--") != 1
+                or separator + 1 >= len(value)
+                or not PurePosixPath(value[separator + 1]).is_absolute()
+            ):
+                raise ValueError("WSL worker prefix must name an absolute Linux interpreter")
+            return value
         if not Path(value[0]).is_absolute():
             raise ValueError("worker executable path must be absolute")
+        return value
+
+    @field_validator("renderer_worker_prefix")
+    @classmethod
+    def renderer_worker_argv(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not Path(value[0]).is_absolute():
+            raise ValueError("renderer worker executable path must be absolute")
         return value
 
 
@@ -103,13 +125,19 @@ def _ordinary_file(path: Path, label: str) -> None:
         raise ValueError(f"{label} must be an ordinary file")
 
 
-def _resolved_inside(path: Path, root: Path, label: str) -> Path:
+def _resolved_inside(
+    path: Path,
+    root: Path,
+    label: str,
+    *,
+    root_label: str = "application workspace",
+) -> Path:
     try:
         resolved = path.resolve(strict=True)
     except OSError as error:
         raise ValueError(f"{label} is unavailable") from error
     if resolved != path or not resolved.is_relative_to(root):
-        raise ValueError(f"{label} must remain inside the application workspace")
+        raise ValueError(f"{label} must remain inside {root_label}")
     return resolved
 
 
@@ -131,14 +159,17 @@ def _validate_loaded_config(
         (config.segmentation_model_config, "segmentation_model_config"),
         (config.segmentation_checkpoint, "segmentation_checkpoint"),
     ):
-        resolved = _resolved_inside(path, model_root, label)
+        resolved = _resolved_inside(path, model_root, label, root_label="model_root")
         _ordinary_file(resolved, label)
-    for prefix, label in (
-        (config.segmentation_worker_prefix, "segmentation worker"),
-        (config.renderer_worker_prefix, "renderer worker"),
-    ):
-        executable = _resolved_inside(Path(prefix[0]), workspace, label)
-        _ordinary_file(executable, label)
+    if not is_wsl_prefix(config.segmentation_worker_prefix):
+        executable = _resolved_inside(
+            Path(config.segmentation_worker_prefix[0]), workspace, "segmentation worker"
+        )
+        _ordinary_file(executable, "segmentation worker")
+    renderer_executable = _resolved_inside(
+        Path(config.renderer_worker_prefix[0]), workspace, "renderer worker"
+    )
+    _ordinary_file(renderer_executable, "renderer worker")
 
 
 def load_runtime_config(path: Path) -> WorkflowRuntimeConfig:

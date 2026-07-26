@@ -1231,6 +1231,7 @@ class RendererWorkflowService:
         if estimated_vram_mb * 5 > self.available_vram_limit_mb * 4:
             raise RepairableError("Gaussian 场景超过配置的保守显存预算")
         identity = self.worker.probe(token=token)
+        expected_implementation = f"gsplat-{identity.gsplat}"
         result_key = cache_key(
             StageName.RENDER.value,
             {
@@ -1277,9 +1278,9 @@ class RendererWorkflowService:
                 or rendered.frame_count != expected_count
                 or rendered.width != width
                 or rendered.height != height
-                or not rendered.implementation_version
+                or rendered.implementation_version != expected_implementation
             ):
-                raise RepairableError("渲染 worker 返回的帧序列无效")
+                raise RepairableError("渲染 worker 返回的实现版本或帧序列无效")
             for frame in rendered.frame_paths:
                 frame.replace(staging / frame.name)
             try:

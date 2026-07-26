@@ -57,6 +57,31 @@ def test_load_runtime_config_accepts_only_confined_absolute_paths(
     assert config.model_root == (workspace / "models").absolute()
 
 
+def test_runtime_config_accepts_wsl_segmentation_worker_prefix(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-wsl"
+    workspace.mkdir()
+    payload = runtime_payload(workspace)
+    payload["segmentation_worker_prefix"] = [
+        "wsl.exe",
+        "-d",
+        "Ubuntu",
+        "--",
+        "/opt/edgetam/bin/python",
+    ]
+
+    config = load_runtime_config(write_runtime(workspace, payload))
+
+    assert config.segmentation_worker_prefix == (
+        "wsl.exe",
+        "-d",
+        "Ubuntu",
+        "--",
+        "/opt/edgetam/bin/python",
+    )
+
+
 @pytest.mark.parametrize("field", ["token", "port", "origin", "allowed_origins"])
 def test_runtime_config_rejects_launcher_or_secret_fields(
     tmp_path: Path, field: str
@@ -87,7 +112,7 @@ def test_runtime_config_rejects_project_containing_runtime_file(
         load_runtime_config(write_runtime(workspace, payload))
 
 
-def test_runtime_config_rejects_model_escape_and_empty_worker_argv(
+def test_runtime_config_rejects_model_escape(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -100,6 +125,10 @@ def test_runtime_config_rejects_model_escape_and_empty_worker_argv(
     with pytest.raises(ValueError, match="model_root"):
         load_runtime_config(write_runtime(workspace, payload))
 
+
+def test_runtime_config_rejects_empty_worker_argv(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace-empty-worker"
+    workspace.mkdir()
     payload = runtime_payload(workspace)
     payload["renderer_worker_prefix"] = [""]
     with pytest.raises(ValidationError, match="worker"):

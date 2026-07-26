@@ -22,7 +22,8 @@ dev = ["httpx>=0.28,<1", "mypy>=1.16,<2", "pyinstaller>=6.14,<7", "pytest>=8,<9"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+pythonpath = ["."]
+addopts = "-ra --import-mode=importlib"
 markers = ["gpu: requires a configured NVIDIA GPU and local model checkpoints"]
 
 [tool.ruff]

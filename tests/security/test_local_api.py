@@ -273,7 +273,7 @@ def test_lifespan_closes_upload_handles_even_when_prior_cleanup_fails(
                 workers_terminated.set()
 
             manager.close = recording_close
-            app.state.task_service.cancel_all = fail_task_cleanup
+            app.state.task_service.request_cancel_all = fail_task_cleanup
             app.state.services.worker_registry.terminate_all = recording_worker_cleanup
 
     assert workers_terminated.is_set()
