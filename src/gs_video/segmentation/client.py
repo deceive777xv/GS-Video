@@ -19,6 +19,7 @@ from gs_video.domain.contracts import MaskSequence, Prompt, SegmentationBackend
 from gs_video.domain.errors import GsVideoError, UnsupportedMaterialError
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
+from gs_video.pipeline.gpu import GpuAdmissionGate
 from gs_video.segmentation.paths import has_reparse_component, worker_path
 from gs_video.segmentation.tree_guard import (
     ProcessTreeGuard,
@@ -46,6 +47,8 @@ class VideoSegmenterClient:
         process_factory: ProcessFactory = subprocess.Popen,
         tree_guard_factory: TreeGuardFactory = create_process_tree_guard,
         log_path: Path | None = None,
+        gpu_gate: GpuAdmissionGate | None = None,
+        cache_root: Path | None = None,
     ) -> None:
         if not worker_prefix or any(not item for item in worker_prefix):
             raise ValueError("worker prefix must contain nonempty argv entries")
@@ -58,6 +61,8 @@ class VideoSegmenterClient:
         self.log_path = log_path or self.model_config.parent / "logs" / "segmentation-worker.log"
         self._active: set[_ActiveWorker] = set()
         self._active_lock = threading.Lock()
+        self._gpu_gate = gpu_gate
+        self._cache_root = Path(cache_root).absolute() if cache_root is not None else None
 
     def _command(
         self, frames_dir: Path, output_dir: Path, prompt: Prompt, startup_gate: Path
@@ -139,6 +144,19 @@ class VideoSegmenterClient:
             )
         else:
             options["start_new_session"] = True
+        if self._cache_root is not None:
+            self._cache_root.mkdir(parents=True, exist_ok=True)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HF_HOME": str(self._cache_root / "huggingface"),
+                    "HF_HUB_CACHE": str(self._cache_root / "huggingface" / "hub"),
+                    "HF_HUB_OFFLINE": "1",
+                    "TORCH_HOME": str(self._cache_root / "torch"),
+                    "XDG_CACHE_HOME": str(self._cache_root),
+                }
+            )
+            options["env"] = environment
         gate = self._create_startup_gate(output_dir)
         try:
             process = self._process_factory(
@@ -356,11 +374,18 @@ class VideoSegmenterClient:
             raise GsVideoError("segmentation worker 事件格式无效")
         schemas = {
             "progress": {"type", "current", "total"},
-            "result": {"type", "mask_dir", "frames"},
+            "result": {"type", "mask_dir", "frames", "peak_vram_mb"},
             "error": {"type", "code", "message"},
         }
         event_type = payload["type"]
-        if event_type not in schemas or set(payload) != schemas[event_type]:
+        legacy_result = event_type == "result" and set(payload) == {
+            "type",
+            "mask_dir",
+            "frames",
+        }
+        if event_type not in schemas or (
+            set(payload) != schemas[event_type] and not legacy_result
+        ):
             raise GsVideoError("segmentation worker 事件 schema 无效")
         return payload
 
@@ -370,10 +395,14 @@ class VideoSegmenterClient:
     ) -> MaskSequence:
         mask_dir_value = event["mask_dir"]
         frames_value = event["frames"]
+        peak_vram_value = event.get("peak_vram_mb", 0)
         if (
             not isinstance(mask_dir_value, str)
             or not isinstance(frames_value, int)
             or isinstance(frames_value, bool)
+            or not isinstance(peak_vram_value, int)
+            or isinstance(peak_vram_value, bool)
+            or peak_vram_value < 0
         ):
             raise GsVideoError("segmentation worker result schema 无效")
         advertised = Path(mask_dir_value)
@@ -408,9 +437,26 @@ class VideoSegmenterClient:
                         raise GsVideoError("segmentation worker mask PNG 格式、模式或尺寸无效")
         except (OSError, ValueError) as exc:
             raise GsVideoError("segmentation worker mask PNG 不可读") from exc
-        return MaskSequence(mask_dir=output_dir, frame_count=frames_value)
+        return MaskSequence(
+            mask_dir=output_dir,
+            frame_count=frames_value,
+            peak_vram_mb=peak_vram_value,
+        )
 
     def segment(
+        self,
+        frames: list[Path],
+        prompt: Prompt,
+        output_dir: Path,
+        emit: ProgressEmitter,
+        token: CancellationToken,
+    ) -> MaskSequence:
+        if self._gpu_gate is not None:
+            with self._gpu_gate.hold(token):
+                return self._segment(frames, prompt, output_dir, emit, token)
+        return self._segment(frames, prompt, output_dir, emit, token)
+
+    def _segment(
         self,
         frames: list[Path],
         prompt: Prompt,

@@ -2,6 +2,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
+import shutil
 import time
 
 from fastapi.testclient import TestClient
@@ -235,7 +236,7 @@ class FakeExporter:
             cancellation_check()
         assert source_video.is_file()
         assert len(tuple(frames_dir.glob("*.png"))) == frame_count == 2
-        output.write_bytes(b"deterministic verified mp4")
+        shutil.copyfile(source_video, output)
         return ExportResult(
             output=output,
             fps=fps,
@@ -263,7 +264,9 @@ class FakeVideoProbe:
         )
 
     def probe(self, path: Path) -> VideoMetadata:
-        assert path.read_bytes() == b"deterministic verified mp4"
+        with path.open("rb") as stream:
+            stream.seek(4)
+            assert stream.read(4) == b"ftyp"
         return VideoMetadata(
             width=8,
             height=6,
@@ -478,7 +481,7 @@ class ProductionHarness:
                 headers=headers,
             )
             assert composite_video.status_code == 200
-            assert composite_video.content == b"deterministic verified mp4"
+            assert composite_video.content[4:8] == b"ftyp"
 
             verified = client.get(
                 "/api/v1/projects/current/export",
@@ -491,7 +494,7 @@ class ProductionHarness:
                 headers=headers,
             )
             assert export_video.status_code == 200
-            assert export_video.content == b"deterministic verified mp4"
+            assert export_video.content[4:8] == b"ftyp"
 
         return repository.load()
 

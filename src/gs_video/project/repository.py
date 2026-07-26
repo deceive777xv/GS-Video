@@ -1,8 +1,10 @@
 import json
 import os
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from threading import RLock
+from typing import BinaryIO
 
 from gs_video.domain.models import (
     Project,
@@ -29,6 +31,59 @@ PROJECT_DIRECTORIES = (
     "exports",
     "logs",
 )
+
+
+class ProjectInstanceLock:
+    def __init__(self, stream: BinaryIO) -> None:
+        self._stream = stream
+        self._closed = False
+
+    @classmethod
+    def acquire(cls, root: Path) -> "ProjectInstanceLock":
+        root.mkdir(parents=True, exist_ok=True)
+        stream = (root / ".gs-video.lock").open("a+b")
+        try:
+            stream.seek(0)
+            if stream.read(1) == b"":
+                stream.seek(0)
+                stream.write(b"\0")
+                stream.flush()
+            stream.seek(0)
+            if sys.platform == "win32":
+                import msvcrt
+
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            stream.close()
+            raise RuntimeError("project is already open in another process") from error
+        return cls(stream)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            self._stream.seek(0)
+            if sys.platform == "win32":
+                import msvcrt
+
+                msvcrt.locking(self._stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._closed = True
+            self._stream.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except OSError:
+            pass
 
 
 class ProjectRepository:
@@ -64,6 +119,20 @@ class ProjectRepository:
                 name, state.model_copy(deep=True)
             )
         )
+
+    def reconcile_interrupted_runs(self) -> Project:
+        """Make persisted in-flight work retryable after an unclean process exit."""
+
+        def reconcile(project: Project) -> None:
+            project.workflow.active_task_id = None
+            for state in project.stages.values():
+                if state.status is StageStatus.RUNNING:
+                    state.status = StageStatus.FAILED
+                    state.cache_key = None
+                    state.error_code = "interrupted"
+                    state.run_id = None
+
+        return self.update(reconcile)
 
     def compare_and_set_stage(
         self,

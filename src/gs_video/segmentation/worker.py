@@ -184,13 +184,16 @@ def run_segmentation(
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}-", dir=output_dir.parent))
     predictor: object | None = None
+    torch_module: Any | None = None
     inference_stack = contextlib.ExitStack()
     try:
         try:
             import torch  # type: ignore[import-not-found]
 
+            torch_module = torch
             inference_stack.enter_context(torch.inference_mode())
             if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
                 inference_stack.enter_context(torch.autocast("cuda", dtype=torch.bfloat16))
         except ImportError:
             pass
@@ -227,7 +230,17 @@ def run_segmentation(
         if _has_invisible_run([ratios_by_index[index] for index in range(len(frames))]):
             raise UnsupportedMaterialError("主要人物长时间不可见")
         _promote_staging(staging, output_dir, replace_path)
-        return {"type": "result", "mask_dir": output_dir.name, "frames": len(frames)}
+        peak_vram_mb = (
+            int(torch_module.cuda.max_memory_allocated() // (1024 * 1024))
+            if torch_module is not None and torch_module.cuda.is_available()
+            else 0
+        )
+        return {
+            "type": "result",
+            "mask_dir": output_dir.name,
+            "frames": len(frames),
+            "peak_vram_mb": peak_vram_mb,
+        }
     finally:
         inference_stack.close()
         if staging.exists():

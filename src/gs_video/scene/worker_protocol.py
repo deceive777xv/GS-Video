@@ -179,6 +179,8 @@ class ProbeEvent(_StrictModel):
     torch: str = Field(min_length=1, max_length=128)
     gsplat: str = Field(min_length=1, max_length=128)
     device: Literal["cuda"]
+    total_vram_mb: int = Field(gt=0)
+    free_vram_mb: int = Field(gt=0)
 
 
 WorkerEvent: TypeAlias = Annotated[

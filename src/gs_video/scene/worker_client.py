@@ -22,6 +22,7 @@ from gs_video.domain.contracts import PickBuffer, RenderSequence
 from gs_video.domain.errors import GsVideoError, UnsupportedMaterialError
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
+from gs_video.pipeline.gpu import GpuAdmissionGate
 from gs_video.scene.worker_protocol import (
     CompleteEvent,
     ErrorEvent,
@@ -53,6 +54,8 @@ class RendererWorkerIdentity:
     torch: str
     gsplat: str
     device: str
+    total_vram_mb: int = 0
+    free_vram_mb: int = 0
 
 
 @dataclass(frozen=True)
@@ -86,6 +89,7 @@ class RendererWorkerClient:
         process_factory: Any = subprocess.Popen,
         tree_guard_factory: Any = create_process_tree_guard,
         log_path: Path | None = None,
+        gpu_gate: GpuAdmissionGate | None = None,
     ) -> None:
         if not worker_prefix or any(not item for item in worker_prefix):
             raise ValueError("worker prefix must contain nonempty argv entries")
@@ -102,6 +106,7 @@ class RendererWorkerClient:
         self.log_path = Path(log_path or default_root / "logs" / "renderer-worker.log")
         self._active: set[_ActiveWorker] = set()
         self._active_lock = threading.Lock()
+        self._gpu_gate = gpu_gate
 
     @staticmethod
     def _create_control_file(parent: Path, label: str, contents: bytes) -> Path:
@@ -417,6 +422,17 @@ class RendererWorkerClient:
         emit: ProgressEmitter,
         token: CancellationToken,
     ) -> tuple[WorkerEvent, int]:
+        if self._gpu_gate is not None:
+            with self._gpu_gate.hold(token):
+                return self._run_admitted(request, emit, token)
+        return self._run_admitted(request, emit, token)
+
+    def _run_admitted(
+        self,
+        request: WorkerRequest,
+        emit: ProgressEmitter,
+        token: CancellationToken,
+    ) -> tuple[WorkerEvent, int]:
         self._validate_before_start(request, self.log_path)
         parent = self._request_parent(request, self.log_path)
         request_path = parent / f".gs-video-renderer-request-{uuid.uuid4().hex}.json"
@@ -680,7 +696,11 @@ class RendererWorkerClient:
         if not isinstance(terminal, ProbeEvent):
             raise GsVideoError("renderer probe returned the wrong terminal event")
         return RendererWorkerIdentity(
-            torch=terminal.torch, gsplat=terminal.gsplat, device=terminal.device
+            torch=terminal.torch,
+            gsplat=terminal.gsplat,
+            device=terminal.device,
+            total_vram_mb=terminal.total_vram_mb,
+            free_vram_mb=terminal.free_vram_mb,
         )
 
     def _terminate_all_sync(self) -> None:

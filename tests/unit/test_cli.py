@@ -64,10 +64,12 @@ def test_serve_loads_runtime_and_reads_one_bounded_private_token(
     runtime = (tmp_path / "runtime.json").absolute()
     runtime.write_text("{}", encoding="utf-8")
     loaded = object()
-    calls: list[tuple[object, str]] = []
+    calls: list[tuple[object, str, tuple[str, ...]]] = []
 
-    def fake_run_api(config: object, token: str) -> int:
-        calls.append((config, token))
+    def fake_run_api(
+        config: object, token: str, browser_origins: tuple[str, ...] = ()
+    ) -> int:
+        calls.append((config, token, browser_origins))
         return 7
 
     monkeypatch.setattr(cli, "load_runtime_config", lambda path: loaded)
@@ -75,11 +77,18 @@ def test_serve_loads_runtime_and_reads_one_bounded_private_token(
     monkeypatch.setattr("sys.stdin", io.StringIO("private-token\nignored\n"))
 
     exit_code = cli.main(
-        ["--serve", "--runtime-config", str(runtime), "--session-token-stdin"]
+        [
+            "--serve",
+            "--runtime-config",
+            str(runtime),
+            "--session-token-stdin",
+            "--browser-origin",
+            "http://127.0.0.1:4173",
+        ]
     )
 
     assert exit_code == 7
-    assert calls == [(loaded, "private-token")]
+    assert calls == [(loaded, "private-token", ("http://127.0.0.1:4173",))]
     captured = capsys.readouterr()
     assert "private-token" not in captured.out
     assert "private-token" not in captured.err

@@ -16,7 +16,13 @@ import { TauriPlatformBridge } from './tauri-platform-bridge'
 const bootstrap = {
   api_version: '1',
   capabilities: [],
-  environment: { ready: true, vram_mb: 8192, issues: [], renderer_versions: null },
+  environment: {
+    ready: true,
+    vram_mb: 8192,
+    vram_limit_mb: 8192,
+    issues: [],
+    renderer_versions: null,
+  },
   project: {
     schema_version: 3,
     project_id: 'project-1',

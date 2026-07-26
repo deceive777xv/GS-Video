@@ -117,6 +117,7 @@ def test_health_and_bootstrap_return_bounded_session_state(
     assert body["environment"] == {
         "ready": True,
         "vram_mb": 8192,
+        "vram_limit_mb": 8192,
         "issues": [],
         "renderer_versions": None,
     }

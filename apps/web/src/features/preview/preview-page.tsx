@@ -169,9 +169,8 @@ export function PreviewPage({
     || /(camera|authority|preview_stale|pick)/.test(recoveryKey)
   )
   const resourceRecovery = !subjectRecovery && !cameraRecovery && (
-    recoveryTarget === 'render'
-    || recoveryTarget === 'composite'
-    || /(resource|cuda|gpu|vram|memory|render)/.test(recoveryKey)
+    recoveryTarget === 'composite'
+    || /(composite|encode|preview)/.test(recoveryKey)
   )
   const retryable = activeTask?.status === 'failed'
     && eventError?.retryable === true

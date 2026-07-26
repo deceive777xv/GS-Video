@@ -1,4 +1,5 @@
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 import logging
 from pathlib import Path, PureWindowsPath
 from uuid import uuid4
@@ -27,6 +28,15 @@ CompareAndSetStage = Callable[
     [StageName, StageState, StageWriteGuard], StageWriteResult
 ]
 ClaimStage = Callable[..., StageClaimResult]
+
+
+@dataclass(frozen=True)
+class PipelineOutcome:
+    requested_stage: StageName
+    terminal_stage: StageName
+    state: StageState
+    error_category: str | None = None
+    retryable: bool = False
 
 
 def _project_relative_path(path: Path) -> str:
@@ -129,6 +139,14 @@ class PipelineRunner:
         token: CancellationToken,
         emit: ProgressEmitter | None = None,
     ) -> StageState:
+        return self.run_outcome(name, token, emit).state
+
+    def run_outcome(
+        self,
+        name: StageName,
+        token: CancellationToken,
+        emit: ProgressEmitter | None = None,
+    ) -> PipelineOutcome:
         run_emit = self.emit if emit is None else emit
         if name not in self.stages:
             raise ValueError(f"unregistered target stage: {name.value}")
@@ -138,12 +156,18 @@ class PipelineRunner:
             and self.reuse_succeeded
             and state.status is StageStatus.SUCCEEDED
         ):
-            return state
+            return PipelineOutcome(name, name, state)
 
         for dependency in self.dependencies.get(name, ()):
-            dependency_state = self.run(dependency, token, run_emit)
-            if dependency_state.status is not StageStatus.SUCCEEDED:
-                return state
+            dependency_outcome = self.run_outcome(dependency, token, run_emit)
+            if dependency_outcome.state.status is not StageStatus.SUCCEEDED:
+                return PipelineOutcome(
+                    requested_stage=name,
+                    terminal_stage=dependency_outcome.terminal_stage,
+                    state=dependency_outcome.state,
+                    error_category=dependency_outcome.error_category,
+                    retryable=dependency_outcome.retryable,
+                )
 
         run_id = uuid4().hex
         if self.claim_stage is not None:
@@ -171,8 +195,10 @@ class PipelineRunner:
                 ),
             )
         if not started:
-            return state
+            return PipelineOutcome(name, name, state)
 
+        error_category: str | None = None
+        retryable = False
         try:
             token.raise_if_cancelled()
             result = self.stages[name].execute(self.project, token, run_emit)
@@ -194,11 +220,15 @@ class PipelineRunner:
             terminal = state.model_copy(deep=True)
             terminal.status = StageStatus.FAILED
             terminal.error_code = error.code
+            error_category = error.category
+            retryable = error.retryable
         except Exception:
             logger.exception("Unexpected failure in pipeline stage %s", name.value)
             terminal = state.model_copy(deep=True)
             terminal.status = StageStatus.FAILED
             terminal.error_code = "unexpected_stage_failure"
+            error_category = "system"
+            retryable = False
 
         terminal.run_id = None
         state, _applied = self._compare_and_set(
@@ -210,4 +240,10 @@ class PipelineRunner:
                 run_id=running.run_id,
             ),
         )
-        return state
+        return PipelineOutcome(
+            requested_stage=name,
+            terminal_stage=name,
+            state=state,
+            error_category=error_category,
+            retryable=retryable,
+        )

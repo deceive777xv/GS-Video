@@ -686,7 +686,8 @@ def build_router() -> APIRouter:
     )
     async def create_task(request: Request, task: TaskCreateRequest) -> TaskSnapshot:
         stage = StageName(task.target_stage)
-        runner = _services(request).pipeline_runner
+        services = _services(request)
+        runner = services.pipeline_runner
         supports = getattr(runner, "supports", None)
         if callable(supports) and not supports(stage):
             raise ApiError(
@@ -696,6 +697,25 @@ def build_router() -> APIRouter:
                 message="The requested workflow stage is not assembled in this build.",
                 retryable=False,
             )
+        if stage in {
+            StageName.SEGMENT,
+            StageName.RENDER,
+            StageName.COMPOSITE,
+            StageName.EXPORT,
+        }:
+            report = await asyncio.to_thread(services.environment_doctor.check)
+            if not report.ready:
+                issue_codes = ", ".join(issue.code for issue in report.issues[:8])
+                raise ApiError(
+                    503,
+                    code="environment_not_ready",
+                    category="environment",
+                    message=(
+                        "Repair the local runtime before starting this stage"
+                        + (f": {issue_codes}" if issue_codes else ".")
+                    ),
+                    retryable=True,
+                )
         snapshot = await _task_service(request).create(stage)
         repository = _services(request).project_repository
         await asyncio.to_thread(

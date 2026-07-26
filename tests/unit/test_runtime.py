@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 from typing import Any, cast
@@ -8,7 +9,7 @@ from pydantic import SecretStr, ValidationError
 from gs_video.api.schemas import ApiError
 from gs_video.api.workflow import WorkerPreviewService
 from gs_video.domain.contracts import SegmentationBackend
-from gs_video.domain.models import SceneSummary, StageName
+from gs_video.domain.models import SceneSummary, StageName, StageState, StageStatus
 from gs_video.runtime import (
     WorkflowRuntimeConfig,
     assemble_api_services,
@@ -16,6 +17,7 @@ from gs_video.runtime import (
 )
 from gs_video.scene.camera import OrbitCamera
 from gs_video.scene.worker_client import RendererWorkerClient
+from gs_video.project.repository import ProjectRepository
 
 
 def runtime_payload(workspace: Path) -> dict[str, object]:
@@ -147,6 +149,77 @@ def test_production_assembly_registers_every_stage(tmp_path: Path) -> None:
     assert services.preview_service is not None
     assert settings.bind_host == "127.0.0.1"
     assert settings.port == 0
+
+
+def test_production_assembly_locks_then_reconciles_and_reopens_project(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-owned"
+    workspace.mkdir()
+    config = load_runtime_config(write_runtime(workspace, runtime_payload(workspace)))
+    repository = ProjectRepository(config.project_root)
+    project = repository.create("restart")
+    project.workflow.active_task_id = "lost-task"
+    project.stages[StageName.SEGMENT] = StageState(
+        status=StageStatus.RUNNING, run_id="lost-run"
+    )
+    repository.save(project)
+
+    _settings, first = assemble_api_services(config, SecretStr("secret"))
+    recovered = first.project_repository.load()
+    assert recovered.workflow.active_task_id is None
+    assert recovered.stages[StageName.SEGMENT].status is StageStatus.FAILED
+    assert recovered.stages[StageName.SEGMENT].error_code == "interrupted"
+    with pytest.raises(RuntimeError, match="already open"):
+        assemble_api_services(config, SecretStr("second"))
+
+    asyncio.run(first.worker_registry.terminate_all())
+    _settings, reopened = assemble_api_services(config, SecretStr("third"))
+    claim = reopened.project_repository.claim_stage(
+        StageName.SEGMENT, reuse_succeeded=False, run_id="retry"
+    )
+    assert claim.claimed
+    asyncio.run(reopened.worker_registry.terminate_all())
+
+
+def test_production_assembly_adds_explicit_loopback_browser_origin(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-browser"
+    workspace.mkdir()
+    config = load_runtime_config(write_runtime(workspace, runtime_payload(workspace)))
+
+    settings, _services = assemble_api_services(
+        config,
+        SecretStr("secret"),
+        browser_origins=("http://127.0.0.1:4173",),
+    )
+
+    assert "http://127.0.0.1:4173" in settings.allowed_origins
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "*",
+        "https://example.com",
+        "http://127.0.0.1:4173/path",
+        "http://user@127.0.0.1:4173",
+    ],
+)
+def test_production_assembly_rejects_unsafe_browser_origin(
+    tmp_path: Path, origin: str
+) -> None:
+    workspace = tmp_path / f"workspace-browser-{abs(hash(origin))}"
+    workspace.mkdir()
+    config = load_runtime_config(write_runtime(workspace, runtime_payload(workspace)))
+
+    with pytest.raises(ValueError, match="browser origin"):
+        assemble_api_services(
+            config,
+            SecretStr("secret"),
+            browser_origins=(origin,),
+        )
 
 
 def test_worker_preview_applies_conservative_configured_vram_limit(

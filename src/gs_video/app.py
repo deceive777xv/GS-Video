@@ -143,14 +143,22 @@ def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
     return app
 
 
-def run_api(config: WorkflowRuntimeConfig, session_token: str) -> int:
+def run_api(
+    config: WorkflowRuntimeConfig,
+    session_token: str,
+    browser_origins: tuple[str, ...] = (),
+) -> int:
     if (
         not session_token
         or len(session_token) > 4096
         or any(ord(character) < 32 or ord(character) == 127 for character in session_token)
     ):
         raise ValueError("session token must contain between 1 and 4096 characters")
-    settings, services = assemble_api_services(config, SecretStr(session_token))
+    settings, services = assemble_api_services(
+        config,
+        SecretStr(session_token),
+        browser_origins=browser_origins,
+    )
     app = create_app(settings, services)
     uvicorn.run(
         app,

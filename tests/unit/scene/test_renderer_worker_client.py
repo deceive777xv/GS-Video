@@ -529,7 +529,8 @@ def test_pick_rejects_nonfinite_or_negative_depth(tmp_path: Path, bad_depth: flo
 
 def test_probe_returns_strict_identity(tmp_path: Path) -> None:
     process = FakeProcess([
-        '{"type":"probe","torch":"2.7.1","gsplat":"1.5.3","device":"cuda"}\n'
+        '{"type":"probe","torch":"2.7.1","gsplat":"1.5.3","device":"cuda",'
+        '"total_vram_mb":16384,"free_vram_mb":12288}\n'
     ])
     identity = _client(tmp_path, lambda *_args, **_kwargs: process).probe(
         ProbeRequest(type="probe"), CancellationToken()
@@ -537,6 +538,8 @@ def test_probe_returns_strict_identity(tmp_path: Path) -> None:
     assert identity.torch == "2.7.1"
     assert identity.gsplat == "1.5.3"
     assert identity.device == "cuda"
+    assert identity.total_vram_mb == 16384
+    assert identity.free_vram_mb == 12288
 
 
 def test_stderr_log_is_bounded_to_one_mib(tmp_path: Path) -> None:
@@ -561,7 +564,8 @@ def test_diagnostic_log_replaces_hardlink_without_modifying_its_target(
     log.parent.mkdir()
     os.link(victim, log)
     process = FakeProcess([
-        '{"type":"probe","torch":"2","gsplat":"1","device":"cuda"}\n'
+        '{"type":"probe","torch":"2","gsplat":"1","device":"cuda",'
+        '"total_vram_mb":16384,"free_vram_mb":12288}\n'
     ], stderr="diagnostic")
 
     identity = _client(tmp_path, lambda *_args, **_kwargs: process).probe()

@@ -10,6 +10,7 @@ from gs_video.domain.models import (
     Project,
     StageName,
     StageState,
+    StageStatus,
     SubjectPromptState,
 )
 from gs_video.project.repository import ProjectRepository
@@ -158,3 +159,27 @@ def test_repository_round_trips_workflow_authority(tmp_path: Path) -> None:
     loaded = repo.load()
     assert loaded.workflow.subject_prompt == project.workflow.subject_prompt
     assert loaded.workflow.target_camera == project.workflow.target_camera
+
+
+def test_reconcile_interrupted_runs_clears_owner_and_allows_retry(tmp_path: Path) -> None:
+    repository = ProjectRepository(tmp_path / "project")
+    project = repository.create("interrupted")
+    project.workflow.active_task_id = "lost-task"
+    project.stages[StageName.RENDER] = StageState(
+        status=StageStatus.RUNNING,
+        run_id="lost-run",
+        cache_key="must-not-survive",
+    )
+    repository.save(project)
+
+    recovered = repository.reconcile_interrupted_runs()
+    state = recovered.stages[StageName.RENDER]
+
+    assert recovered.workflow.active_task_id is None
+    assert state.status is StageStatus.FAILED
+    assert state.error_code == "interrupted"
+    assert state.cache_key is None
+    assert state.run_id is None
+    assert repository.claim_stage(
+        StageName.RENDER, reuse_succeeded=False, run_id="retry"
+    ).claimed

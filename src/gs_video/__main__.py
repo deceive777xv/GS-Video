@@ -15,6 +15,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--runtime-config", type=Path)
     parser.add_argument("--session-token-stdin", action="store_true")
+    parser.add_argument("--browser-origin", action="append", default=[])
     return parser
 
 
@@ -54,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
         token = _read_private_token()
         from gs_video.app import run_api
 
-        return run_api(config, token)
+        return run_api(config, token, tuple(args.browser_origin))
 
     parser.print_help()
     return 0

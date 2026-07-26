@@ -157,6 +157,7 @@ export interface EnvironmentIssueDto {
 export interface EnvironmentDto {
   ready: boolean
   vram_mb: number
+  vram_limit_mb: number
   issues: EnvironmentIssueDto[]
   renderer_versions: Record<string, string> | null
 }

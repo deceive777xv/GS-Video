@@ -77,6 +77,7 @@ function bootstrap(current: ProjectDto): BootstrapDto {
     environment: {
       ready: true,
       vram_mb: 8192,
+      vram_limit_mb: 8192,
       issues: [],
       renderer_versions: { renderer: 'fake' },
     },
@@ -929,5 +930,34 @@ describe('guided workflow', () => {
     expect(screen.getByText('已用时 10 秒')).toBeVisible()
     expect(screen.queryByText(/预计剩余/)).toBeNull()
     expect(screen.queryByText('过期事件')).toBeNull()
+  })
+
+  it('does not display an older matching event after a newer terminal REST snapshot', () => {
+    const current = project()
+    current.workflow.active_task_id = 'task-render'
+    const harness = createHarness(current)
+    const task = {
+      id: 'task-render', target_stage: 'render' as const, status: 'cancelled' as const,
+      revision: 9, error: null,
+    }
+    const snapshot = {
+      task, revision: 9, pendingResyncRevision: null, connection: 'connected' as const,
+      latestEvent: {
+        type: 'task_event' as const, task_id: task.id, revision: 8,
+        stage: 'render' as const, progress: 0.5, current: 15, total: 30,
+        message: '过期的运行进度', elapsed_seconds: 10, eta_seconds: 10, error: null,
+      },
+    }
+    const createOwnedTaskStore = () => ({
+      subscribe: () => () => undefined, snapshot: () => snapshot,
+      onEvent: vi.fn(), onConnectionChange: vi.fn(), replaceFromRest: vi.fn(), acknowledgeResync: vi.fn(),
+      whenIdle: async () => undefined, dispose: vi.fn(),
+    })
+
+    render(<App backend={harness.client} createOwnedTaskStore={createOwnedTaskStore} initialBootstrap={bootstrap(current)} platform={harness.platform} />)
+
+    expect(screen.getByText('render · cancelled')).toBeVisible()
+    expect(screen.queryByText('过期的运行进度')).toBeNull()
+    expect(screen.queryByRole('progressbar', { name: 'render 进度' })).toBeNull()
   })
 })

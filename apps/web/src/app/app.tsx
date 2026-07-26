@@ -377,9 +377,13 @@ export function App({
   const unresolvedProjectOwner = project.workflow.active_task_id !== null
     && missingTaskOwnerId !== project.workflow.active_task_id
     && (activeTask === null || activeTask.id !== project.workflow.active_task_id)
-  const workflowBusy = startingStage || activeTaskRunning || unresolvedProjectOwner
+  const workflowBusy = startingStage
+    || activeTaskRunning
+    || unresolvedProjectOwner
+    || !bootstrap.environment.ready
   const progressEvent = taskState.latestEvent?.type === 'task_event'
     && taskState.latestEvent.task_id === activeTask?.id
+    && taskState.latestEvent.revision >= (activeTask?.revision ?? 0)
     ? taskState.latestEvent
     : null
   const restProgress = activeTask !== null

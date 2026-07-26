@@ -23,6 +23,7 @@ class EnvironmentIssue(BaseModel):
 class EnvironmentReport(BaseModel):
     ready: bool
     vram_mb: int
+    vram_limit_mb: int = 8192
     issues: list[EnvironmentIssue]
     renderer_versions: dict[str, str] | None = None
 
@@ -77,6 +78,7 @@ class EnvironmentDoctor:
         process_runner: Callable[..., Any] = subprocess.run,
         check_renderer: bool = False,
         renderer_probe: Callable[[], tuple[str | None, str | None]] = probe_renderer,
+        vram_limit_mb: int = 8192,
     ) -> None:
         self._which = which
         self._cuda_probe = cuda_probe
@@ -87,6 +89,7 @@ class EnvironmentDoctor:
         self._process_runner = process_runner
         self._check_renderer = check_renderer
         self._renderer_probe = renderer_probe
+        self._vram_limit_mb = vram_limit_mb
 
     def _renderer_versions(self, issues: list[EnvironmentIssue]) -> dict[str, str] | None:
         if not self._check_renderer:
@@ -215,6 +218,7 @@ class EnvironmentDoctor:
         return EnvironmentReport(
             ready=not issues,
             vram_mb=vram_mb,
+            vram_limit_mb=self._vram_limit_mb,
             issues=issues,
             renderer_versions=renderer_versions,
         )

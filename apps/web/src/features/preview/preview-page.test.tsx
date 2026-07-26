@@ -59,7 +59,7 @@ const failedProject = (target: TaskDto['target_stage'] = 'composite') => ({
 
 it.each([
   ['segment', 'subject_mask_invalid', '重新选择人物', ['降低预览分辨率', '返回机位']],
-  ['render', 'gpu_out_of_memory', '降低预览分辨率', ['重新选择人物', '返回机位']],
+  ['composite', 'preview_encode_failed', '降低预览分辨率', ['重新选择人物', '返回机位']],
   ['solve_camera', 'camera_authority_stale', '返回机位', ['重新选择人物', '降低预览分辨率']],
 ] as const)('shows only the targeted %s recovery action', (target, code, expected, absent) => {
   const task: TaskDto = {
@@ -85,6 +85,31 @@ it.each([
   expect(screen.getByRole('button', { name: expected })).toBeInTheDocument()
   for (const name of absent) expect(screen.queryByRole('button', { name })).toBeNull()
   expect(screen.queryByRole('button', { name: '重试' })).toBeNull()
+})
+
+it('does not claim preview downscaling can recover a full-resolution render OOM', () => {
+  const task: TaskDto = {
+    id: 'task-render', target_stage: 'render', status: 'failed', revision: 3,
+    error: 'gpu_out_of_memory',
+  }
+  render(
+    <PreviewPage
+      activeTask={task}
+      backend={{} as BackendClient}
+      busy={false}
+      latestEvent={{
+        type: 'task_event', task_id: task.id, revision: 3, stage: 'render',
+        progress: 1, error: { code: task.error, category: 'resource', retryable: false },
+      }}
+      onBackToCamera={vi.fn()}
+      onError={vi.fn()}
+      onProjectChange={vi.fn()}
+      onReselectSubject={vi.fn()}
+      onStartStage={vi.fn()}
+      project={failedProject('render')}
+    />,
+  )
+  expect(screen.queryByRole('button', { name: '降低预览分辨率' })).toBeNull()
 })
 
 it('offers retry only for a failed task whose event says it is retryable', () => {

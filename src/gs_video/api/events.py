@@ -17,6 +17,7 @@ from gs_video.api.schemas import ApiError, ApiSettings, TaskEvent, TaskSnapshot,
 from gs_video.domain.models import StageName, StageState, StageStatus
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter, discard_progress
+from gs_video.pipeline.runner import PipelineOutcome
 
 
 class PipelineRunnerLike(Protocol):
@@ -173,6 +174,18 @@ class TaskService:
                         message="The task service is not running.",
                         retryable=True,
                     )
+                terminal_statuses = {
+                    TaskStatus.SUCCEEDED.value,
+                    TaskStatus.FAILED.value,
+                    TaskStatus.CANCELLED.value,
+                }
+                for retained_id, retained in tuple(self._snapshots.items()):
+                    if len(self._snapshots) < self._max_tasks:
+                        break
+                    if retained.status in terminal_statuses:
+                        self._snapshots.pop(retained_id, None)
+                        self._tokens.pop(retained_id, None)
+                        self._started_at.pop(retained_id, None)
                 if len(self._snapshots) >= self._max_tasks:
                     raise ApiError(
                         429,
@@ -230,12 +243,18 @@ class TaskService:
         error: str | None = None,
         *,
         elapsed_seconds: float | None = None,
+        error_category: str = "task",
+        error_retryable: bool = False,
     ) -> TaskSnapshot:
         committed: TaskSnapshot | None = None
         event_error = (
             None
             if error is None
-            else {"code": error, "category": "task", "retryable": False}
+            else {
+                "code": error,
+                "category": error_category,
+                "retryable": error_retryable,
+            }
         )
 
         async def commit(event: TaskEvent) -> bool:
@@ -399,8 +418,10 @@ class TaskService:
             future.result()
             token.raise_if_cancelled()
         try:
+            run_outcome = getattr(self._runner, "run_outcome", None)
+            runner_method = run_outcome if callable(run_outcome) else self._runner.run
             result = await loop.run_in_executor(
-                self._executor, self._runner.run, stage, token, relay
+                self._executor, runner_method, stage, token, relay
             )
         except Exception:
             await self._update(
@@ -412,6 +433,9 @@ class TaskService:
                 elapsed_seconds=monotonic() - started_at,
             )
             return
+        outcome = result if isinstance(result, PipelineOutcome) else None
+        state = outcome.state if outcome is not None else result
+        terminal_stage = outcome.terminal_stage if outcome is not None else stage
         mapped = {
             StageStatus.SUCCEEDED: TaskStatus.SUCCEEDED,
             StageStatus.FAILED: TaskStatus.FAILED,
@@ -419,15 +443,17 @@ class TaskService:
             StageStatus.STALE: TaskStatus.CANCELLED,
             StageStatus.PENDING: TaskStatus.CANCELLED,
             StageStatus.RUNNING: TaskStatus.CANCELLED,
-        }[result.status]
-        error = result.error_code if mapped is TaskStatus.FAILED else None
+        }[state.status]
+        error = state.error_code if mapped is TaskStatus.FAILED else None
         await self._update(
             task_id,
-            stage,
+            terminal_stage,
             mapped,
             1.0,
             error,
             elapsed_seconds=monotonic() - started_at,
+            error_category=(outcome.error_category or "task") if outcome else "task",
+            error_retryable=outcome.retryable if outcome else False,
         )
 
     async def cancel(self, task_id: str) -> TaskSnapshot:

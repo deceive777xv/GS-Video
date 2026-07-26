@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from gs_video.app import create_app
@@ -36,11 +37,25 @@ def test_production_assembly_builds_runnable_api_without_spawning_workers(
         encoding="utf-8",
     )
 
+    browser_origin = "http://127.0.0.1:4173"
     settings, services = assemble_api_services(
-        load_runtime_config(runtime_path.absolute()), SecretStr("session-secret")
+        load_runtime_config(runtime_path.absolute()),
+        SecretStr("session-secret"),
+        browser_origins=(browser_origin,),
     )
     app = create_app(settings, services)
 
     assert app.state.preview_service is services.preview_service
     assert all(services.pipeline_runner.supports(stage) for stage in StageName)
     assert services.project_repository.load().name == "GS Video project"
+    with TestClient(app) as client:
+        preflight = client.options(
+            "/api/v1/bootstrap",
+            headers={
+                "Origin": browser_origin,
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization",
+            },
+        )
+    assert preflight.status_code == 200
+    assert preflight.headers["access-control-allow-origin"] == browser_origin

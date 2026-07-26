@@ -14,11 +14,11 @@ from gs_video.api.schemas import ApiSettings
 from gs_video.app import create_app
 from gs_video.domain.contracts import StageResult
 from gs_video.domain.models import Project, StageName, StageState, StageStatus
-from gs_video.environment.doctor import EnvironmentReport
+from gs_video.environment.doctor import EnvironmentIssue, EnvironmentReport
 from gs_video.domain.errors import CancelledError
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter, discard_progress
-from gs_video.pipeline.runner import PipelineRunner
+from gs_video.pipeline.runner import PipelineOutcome, PipelineRunner
 from gs_video.project.repository import ProjectRepository
 
 
@@ -28,7 +28,22 @@ ORIGIN = "http://localhost:5173"
 
 class StaticDoctor:
     def check(self) -> EnvironmentReport:
-        return EnvironmentReport(ready=False, vram_mb=0, issues=[])
+        return EnvironmentReport(ready=True, vram_mb=8192, issues=[])
+
+
+class ChangingDoctor:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def check(self) -> EnvironmentReport:
+        self.calls += 1
+        if self.calls == 1:
+            return EnvironmentReport(ready=True, vram_mb=8192, issues=[])
+        return EnvironmentReport(
+            ready=False,
+            vram_mb=0,
+            issues=[EnvironmentIssue(code="cuda_unavailable", message="CUDA unavailable")],
+        )
 
 
 class SucceedingRunner:
@@ -41,6 +56,23 @@ class SucceedingRunner:
         del emit
         token.raise_if_cancelled()
         return StageState(status=StageStatus.SUCCEEDED, cache_key=f"{name.value}-key")
+
+
+class DependencyFailureRunner(SucceedingRunner):
+    def run_outcome(
+        self,
+        name: StageName,
+        token: CancellationToken,
+        emit: ProgressEmitter = discard_progress,
+    ) -> PipelineOutcome:
+        del token, emit
+        return PipelineOutcome(
+            requested_stage=name,
+            terminal_stage=StageName.SEGMENT,
+            state=StageState(status=StageStatus.FAILED, error_code="repairable"),
+            error_category="input",
+            retryable=True,
+        )
 
 
 class RunnerLike(Protocol):
@@ -194,13 +226,14 @@ def make_app(
     event_window: int = 256,
     runner: RunnerLike | None = None,
     shutdown_timeout: float = 5.0,
+    doctor: object | None = None,
 ) -> tuple[object, RecordingWorkerRegistry]:
     repository = ProjectRepository(tmp_path / "project")
     repository.save(repository.create("tasks"))
     registry = RecordingWorkerRegistry()
     services = ApiServices(
         project_repository=repository,
-        environment_doctor=StaticDoctor(),
+        environment_doctor=doctor or StaticDoctor(),
         pipeline_runner=runner or SucceedingRunner(),
         worker_registry=registry,
         preview_service=FakePreviewService(),
@@ -215,6 +248,52 @@ def make_app(
         shutdown_timeout=shutdown_timeout,
     )
     return create_app(settings, services), registry
+
+
+def test_task_preflight_rechecks_environment_after_bootstrap(tmp_path: Path) -> None:
+    doctor = ChangingDoctor()
+    app, _ = make_app(tmp_path, doctor=doctor)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+
+    with TestClient(app) as client:
+        assert client.get("/api/v1/bootstrap", headers=headers).status_code == 200
+        response = client.post(
+            "/api/v1/tasks", json={"target_stage": "segment"}, headers=headers
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "code": "environment_not_ready",
+        "category": "environment",
+        "message": "Repair the local runtime before starting this stage: cuda_unavailable",
+        "retryable": True,
+    }
+
+
+def test_dependency_failure_is_failed_with_actual_stage_and_retryability(
+    tmp_path: Path,
+) -> None:
+    app, _ = make_app(tmp_path, runner=DependencyFailureRunner())
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+
+    with TestClient(app) as client:
+        task_id = client.post(
+            "/api/v1/tasks", json={"target_stage": "composite"}, headers=headers
+        ).json()["id"]
+        snapshot = _wait_for_terminal_task(client, task_id, headers)
+        events = app.state.event_bus.after(0)
+
+    assert snapshot["target_stage"] == "composite"
+    assert snapshot["status"] == "failed"
+    assert snapshot["error"] == "repairable"
+    assert events is not None
+    terminal = events[-1]
+    assert terminal.stage == "segment"
+    assert terminal.error == {
+        "code": "repairable",
+        "category": "input",
+        "retryable": True,
+    }
 
 
 def _wait_for_terminal_task(

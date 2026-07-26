@@ -201,8 +201,14 @@ def _probe(_request: ProbeRequest) -> ProbeEvent:
         raise RuntimeError("gsplat version is unavailable")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA device is unavailable")
+    free_vram, total_vram = torch.cuda.mem_get_info(0)
     return ProbeEvent(
-        type="probe", torch=torch_version, gsplat=gsplat_version, device="cuda"
+        type="probe",
+        torch=torch_version,
+        gsplat=gsplat_version,
+        device="cuda",
+        total_vram_mb=total_vram // (1024 * 1024),
+        free_vram_mb=free_vram // (1024 * 1024),
     )
 
 

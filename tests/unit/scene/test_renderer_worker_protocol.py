@@ -142,7 +142,14 @@ def test_worker_redirects_dependency_stdout_away_from_jsonl_protocol(
     def noisy_dependency(_request: object) -> ProbeEvent:
         print("dependency noise")
         os.write(1, b"native dependency noise\n")
-        return ProbeEvent(type="probe", torch="2.7", gsplat="1.5", device="cuda")
+        return ProbeEvent(
+            type="probe",
+            torch="2.7",
+            gsplat="1.5",
+            device="cuda",
+            total_vram_mb=16384,
+            free_vram_mb=12288,
+        )
 
     monkeypatch.setattr(worker_module, "_run_validated_request", noisy_dependency)
     assert worker_module.main([
@@ -156,7 +163,12 @@ def test_worker_redirects_dependency_stdout_away_from_jsonl_protocol(
     stdout_lines = captured.out.splitlines()
     assert stdout_lines[-1] == "stdout restored"
     assert json.loads(stdout_lines[0]) == {
-        "type": "probe", "torch": "2.7", "gsplat": "1.5", "device": "cuda"
+        "type": "probe",
+        "torch": "2.7",
+        "gsplat": "1.5",
+        "device": "cuda",
+        "total_vram_mb": 16384,
+        "free_vram_mb": 12288,
     }
 
 

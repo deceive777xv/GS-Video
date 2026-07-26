@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from ipaddress import ip_address
+import os
 import stat
+import subprocess
 from pathlib import Path, PurePosixPath
 from threading import Lock
-from typing import Any
+from typing import Any, cast
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
@@ -32,8 +36,10 @@ from gs_video.pipeline.services import (
     TrajectoryMapWorkflowService,
     WorkflowPaths,
 )
+from gs_video.pipeline.cancellation import CancellationToken
+from gs_video.pipeline.gpu import GpuAdmissionGate
 from gs_video.pipeline.workflow import WorkflowServices, build_mvp_workflow
-from gs_video.project.repository import ProjectRepository
+from gs_video.project.repository import ProjectInstanceLock, ProjectRepository
 from gs_video.scene.worker_client import RendererWorkerClient
 from gs_video.segmentation.client import VideoSegmenterClient
 from gs_video.segmentation.paths import has_reparse_component, is_wsl_prefix
@@ -44,6 +50,51 @@ _TAURI_ORIGINS = (
     "http://tauri.localhost",
     "https://tauri.localhost",
 )
+
+
+def validate_browser_origins(origins: tuple[str, ...]) -> tuple[str, ...]:
+    if len(origins) > 16:
+        raise ValueError("browser origin allowlist is too large")
+    normalized: list[str] = []
+    for origin in origins:
+        if (
+            not origin
+            or len(origin) > 2048
+            or any(ord(character) < 32 or ord(character) == 127 for character in origin)
+        ):
+            raise ValueError("browser origin must be a bounded HTTP loopback origin")
+        parsed = urlsplit(origin)
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError("browser origin port is invalid") from error
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.hostname is None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or (port is not None and port == 0)
+        ):
+            raise ValueError("browser origin must be an HTTP loopback origin without a path")
+        hostname = parsed.hostname.lower()
+        if hostname == "localhost":
+            rendered_host = hostname
+        else:
+            try:
+                address = ip_address(hostname)
+            except ValueError as error:
+                raise ValueError("browser origin host must be loopback") from error
+            if not address.is_loopback:
+                raise ValueError("browser origin host must be loopback")
+            rendered_host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+        rendered_port = "" if port is None else f":{port}"
+        normalized.append(f"{parsed.scheme.lower()}://{rendered_host}{rendered_port}")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("browser origins must be unique")
+    return tuple(normalized)
 
 
 class WorkflowRuntimeConfig(BaseModel):
@@ -204,19 +255,36 @@ def load_runtime_config(path: Path) -> WorkflowRuntimeConfig:
 
 
 class WorkerRegistry:
-    def __init__(self, *workers: Any) -> None:
+    def __init__(
+        self,
+        *workers: Any,
+        gpu_gate: GpuAdmissionGate | None = None,
+        project_lock: ProjectInstanceLock | None = None,
+    ) -> None:
         self._workers = tuple(workers)
+        self._gpu_gate = gpu_gate
+        self._project_lock = project_lock
 
     async def terminate_all(self) -> None:
-        await asyncio.gather(
-            *(worker.terminate_all() for worker in self._workers),
-            return_exceptions=True,
-        )
+        if self._gpu_gate is not None:
+            self._gpu_gate.close()
+        try:
+            await asyncio.gather(
+                *(worker.terminate_all() for worker in self._workers),
+                return_exceptions=True,
+            )
+        finally:
+            if self._project_lock is not None:
+                self._project_lock.close()
 
 
 def assemble_api_services(
-    config: WorkflowRuntimeConfig, session_token: SecretStr
+    config: WorkflowRuntimeConfig,
+    session_token: SecretStr,
+    *,
+    browser_origins: tuple[str, ...] = (),
 ) -> tuple[ApiSettings, ApiServices]:
+    allowed_browser_origins = validate_browser_origins(browser_origins)
     if config._workspace_root is not None:
         assert config._runtime_path is not None
         _validate_loaded_config(
@@ -227,22 +295,27 @@ def assemble_api_services(
     config.project_root.mkdir(parents=True, exist_ok=True)
     if has_reparse_component(config.project_root):
         raise ValueError("project_root contains a link or reparse point")
+    project_lock = ProjectInstanceLock.acquire(config.project_root)
     repository = ProjectRepository(config.project_root)
     if repository.path.exists():
-        project = repository.load()
+        project = repository.reconcile_interrupted_runs()
     else:
         project = repository.create("GS Video project")
         repository.save(project)
+    gpu_gate = GpuAdmissionGate()
     segmentation = VideoSegmenterClient(
         backend=config.segmentation_backend,
         worker_prefix=config.segmentation_worker_prefix,
         model_config=config.segmentation_model_config,
         checkpoint=config.segmentation_checkpoint,
         log_path=config.project_root / "logs" / "segmentation-worker.log",
+        gpu_gate=gpu_gate,
+        cache_root=config.model_root / ".cache",
     )
     renderer = RendererWorkerClient(
         worker_prefix=config.renderer_worker_prefix,
         log_path=config.project_root / "logs" / "renderer-worker.log",
+        gpu_gate=gpu_gate,
     )
     paths = WorkflowPaths(config.project_root, update_project=repository.update)
     workflow_services = WorkflowServices(
@@ -289,7 +362,13 @@ def assemble_api_services(
         available = isinstance(device, str) and device.lower().startswith("cuda")
         return (
             available,
-            config.available_vram_limit_mb if available else 0,
+            min(
+                int(getattr(identity, "free_vram_mb", 0)),
+                int(getattr(identity, "total_vram_mb", 0)),
+                config.available_vram_limit_mb,
+            )
+            if available
+            else 0,
         )
 
     def external_renderer_probe() -> tuple[str | None, str | None]:
@@ -301,6 +380,23 @@ def assemble_api_services(
             gsplat_version if isinstance(gsplat_version, str) else None,
         )
 
+    def admitted_process_run(command: list[str], **options: object) -> Any:
+        cache_root = config.model_root / ".cache"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HF_HOME": str(cache_root / "huggingface"),
+                "HF_HUB_CACHE": str(cache_root / "huggingface" / "hub"),
+                "HF_HUB_OFFLINE": "1",
+                "TORCH_HOME": str(cache_root / "torch"),
+                "XDG_CACHE_HOME": str(cache_root),
+            }
+        )
+        options["env"] = environment
+        with gpu_gate.hold(CancellationToken()):
+            return cast(Any, subprocess.run)(command, **options)
+
     doctor = EnvironmentDoctor(
         cuda_probe=external_cuda_probe,
         segmentation_backend=config.segmentation_backend,
@@ -309,19 +405,26 @@ def assemble_api_services(
         checkpoint=config.segmentation_checkpoint,
         check_renderer=True,
         renderer_probe=external_renderer_probe,
+        process_runner=admitted_process_run,
+        vram_limit_mb=config.available_vram_limit_mb,
     )
     settings = ApiSettings(
         bind_host="127.0.0.1",
         port=0,
         session_token=session_token,
-        allowed_origins=_TAURI_ORIGINS,
+        allowed_origins=(*_TAURI_ORIGINS, *allowed_browser_origins),
         task_workers=1,
     )
     services = ApiServices(
         project_repository=repository,
         environment_doctor=doctor,
         pipeline_runner=runner,
-        worker_registry=WorkerRegistry(segmentation, renderer),
+        worker_registry=WorkerRegistry(
+            segmentation,
+            renderer,
+            gpu_gate=gpu_gate,
+            project_lock=project_lock,
+        ),
         preview_service=WorkerPreviewService(
             renderer,
             available_vram_limit_mb=config.available_vram_limit_mb,
@@ -336,4 +439,5 @@ __all__ = [
     "WorkerRegistry",
     "assemble_api_services",
     "load_runtime_config",
+    "validate_browser_origins",
 ]

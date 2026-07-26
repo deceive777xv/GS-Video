@@ -42,6 +42,7 @@ class Prompt:
 class MaskSequence:
     mask_dir: Path
     frame_count: int
+    peak_vram_mb: int = 0
 
 
 @dataclass(frozen=True)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +11,10 @@ from PIL import Image
 
 import gs_video.segmentation.worker as worker_module
 
-from gs_video.domain.errors import UnsupportedMaterialError
+from gs_video.domain.contracts import Prompt, SegmentationBackend
+from gs_video.domain.errors import CancelledError, UnsupportedMaterialError
+from gs_video.pipeline.cancellation import CancellationToken
+from gs_video.segmentation.client import VideoSegmenterClient
 from gs_video.segmentation.worker import _has_invisible_run, probe_backend, run_segmentation
 
 
@@ -87,7 +92,12 @@ def test_worker_covers_forward_then_only_missing_reverse_and_preserves_names(
         emit=events.append,
     )
 
-    assert result == {"type": "result", "mask_dir": "masks", "frames": 3}
+    assert result == {
+        "type": "result",
+        "mask_dir": "masks",
+        "frames": 3,
+        "peak_vram_mb": 0,
+    }
     assert [event["current"] for event in events] == [1, 2, 3]
     assert sorted(path.name for path in (tmp_path / "masks").iterdir()) == [
         "000002.png", "000010.png", "000021.png"
@@ -283,5 +293,79 @@ def test_worker_waits_for_startup_gate_before_probe(
 
 
 @pytest.mark.gpu
-def test_real_checkpoint_smoke_is_opt_in() -> None:
-    pytest.skip("requires a separately installed backend and local checkpoint")
+def test_configured_real_edgetam_checkpoint_propagates_complete_masks(
+    tmp_path: Path,
+) -> None:
+    executable = os.environ.get("GS_VIDEO_SEGMENTATION_PYTHON")
+    if not executable:
+        pytest.skip("set GS_VIDEO_SEGMENTATION_PYTHON to enable the EdgeTAM release gate")
+    required = {
+        "GS_VIDEO_PROJECT_ROOT": os.environ.get("GS_VIDEO_PROJECT_ROOT"),
+        "GS_VIDEO_EDGETAM_CONFIG": os.environ.get("GS_VIDEO_EDGETAM_CONFIG"),
+        "GS_VIDEO_EDGETAM_CHECKPOINT": os.environ.get("GS_VIDEO_EDGETAM_CHECKPOINT"),
+        "GS_VIDEO_EDGETAM_FRAMES": os.environ.get("GS_VIDEO_EDGETAM_FRAMES"),
+        "GS_VIDEO_EDGETAM_POINT": os.environ.get("GS_VIDEO_EDGETAM_POINT"),
+        "GS_VIDEO_EDGETAM_CACHE_ROOT": os.environ.get("GS_VIDEO_EDGETAM_CACHE_ROOT"),
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        pytest.fail(f"configured EdgeTAM gate is missing: {', '.join(missing)}")
+    root = Path(str(required["GS_VIDEO_PROJECT_ROOT"])).absolute()
+    python_path = Path(executable).absolute()
+    config = Path(str(required["GS_VIDEO_EDGETAM_CONFIG"])).absolute()
+    checkpoint = Path(str(required["GS_VIDEO_EDGETAM_CHECKPOINT"])).absolute()
+    frames_dir = Path(str(required["GS_VIDEO_EDGETAM_FRAMES"])).absolute()
+    cache_root = Path(str(required["GS_VIDEO_EDGETAM_CACHE_ROOT"])).absolute()
+    assets = (python_path, config, checkpoint, frames_dir, cache_root)
+    if any(root != path and root not in path.parents for path in assets):
+        pytest.fail("EdgeTAM runtime and controlled clip must remain inside the project")
+    try:
+        point_parts = str(required["GS_VIDEO_EDGETAM_POINT"]).split(",")
+        point = (int(point_parts[0]), int(point_parts[1]))
+    except (IndexError, ValueError) as error:
+        pytest.fail("GS_VIDEO_EDGETAM_POINT must be x,y")
+        raise AssertionError from error
+    frames = sorted(
+        (
+            path
+            for path in frames_dir.iterdir()
+            if path.suffix.lower() in {".jpg", ".jpeg", ".png"}
+        ),
+        key=lambda path: int(path.stem),
+    )
+    if not 2 <= len(frames) <= 30:
+        pytest.fail("EdgeTAM release clip must contain 2-30 numeric image frames")
+    client = VideoSegmenterClient(
+        backend=SegmentationBackend.EDGETAM,
+        worker_prefix=(str(python_path),),
+        model_config=config,
+        checkpoint=checkpoint,
+        log_path=root / "logs" / "edgetam-release-smoke.log",
+        cache_root=cache_root,
+    )
+    result = client.segment(
+        frames,
+        Prompt(frame_index=0, x=point[0], y=point[1]),
+        tmp_path / "masks",
+        lambda *_: None,
+        CancellationToken(),
+    )
+
+    masks = sorted(result.mask_dir.glob("*.png"))
+    assert result.frame_count == len(frames)
+    assert len(masks) == len(frames)
+    assert all(np.count_nonzero(np.asarray(Image.open(mask))) > 0 for mask in masks)
+    assert 0 < result.peak_vram_mb <= 8192
+
+    cancelled = CancellationToken()
+    cancelled.cancel()
+    started = time.monotonic()
+    with pytest.raises(CancelledError):
+        client.segment(
+            frames,
+            Prompt(frame_index=0, x=point[0], y=point[1]),
+            tmp_path / "cancelled-masks",
+            lambda *_: None,
+            cancelled,
+        )
+    assert time.monotonic() - started < 10

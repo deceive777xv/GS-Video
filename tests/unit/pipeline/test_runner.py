@@ -166,6 +166,32 @@ def test_runner_registers_outputs_only_after_stage_returns_successfully() -> Non
     assert state.error_code is None
 
 
+def test_dependency_failure_outcome_names_actual_stage_and_preserves_recovery() -> None:
+    project = Project(name="dependency-failure")
+    segment = RecordingStage(
+        lambda project, token: (_ for _ in ()).throw(RepairableError("repair prompt"))
+    )
+    composite = RecordingStage(
+        lambda project, token: StageResult((Path("composites/out.mp4"),), "unused")
+    )
+    runner = PipelineRunner(
+        project,
+        {StageName.SEGMENT: segment, StageName.COMPOSITE: composite},
+        save=lambda project: None,
+        dependencies={StageName.COMPOSITE: (StageName.SEGMENT,)},
+    )
+
+    outcome = runner.run_outcome(StageName.COMPOSITE, CancellationToken())
+
+    assert outcome.requested_stage is StageName.COMPOSITE
+    assert outcome.terminal_stage is StageName.SEGMENT
+    assert outcome.state.status is StageStatus.FAILED
+    assert outcome.state.error_code == "repairable"
+    assert outcome.error_category == "input"
+    assert outcome.retryable
+    assert project.stages[StageName.COMPOSITE].status is StageStatus.PENDING
+
+
 def test_runner_persists_typed_stage_artifact_roots() -> None:
     project = project_with_prior_output()
     stage = RecordingStage(
