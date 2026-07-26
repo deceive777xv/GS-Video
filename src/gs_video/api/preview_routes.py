@@ -13,7 +13,7 @@ from gs_video.api.export_routes import (
     _read_stable_artifact,
     _verified_artifact_state,
 )
-from gs_video.api.schemas import ApiError, ApiSettings, CompositePreviewResponse
+from gs_video.api.schemas import ApiError, CompositePreviewResponse
 from gs_video.domain.models import ArtifactRole, Project, StageName, StageStatus
 
 
@@ -32,10 +32,6 @@ class ServicesLike(Protocol):
 
 def _services(request: Request) -> ServicesLike:
     return cast(ServicesLike, request.app.state.services)
-
-
-def _settings(request: Request) -> ApiSettings:
-    return cast(ApiSettings, request.app.state.settings)
 
 
 def _preview_inspector(request: Request) -> CompositePreviewInspectorLike:
@@ -77,6 +73,22 @@ def _authoritative_preview_relative(project: Project) -> tuple[str, str]:
     ):
         raise _preview_changed()
     return expected, stage.cache_key
+
+
+def _revalidate_preview_authority(
+    repository: ProjectRepositoryLike,
+    project: Project,
+    relative: str,
+    cache_key: str,
+) -> None:
+    latest = _load_project(repository)
+    latest_relative, latest_cache_key = _authoritative_preview_relative(latest)
+    if (
+        latest.project_id != project.project_id
+        or latest_relative != relative
+        or latest_cache_key != cache_key
+    ):
+        raise _preview_changed()
 
 
 def _opaque_preview_id(
@@ -149,12 +161,12 @@ def _revalidate_preview_identity(
 
 
 def _resolve_composite_preview(
-    project: Project,
-    root: Path,
+    repository: ProjectRepositoryLike,
     inspector: CompositePreviewInspectorLike,
 ) -> CompositePreviewResponse:
+    project = _load_project(repository)
     relative, cache_key = _authoritative_preview_relative(project)
-    path, payload, digest, identity = _read_current_preview(root, relative)
+    path, payload, digest, identity = _read_current_preview(repository.root, relative)
     try:
         metadata = inspector.probe(path)
     except Exception as error:
@@ -165,12 +177,13 @@ def _resolve_composite_preview(
             message="The composite preview could not be verified.",
         ) from error
     _revalidate_preview_identity(
-        root,
+        repository.root,
         relative,
         expected_identity=identity,
         expected_size=len(payload),
         expected_sha256=digest,
     )
+    _revalidate_preview_authority(repository, project, relative, cache_key)
     if metadata.frame_count is None:
         raise ApiError(
             409,
@@ -207,14 +220,7 @@ def _read_composite_preview_blob(
             category="project",
             message="The requested composite preview is unavailable.",
         )
-    latest = _load_project(repository)
-    latest_relative, latest_cache_key = _authoritative_preview_relative(latest)
-    if (
-        latest.project_id != project.project_id
-        or latest_relative != relative
-        or latest_cache_key != cache_key
-    ):
-        raise _preview_changed()
+    _revalidate_preview_authority(repository, project, relative, cache_key)
     _revalidate_preview_identity(
         repository.root,
         relative,
@@ -236,8 +242,7 @@ def build_composite_preview_router() -> APIRouter:
         repository = _services(request).project_repository
         return await asyncio.to_thread(
             _resolve_composite_preview,
-            _load_project(repository),
-            repository.root,
+            repository,
             _preview_inspector(request),
         )
 

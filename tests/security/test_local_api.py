@@ -21,6 +21,7 @@ from gs_video.api.uploads import CHUNK_LIMIT
 from gs_video.app import create_app
 from gs_video.domain.models import ArtifactRole, StageName, StageState, StageStatus
 from gs_video.environment.doctor import EnvironmentReport
+from gs_video.media.ffmpeg import VideoMetadata
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter, discard_progress
 from gs_video.project.repository import ProjectRepository
@@ -171,6 +172,113 @@ def test_composite_preview_blob_revalidates_current_stage_authority(
     )
 
     assert_stable_error(stale, status_code=409, code="composite_preview_changed")
+
+
+@pytest.mark.parametrize("mutation", ["empty", "oversize", "hard_link", "reparse"])
+def test_composite_preview_rejects_unsafe_registered_files(
+    client_and_root,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:  # type: ignore[no-untyped-def]
+    client, root = client_and_root
+    cache_key = f"composite-{mutation}"
+    relative = f"previews/{cache_key}/composite-preview.mp4"
+    preview = root / relative
+    preview.parent.mkdir()
+    preview.write_bytes(b"composite-preview")
+    repository = client.app.state.services.project_repository
+    repository.update(
+        lambda project: project.stages.__setitem__(
+            StageName.COMPOSITE,
+            StageState(
+                status=StageStatus.SUCCEEDED,
+                cache_key=cache_key,
+                output_paths=[relative],
+                artifacts={ArtifactRole.COMPOSITE_PREVIEW: relative},
+            ),
+        )
+    )
+
+    if mutation == "empty":
+        preview.write_bytes(b"")
+    elif mutation == "oversize":
+        with preview.open("r+b") as stream:
+            stream.truncate(256 * 1024 * 1024 + 1)
+    elif mutation == "hard_link":
+        try:
+            os.link(preview, root / "outside-preview.mp4")
+        except OSError:
+            pytest.skip("the filesystem does not support hard-link coverage")
+    else:
+        outside = root.parent / "outside-preview.mp4"
+        outside.write_bytes(b"outside")
+        preview.unlink()
+        try:
+            preview.symlink_to(outside)
+        except OSError:
+            pytest.skip("the filesystem does not permit reparse-point coverage")
+
+    class Inspector:
+        def probe(self, path: Path) -> VideoMetadata:
+            raise AssertionError(f"unsafe preview reached ffprobe: {path}")
+
+    monkeypatch.setattr(client.app.state, "export_inspector", Inspector())
+    response = client.get(
+        "/api/v1/projects/current/composite-preview", headers=auth_headers()
+    )
+
+    assert_stable_error(response, status_code=409, code="composite_preview_changed")
+
+
+def test_composite_preview_descriptor_revalidates_authority_after_probe(
+    client_and_root,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    client, root = client_and_root
+    cache_key = "composite-race"
+    relative = f"previews/{cache_key}/composite-preview.mp4"
+    preview = root / relative
+    preview.parent.mkdir()
+    preview.write_bytes(b"composite-preview")
+    repository = client.app.state.services.project_repository
+    repository.update(
+        lambda project: project.stages.__setitem__(
+            StageName.COMPOSITE,
+            StageState(
+                status=StageStatus.SUCCEEDED,
+                cache_key=cache_key,
+                output_paths=[relative],
+                artifacts={ArtifactRole.COMPOSITE_PREVIEW: relative},
+            ),
+        )
+    )
+    probe_started = Event()
+    release_probe = Event()
+
+    class BlockingInspector:
+        def probe(self, path: Path) -> VideoMetadata:
+            assert path == preview
+            probe_started.set()
+            assert release_probe.wait(2)
+            return VideoMetadata(16, 9, 1.0, "30", frame_count=30)
+
+    monkeypatch.setattr(client.app.state, "export_inspector", BlockingInspector())
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        request = executor.submit(
+            client.get,
+            "/api/v1/projects/current/composite-preview",
+            headers=auth_headers(),
+        )
+        assert probe_started.wait(1)
+        repository.update(
+            lambda project: setattr(
+                project.stages[StageName.COMPOSITE], "status", StageStatus.STALE
+            )
+        )
+        release_probe.set()
+        response = request.result(timeout=2)
+
+    assert_stable_error(response, status_code=409, code="composite_preview_changed")
 
 
 def test_outer_boundary_rejects_unauthorized_body_without_consuming_it(

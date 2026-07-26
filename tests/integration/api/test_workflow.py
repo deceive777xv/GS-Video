@@ -791,6 +791,68 @@ def test_composite_preview_is_opaque_authenticated_and_cache_bound(
     assert video.headers["content-type"] == "video/mp4"
 
 
+@pytest.mark.parametrize("mutation", ["bytes", "cache_key", "project_id"])
+def test_composite_preview_blob_rejects_stale_descriptor_identity(
+    workflow_client: TestClient,
+    auth_headers: dict[str, str],
+    mutation: str,
+) -> None:
+    descriptor = workflow_client.get(
+        "/api/v1/projects/current/composite-preview", headers=auth_headers
+    ).json()
+    repository = workflow_client.app.state.services.project_repository
+    cache_key = "composite-key"
+    relative = f"previews/{cache_key}/composite-preview.mp4"
+
+    if mutation == "bytes":
+        (repository.root / relative).write_bytes(b"changed-composite-preview")
+    elif mutation == "cache_key":
+        replacement_key = "replacement-composite-key"
+        replacement_relative = f"previews/{replacement_key}/composite-preview.mp4"
+        replacement = repository.root / replacement_relative
+        replacement.parent.mkdir()
+        replacement.write_bytes(b"composite-preview")
+
+        def change_cache(project: object) -> None:
+            stage = project.stages[StageName.COMPOSITE]  # type: ignore[attr-defined]
+            stage.cache_key = replacement_key
+            stage.output_paths = [replacement_relative]
+            stage.artifacts = {ArtifactRole.COMPOSITE_PREVIEW: replacement_relative}
+
+        repository.update(change_cache)
+    else:
+        repository.update(
+            lambda project: setattr(project, "project_id", "replacement-project")
+        )
+
+    stale = workflow_client.get(
+        f"/api/v1/artifacts/composite-previews/{descriptor['artifact_id']}",
+        headers=auth_headers,
+    )
+
+    assert stale.status_code == 404
+    assert stale.json()["code"] == "composite_preview_unavailable"
+
+
+def test_composite_preview_requires_exact_registered_preview_path(
+    workflow_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    repository = workflow_client.app.state.services.project_repository
+
+    def mismatch_registration(project: object) -> None:
+        stage = project.stages[StageName.COMPOSITE]  # type: ignore[attr-defined]
+        stage.artifacts = {ArtifactRole.COMPOSITE_PREVIEW: "source/outside.mp4"}
+
+    repository.update(mismatch_registration)
+
+    response = workflow_client.get(
+        "/api/v1/projects/current/composite-preview", headers=auth_headers
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "composite_preview_changed"
+
+
 def test_verified_export_can_be_safely_copied_to_caller_destination(
     workflow_client: TestClient,
     auth_headers: dict[str, str],
