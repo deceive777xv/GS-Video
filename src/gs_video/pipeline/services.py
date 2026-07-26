@@ -29,6 +29,7 @@ from gs_video.composite.alpha import composite_frame
 from gs_video.domain.contracts import (
     MaskSequence,
     Prompt,
+    RenderSequence,
     SegmentationBackend,
     StageResult,
 )
@@ -49,7 +50,7 @@ from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
 from gs_video.project.cache import cache_key
 from gs_video.scene.camera import OrbitCamera
-from gs_video.scene.worker_client import RendererWorkerClient
+from gs_video.scene.worker_client import RendererWorkerIdentity
 from gs_video.scene.worker_protocol import RenderSequenceRequest
 from gs_video.segmentation.paths import has_reparse_component
 
@@ -123,6 +124,19 @@ class CameraSolverLike(Protocol):
         emit: ProgressEmitter,
         token: CancellationToken,
     ) -> CameraSolution: ...
+
+
+class RendererWorkerLike(Protocol):
+    def probe(
+        self, *, token: CancellationToken | None = None
+    ) -> RendererWorkerIdentity: ...
+
+    def render_sequence(
+        self,
+        request: RenderSequenceRequest,
+        emit: ProgressEmitter,
+        token: CancellationToken,
+    ) -> RenderSequence: ...
 
 
 @dataclass(frozen=True)
@@ -1160,7 +1174,7 @@ class RendererWorkflowService:
     def __init__(
         self,
         paths: WorkflowPaths,
-        worker: RendererWorkerClient,
+        worker: RendererWorkerLike,
         *,
         sh_degree: int = 3,
         available_vram_limit_mb: int = 8192,

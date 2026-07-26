@@ -207,10 +207,60 @@ it('shows only the composite video registered by the succeeded stage', async () 
   expect(video).toHaveAttribute('preload', 'metadata')
   expect(video).toHaveAttribute('src', 'blob:composite-preview')
   expect(screen.queryByRole('img')).toBeNull()
-  expect(backend.getCompositePreview).toHaveBeenCalledOnce()
+  expect(backend.getCompositePreview).toHaveBeenCalledWith(
+    expect.any(AbortSignal),
+  )
   expect(backend.fetchCompositePreviewArtifact).toHaveBeenCalledWith(
     descriptor.artifact_id,
     expect.any(AbortSignal),
+  )
+})
+
+it('aborts a stale composite descriptor before requesting its artifact', async () => {
+  vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:composite-2')
+  vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+  const first = compositeDescriptor('composite-1')
+  const second = compositeDescriptor('composite-2')
+  let firstSignal: AbortSignal | undefined
+  let resolveFirst!: (descriptor: ReturnType<typeof compositeDescriptor>) => void
+  const getCompositePreview = vi.fn((signal?: AbortSignal) => {
+    if (getCompositePreview.mock.calls.length === 1) {
+      firstSignal = signal
+      return new Promise<ReturnType<typeof compositeDescriptor>>((resolve) => {
+        resolveFirst = resolve
+      })
+    }
+    return Promise.resolve(second)
+  })
+  const backend = {
+    getCompositePreview,
+    fetchCompositePreviewArtifact: vi.fn(async () => new Blob(['new'], { type: 'video/mp4' })),
+    fetchPreviewArtifact: vi.fn(async () => new Blob(['camera'], { type: 'image/png' })),
+  } as unknown as BackendClient
+  const initialProps = compositeProps(backend, compositeProject('cache-1', 'succeeded'))
+  const view = render(<PreviewPage {...initialProps} />)
+  await waitFor(() => expect(getCompositePreview).toHaveBeenCalledOnce())
+
+  view.rerender(
+    <PreviewPage {...initialProps} project={compositeProject('cache-2', 'succeeded')} />,
+  )
+
+  expect(await screen.findByLabelText('低分辨率合成预览')).toHaveAttribute(
+    'src',
+    'blob:composite-2',
+  )
+  expect(firstSignal?.aborted).toBe(true)
+  expect(backend.fetchCompositePreviewArtifact).toHaveBeenCalledOnce()
+  expect(backend.fetchCompositePreviewArtifact).toHaveBeenCalledWith(
+    second.artifact_id,
+    expect.any(AbortSignal),
+  )
+
+  resolveFirst(first)
+  await Promise.resolve()
+  expect(backend.fetchCompositePreviewArtifact).not.toHaveBeenCalledWith(
+    first.artifact_id,
+    expect.anything(),
   )
 })
 

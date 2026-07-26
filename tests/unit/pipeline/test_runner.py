@@ -182,6 +182,63 @@ def test_runner_persists_typed_stage_artifact_roots() -> None:
     assert state.artifacts == {ArtifactRole.PROXY_FRAMES: "proxies"}
 
 
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        Path.cwd() / "outside-project.png",
+        Path("../outside-project.png"),
+        Path("renders/../../outside-project.png"),
+        Path("C:/outside-project.png"),
+        Path(r"C:\outside-project.png"),
+        Path(r"C:outside-project.png"),
+        Path(r"\\server\share\outside-project.png"),
+        Path(r"\rooted\outside-project.png"),
+    ],
+    ids=[
+        "host-absolute",
+        "parent",
+        "nested-parent",
+        "windows-forward-absolute",
+        "windows-drive-absolute",
+        "windows-drive-relative",
+        "windows-unc",
+        "windows-rooted",
+    ],
+)
+def test_runner_rejects_non_project_relative_output_paths(
+    unsafe_path: Path,
+) -> None:
+    project = project_with_prior_output()
+    stage = RecordingStage(
+        lambda project, token: StageResult((unsafe_path,), "render-key")
+    )
+    runner = PipelineRunner(project, {StageName.RENDER: stage}, save=lambda project: None)
+
+    state = runner.run(StageName.RENDER, CancellationToken())
+
+    assert state.status is StageStatus.FAILED
+    assert state.cache_key is None
+    assert state.output_paths == []
+
+
+def test_runner_rejects_non_project_relative_artifact_paths() -> None:
+    project = project_with_prior_output()
+    stage = RecordingStage(
+        lambda project, token: StageResult(
+            (Path("renders/safe.png"),),
+            "render-key",
+            artifacts={ArtifactRole.RENDER_FRAMES: Path("renders/../../outside")},
+        )
+    )
+    runner = PipelineRunner(project, {StageName.RENDER: stage}, save=lambda project: None)
+
+    state = runner.run(StageName.RENDER, CancellationToken())
+
+    assert state.status is StageStatus.FAILED
+    assert state.cache_key is None
+    assert state.artifacts == {}
+
+
 def test_stage_persistence_merges_into_latest_project_authority() -> None:
     stale_runner_project = project_with_prior_output()
     authoritative = stale_runner_project.model_copy(deep=True)

@@ -74,7 +74,7 @@ export function PreviewPage({
     if (compositeAuthority === null) return
 
     const controller = new AbortController()
-    void backend.getCompositePreview().then(async (descriptor) => {
+    void backend.getCompositePreview(controller.signal).then(async (descriptor) => {
       if (controller.signal.aborted || compositeRequest.current !== request) return
       descriptorAuthority.current = descriptor.artifact_id
       const blob = await backend.fetchCompositePreviewArtifact(

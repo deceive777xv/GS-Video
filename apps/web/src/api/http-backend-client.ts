@@ -281,8 +281,10 @@ export class HttpBackendClient implements BackendClient {
     )
   }
 
-  getCompositePreview(): Promise<CompositePreviewDto> {
-    return this.#request('/projects/current/composite-preview')
+  getCompositePreview(signal?: AbortSignal): Promise<CompositePreviewDto> {
+    return signal === undefined
+      ? this.#request('/projects/current/composite-preview')
+      : this.#request('/projects/current/composite-preview', { signal })
   }
 
   fetchCompositePreviewArtifact(id: string, signal?: AbortSignal): Promise<Blob> {

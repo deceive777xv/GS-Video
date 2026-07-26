@@ -440,6 +440,42 @@ describe('HttpBackendClient', () => {
     )
   })
 
+  it('propagates caller cancellation to the composite descriptor request', async () => {
+    let settleFetch:
+      | ((response: Response) => void)
+      | undefined
+    let requestSignal: AbortSignal | null | undefined
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation((_url, init) => {
+      requestSignal = init?.signal
+      return new Promise<Response>((resolve, reject) => {
+        settleFetch = resolve
+        init?.signal?.addEventListener(
+          'abort',
+          () => reject(init.signal?.reason),
+          { once: true },
+        )
+      })
+    })
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152',
+      token: 'secret',
+      fetchImpl,
+    })
+    const controller = new AbortController()
+
+    const request = client.getCompositePreview(controller.signal)
+    controller.abort()
+
+    expect(requestSignal?.aborted).toBe(true)
+    settleFetch?.(
+      new Response('{}', {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    await request.catch(() => undefined)
+  })
+
   it('requests a local copy only for the current opaque export id', async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(null, { status: 204 }),

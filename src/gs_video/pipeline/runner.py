@@ -1,5 +1,6 @@
 from collections.abc import Callable, Mapping
 import logging
+from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
 from gs_video.domain.contracts import Stage
@@ -26,6 +27,17 @@ CompareAndSetStage = Callable[
     [StageName, StageState, StageWriteGuard], StageWriteResult
 ]
 ClaimStage = Callable[..., StageClaimResult]
+
+
+def _project_relative_path(path: Path) -> str:
+    candidate = PureWindowsPath(path)
+    if (
+        candidate.anchor
+        or candidate == PureWindowsPath(".")
+        or ".." in candidate.parts
+    ):
+        raise ValueError("stage outputs must be non-escaping project-relative paths")
+    return candidate.as_posix()
 
 
 def _validated_dependencies(
@@ -168,9 +180,12 @@ class PipelineRunner:
             terminal = state.model_copy(deep=True)
             terminal.status = StageStatus.SUCCEEDED
             terminal.cache_key = result.cache_key
-            terminal.output_paths = [path.as_posix() for path in result.output_paths]
+            terminal.output_paths = [
+                _project_relative_path(path) for path in result.output_paths
+            ]
             terminal.artifacts = {
-                role: path.as_posix() for role, path in result.artifacts.items()
+                role: _project_relative_path(path)
+                for role, path in result.artifacts.items()
             }
         except CancelledError:
             terminal = state.model_copy(deep=True)

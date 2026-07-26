@@ -44,7 +44,7 @@ export interface BackendClient {
   confirmCamera(cameraRevision: number): Promise<ProjectDto>
   getVerifiedExport(): Promise<VerifiedExportDto>
   fetchExportArtifact(id: string, signal?: AbortSignal): Promise<Blob>
-  getCompositePreview(): Promise<CompositePreviewDto>
+  getCompositePreview(signal?: AbortSignal): Promise<CompositePreviewDto>
   fetchCompositePreviewArtifact(id: string, signal?: AbortSignal): Promise<Blob>
   copyVerifiedExport(id: string, destination: string): Promise<void>
   getSubjectMedia(role: SubjectMediaRole): Promise<SubjectMediaDto>

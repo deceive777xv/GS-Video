@@ -664,6 +664,79 @@ class MismatchedRendererWorker:
         )
 
 
+class CpuFakeRendererWorker:
+    def __init__(self) -> None:
+        self.requests: list[RenderSequenceRequest] = []
+
+    def probe(
+        self, *, token: CancellationToken | None = None
+    ) -> RendererWorkerIdentity:
+        if token is not None:
+            token.raise_if_cancelled()
+        return RendererWorkerIdentity(
+            torch="cpu-fake",
+            gsplat="cpu-fake-1",
+            device="cpu",
+        )
+
+    def render_sequence(
+        self,
+        request: RenderSequenceRequest,
+        emit: ProgressEmitter,
+        token: CancellationToken,
+    ) -> RenderSequence:
+        self.requests.append(request)
+        request.output_dir.mkdir()
+        trajectory = read_mapped_trajectory(request.camera_manifest)
+        source_indices = tuple(
+            range(0, len(trajectory.camera_to_world), request.preview_stride)
+        )
+        frames: list[Path] = []
+        for current, _source_index in enumerate(source_indices, start=1):
+            token.raise_if_cancelled()
+            frame = request.output_dir / f"{current:06d}.png"
+            write_rgb(frame, (request.width, request.height), 64)
+            frames.append(frame)
+            emit(
+                current,
+                len(source_indices),
+                f"cpu fake render {current}/{len(source_indices)}",
+            )
+        return RenderSequence(
+            frame_dir=request.output_dir,
+            frame_paths=tuple(frames),
+            source_frame_indices=source_indices,
+            width=request.width,
+            height=request.height,
+            implementation_version="gsplat-cpu-fake-1",
+        )
+
+
+def test_renderer_service_orchestrates_cpu_adapter_and_registers_artifacts(
+    tmp_path: Path,
+) -> None:
+    project = renderer_project(tmp_path)
+    worker = CpuFakeRendererWorker()
+    events: list[tuple[int, int, str]] = []
+    service = RendererWorkflowService(WorkflowPaths(tmp_path), worker)
+
+    result = service.run(
+        project,
+        "final",
+        CancellationToken(),
+        lambda current, total, message: events.append((current, total, message)),
+    )
+
+    assert len(worker.requests) == 1
+    assert worker.requests[0].scene_path == tmp_path / "source" / "scene.ply"
+    assert result.artifacts[ArtifactRole.RENDER_FRAMES] == Path(
+        f"renders/{result.cache_key}"
+    )
+    output = tmp_path / result.artifacts[ArtifactRole.RENDER_FRAMES]
+    assert (output / "000001.png").is_file()
+    assert events == [(1, 1, "cpu fake render 1/1")]
+
+
 def renderer_project(root: Path) -> Project:
     project = source_project(root, frame_count=1)
     scene = root / "source" / "scene.ply"

@@ -15,12 +15,13 @@ from gs_video.api.schemas import ApiSettings
 from gs_video.app import create_app
 from gs_video.camera.classify import CameraKind
 from gs_video.camera.opencv_solver import CameraSolution
+from gs_video.camera.serialization import read_mapped_trajectory
 from gs_video.domain.contracts import (
     MaskSequence,
     PickBuffer,
     Prompt,
+    RenderSequence,
     SegmentationBackend,
-    StageResult,
 )
 from gs_video.domain.models import (
     ArtifactRole,
@@ -33,7 +34,6 @@ from gs_video.domain.models import (
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.media.export import ExportResult
 from gs_video.media.ffmpeg import VideoMetadata
-from gs_video.pipeline.artifacts import ArtifactPublisher
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
 from gs_video.pipeline.services import (
@@ -41,17 +41,15 @@ from gs_video.pipeline.services import (
     CompositeWorkflowService,
     ExportWorkflowService,
     MediaIngestService,
+    RendererWorkflowService,
     SegmentWorkflowService,
     TrajectoryMapWorkflowService,
     WorkflowPaths,
 )
-from gs_video.pipeline.workflow import (
-    RenderCacheNamespace,
-    WorkflowServices,
-    build_mvp_workflow,
-)
-from gs_video.project.cache import cache_key
+from gs_video.pipeline.workflow import WorkflowServices, build_mvp_workflow
 from gs_video.project.repository import ProjectRepository
+from gs_video.scene.worker_client import RendererWorkerIdentity
+from gs_video.scene.worker_protocol import RenderSequenceRequest
 
 
 TOKEN = "real-workflow-session-token"
@@ -174,39 +172,51 @@ class FakeCameraSolver:
         )
 
 
-class FakeRenderer:
-    def __init__(self, root: Path) -> None:
-        self.root = root
-        self.publisher = ArtifactPublisher(root)
+class CpuFakeRendererWorker:
+    def __init__(self) -> None:
+        self.render_requests: list[RenderSequenceRequest] = []
 
-    def run(
-        self,
-        project: Project,
-        namespace: RenderCacheNamespace,
-        token: CancellationToken,
-        emit: ProgressEmitter,
-    ) -> StageResult:
-        mapped = project.stages[StageName.MAP_TRAJECTORY]
-        assert mapped.cache_key is not None
-        result_key = cache_key(
-            StageName.RENDER.value,
-            {"mapped_cache_key": mapped.cache_key},
-            {"namespace": namespace.value},
-            "fake-renderer-v1",
+    def probe(
+        self, *, token: CancellationToken | None = None
+    ) -> RendererWorkerIdentity:
+        if token is not None:
+            token.raise_if_cancelled()
+        return RendererWorkerIdentity(
+            torch="cpu-fake",
+            gsplat="cpu-fake-1",
+            device="cpu",
         )
 
-        def build(staging: Path) -> None:
-            for index in range(1, 3):
-                token.raise_if_cancelled()
-                _write_rgb(staging / f"{index:06d}.png", (8, 6), 200)
-                emit(index, 2, f"fake render {index}/2")
-
-        output = self.publisher.publish_tree("renders", result_key, build)
-        relative = output.relative_to(self.root)
-        return StageResult(
-            (relative,),
-            result_key,
-            {ArtifactRole.RENDER_FRAMES: relative},
+    def render_sequence(
+        self,
+        request: RenderSequenceRequest,
+        emit: ProgressEmitter,
+        token: CancellationToken,
+    ) -> RenderSequence:
+        self.render_requests.append(request)
+        request.output_dir.mkdir()
+        trajectory = read_mapped_trajectory(request.camera_manifest)
+        source_indices = tuple(
+            range(0, len(trajectory.camera_to_world), request.preview_stride)
+        )
+        frames: list[Path] = []
+        for current, _source_index in enumerate(source_indices, start=1):
+            token.raise_if_cancelled()
+            frame = request.output_dir / f"{current:06d}.png"
+            _write_rgb(frame, (request.width, request.height), 200)
+            frames.append(frame)
+            emit(
+                current,
+                len(source_indices),
+                f"cpu fake render {current}/{len(source_indices)}",
+            )
+        return RenderSequence(
+            frame_dir=request.output_dir,
+            frame_paths=tuple(frames),
+            source_frame_indices=source_indices,
+            width=request.width,
+            height=request.height,
+            implementation_version="gsplat-cpu-fake-1",
         )
 
 
@@ -330,7 +340,10 @@ class ProductionHarness:
                 backend_identity="fake-camera-solver-v1",
             ),
             trajectory_mapper=TrajectoryMapWorkflowService(paths),
-            renderer=FakeRenderer(repository.root),
+            renderer=RendererWorkflowService(
+                paths,
+                CpuFakeRendererWorker(),
+            ),
             compositor=CompositeWorkflowService(
                 paths,
                 exporter=FakeExporter(),
