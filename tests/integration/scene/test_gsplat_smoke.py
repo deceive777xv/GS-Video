@@ -26,8 +26,14 @@ def test_real_gsplat_tiny_scene_writes_png_below_one_gibibyte(tmp_path: Path) ->
     scene = load_gaussian_ply(Path("tests/fixtures/scene/tiny_gaussians.ply"))
     # Center the first fixture Gaussian at positive camera depth so visibility is deterministic.
     camera = OrbitCamera((1.0, 2.0, 3.0), 3.0, 0.0, 0.0, 60.0)
+    renderer = GsplatRenderer()
+    pick = renderer.render_pick(scene, camera, width=64, height=36)
+    assert pick.rgb.shape == (36, 64, 3)
+    assert pick.expected_depth.shape == (36, 64)
+    assert np.isfinite(pick.expected_depth).all()
+    assert np.all(pick.expected_depth >= 0)
     background = (0.05, 0.1, 0.15)
-    result = GsplatRenderer().render(
+    result = renderer.render(
         scene, [camera], tmp_path / "frames",
         RenderSettings(width=64, height=36, sh_degree=0, background=background),
         lambda *_: None, CancellationToken(),

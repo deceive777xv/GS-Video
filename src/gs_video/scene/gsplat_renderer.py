@@ -365,15 +365,20 @@ class GsplatRenderer:
         render_mode: str,
     ) -> tuple[object, object, object]:
         viewmats, intrinsics = self._camera_arguments(camera, settings.width, settings.height)
-        return rasterizer(
+        arguments: dict[str, object] = {
             **runtime,
-            viewmats=viewmats,
-            Ks=intrinsics,
-            width=settings.width,
-            height=settings.height,
-            sh_degree=settings.sh_degree,
-            backgrounds=np.asarray(settings.background, dtype=np.float32)[None],
-            render_mode=render_mode,
+            "viewmats": viewmats,
+            "Ks": intrinsics,
+            "width": settings.width,
+            "height": settings.height,
+            "sh_degree": settings.sh_degree,
+            "packed": True,
+            "render_mode": render_mode,
+        }
+        if render_mode == "RGB":
+            arguments["backgrounds"] = np.asarray(settings.background, dtype=np.float32)
+        return rasterizer(
+            **arguments,
         )
 
     def render(

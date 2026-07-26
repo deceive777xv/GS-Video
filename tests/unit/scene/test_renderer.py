@@ -131,6 +131,9 @@ def test_renderer_converts_raw_parameters_and_uses_world_to_camera_matrices(
     np.testing.assert_allclose(call["Ks"], selected_camera.intrinsics(64, 36)[None])
     assert np.asarray(call["viewmats"]).shape == (1, 4, 4)
     assert np.asarray(call["Ks"]).shape == (1, 3, 3)
+    np.testing.assert_allclose(call["backgrounds"], [0.0, 0.0, 0.0])
+    assert np.asarray(call["backgrounds"]).shape == (3,)
+    assert call["packed"] is True
 
 
 def test_renderer_rejects_nonfinite_passthrough_scene_fields_before_rasterizing(
@@ -357,6 +360,8 @@ def test_render_pick_returns_only_rgb_and_expected_depth_without_writing(
     assert pick.expected_depth.dtype == np.float32
     assert np.all(pick.expected_depth == 2.5)
     assert rasterizer.calls[0]["render_mode"] == "RGB+ED"
+    assert rasterizer.calls[0]["packed"] is True
+    assert rasterizer.calls[0].get("backgrounds") is None
     assert list(tmp_path.iterdir()) == []
 
 
