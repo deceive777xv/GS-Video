@@ -38,6 +38,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.startup_handshake and not args.serve:
         raise SystemExit("--startup-handshake requires --serve")
+    if args.startup_handshake and args.doctor:
+        raise SystemExit("--startup-handshake cannot be used with --doctor")
 
     if args.doctor:
         report = EnvironmentDoctor().check()

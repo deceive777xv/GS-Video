@@ -107,3 +107,8 @@ def test_serve_requires_runtime_config_and_private_stdin_token() -> None:
 def test_startup_handshake_requires_serve() -> None:
     with pytest.raises(SystemExit, match="--startup-handshake requires --serve"):
         cli.main(["--startup-handshake"])
+
+
+def test_startup_handshake_rejects_doctor_mode() -> None:
+    with pytest.raises(SystemExit, match="cannot be used with --doctor"):
+        cli.main(["--doctor", "--serve", "--startup-handshake"])

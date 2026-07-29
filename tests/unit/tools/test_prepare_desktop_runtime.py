@@ -16,19 +16,8 @@ def create_runtime_layout(root: Path) -> None:
         root / ".venv" / "Scripts" / "python.exe",
         root / ".runtime" / "segmentation" / ".venv" / "Scripts" / "python.exe",
         root / ".runtime" / "renderer" / ".venv" / "Scripts" / "python.exe",
-        root
-        / ".runtime"
-        / "segmentation"
-        / "EdgeTAM"
-        / "sam2"
-        / "configs"
-        / "edgetam.yaml",
-        root
-        / ".runtime"
-        / "segmentation"
-        / "EdgeTAM"
-        / "checkpoints"
-        / "edgetam.pt",
+        root / ".runtime" / "segmentation" / "EdgeTAM" / "sam2" / "configs" / "edgetam.yaml",
+        root / ".runtime" / "segmentation" / "EdgeTAM" / "checkpoints" / "edgetam.pt",
     )
     for path in required:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -55,19 +44,10 @@ def test_prepare_desktop_runtime_writes_confined_absolute_configuration(
             str(runtime_root / "segmentation" / ".venv" / "Scripts" / "python.exe")
         ],
         "segmentation_model_config": str(
-            runtime_root
-            / "segmentation"
-            / "EdgeTAM"
-            / "sam2"
-            / "configs"
-            / "edgetam.yaml"
+            runtime_root / "segmentation" / "EdgeTAM" / "sam2" / "configs" / "edgetam.yaml"
         ),
         "segmentation_checkpoint": str(
-            runtime_root
-            / "segmentation"
-            / "EdgeTAM"
-            / "checkpoints"
-            / "edgetam.pt"
+            runtime_root / "segmentation" / "EdgeTAM" / "checkpoints" / "edgetam.pt"
         ),
         "renderer_worker_prefix": [
             str(runtime_root / "renderer" / ".venv" / "Scripts" / "python.exe")
@@ -96,4 +76,23 @@ def test_prepare_desktop_runtime_reports_missing_project_python(tmp_path: Path) 
     root.mkdir()
 
     with pytest.raises(DesktopRuntimeError, match=r"\.venv.*python\.exe"):
+        prepare_desktop_runtime(root, validate=False)
+
+
+def test_prepare_desktop_runtime_rejects_runtime_resolving_outside_repository(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "repo").absolute()
+    outside = (tmp_path / "outside-runtime").absolute()
+    root.mkdir()
+    outside.mkdir()
+    project_python = root / ".venv" / "Scripts" / "python.exe"
+    project_python.parent.mkdir(parents=True)
+    project_python.write_bytes(b"runtime")
+    try:
+        (root / ".runtime").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+
+    with pytest.raises(DesktopRuntimeError, match="outside the repository"):
         prepare_desktop_runtime(root, validate=False)

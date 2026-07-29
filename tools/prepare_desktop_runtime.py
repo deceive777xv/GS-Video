@@ -12,33 +12,53 @@ class DesktopRuntimeError(RuntimeError):
     """Raised when the project-local desktop runtime is incomplete."""
 
 
-def _required_file(path: Path, label: str) -> Path:
+def _confined_path(path: Path, label: str, repo_root: Path) -> Path:
     absolute = path.absolute()
-    if not absolute.is_file() or absolute.is_symlink():
-        raise DesktopRuntimeError(f"{label} is missing: {absolute}")
-    return absolute
+    try:
+        resolved = absolute.resolve(strict=True)
+    except OSError as error:
+        raise DesktopRuntimeError(f"{label} is missing: {absolute}") from error
+    if not resolved.is_relative_to(repo_root):
+        raise DesktopRuntimeError(f"{label} resolves outside the repository: {absolute}")
+    return resolved
+
+
+def _required_file(path: Path, label: str, repo_root: Path) -> Path:
+    resolved = _confined_path(path, label, repo_root)
+    if not resolved.is_file() or path.is_symlink():
+        raise DesktopRuntimeError(f"{label} is missing: {path.absolute()}")
+    return resolved
 
 
 def _runtime_payload(repo_root: Path) -> dict[str, Any]:
-    root = repo_root.absolute()
-    runtime_root = root / ".runtime"
+    try:
+        root = repo_root.resolve(strict=True)
+    except OSError as error:
+        raise DesktopRuntimeError(
+            f"repository root is unavailable: {repo_root.absolute()}"
+        ) from error
+    _required_file(root / ".venv" / "Scripts" / "python.exe", "project Python", root)
+    runtime_root = _confined_path(root / ".runtime", "project runtime", root)
     edgetam_root = runtime_root / "segmentation" / "EdgeTAM"
-    _required_file(root / ".venv" / "Scripts" / "python.exe", "project Python")
     segmentation_python = _required_file(
         runtime_root / "segmentation" / ".venv" / "Scripts" / "python.exe",
         "segmentation worker Python",
+        root,
     )
     renderer_python = _required_file(
         runtime_root / "renderer" / ".venv" / "Scripts" / "python.exe",
         "renderer worker Python",
+        root,
     )
     model_config = _required_file(
         edgetam_root / "sam2" / "configs" / "edgetam.yaml",
         "EdgeTAM model config",
+        root,
     )
     checkpoint = _required_file(
         edgetam_root / "checkpoints" / "edgetam.pt",
         "EdgeTAM checkpoint",
+        root,
     )
     return {
         "project_root": str(runtime_root / "projects" / "default"),
@@ -54,7 +74,12 @@ def _runtime_payload(repo_root: Path) -> dict[str, Any]:
 
 
 def prepare_desktop_runtime(repo_root: Path, *, validate: bool = True) -> Path:
-    root = repo_root.absolute()
+    try:
+        root = repo_root.resolve(strict=True)
+    except OSError as error:
+        raise DesktopRuntimeError(
+            f"repository root is unavailable: {repo_root.absolute()}"
+        ) from error
     if not root.is_dir():
         raise DesktopRuntimeError(f"repository root is unavailable: {root}")
     payload = _runtime_payload(root)

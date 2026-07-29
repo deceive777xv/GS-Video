@@ -1,31 +1,71 @@
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 fn main() {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments
+        .iter()
+        .any(|argument| argument == "--grandchild-process")
+    {
+        std::thread::sleep(Duration::from_secs(30));
+        return;
+    }
     let mut token = String::new();
     std::io::stdin().lock().read_line(&mut token).unwrap();
     let token = token.trim_end_matches(['\r', '\n']).to_string();
-    if std::env::args().any(|argument| argument == "--no-handshake") {
+    if let Some(index) = arguments
+        .iter()
+        .position(|argument| argument == "--spawn-grandchild")
+    {
+        let pid_path = arguments.get(index + 1).expect("grandchild PID path");
+        let child = Command::new(std::env::current_exe().unwrap())
+            .arg("--grandchild-process")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::fs::write(pid_path, child.id().to_string()).unwrap();
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument == "--no-handshake")
+    {
         std::thread::sleep(Duration::from_secs(30));
         return;
     }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    if arguments
+        .iter()
+        .any(|argument| argument == "--blank-before-handshake")
+    {
+        println!();
+    }
     println!(
         "{{\"port\":{port},\"apiVersion\":\"v1\",\"pid\":{}}}",
         std::process::id()
     );
     std::io::stdout().flush().unwrap();
+    if arguments
+        .iter()
+        .any(|argument| argument == "--stderr-token-and-exit")
+    {
+        eprintln!("secret-from-stdin={token}");
+        return;
+    }
+    let unhealthy = arguments.iter().any(|argument| argument == "--unhealthy");
     for incoming in listener.incoming() {
         let mut stream = incoming.unwrap();
-        if handle_request(&mut stream, &token) {
+        if handle_request(&mut stream, &token, unhealthy) {
             break;
         }
     }
 }
 
-fn handle_request(stream: &mut TcpStream, token: &str) -> bool {
+fn handle_request(stream: &mut TcpStream, token: &str, unhealthy: bool) -> bool {
     let mut request = Vec::new();
     let mut block = [0_u8; 1024];
     while request.len() < 16 * 1024 {
@@ -47,6 +87,8 @@ fn handle_request(stream: &mut TcpStream, token: &str) -> bool {
     let health = first.starts_with("GET /healthz ");
     let (status, body) = if !authorized {
         ("401 Unauthorized", "{}")
+    } else if health && unhealthy {
+        ("503 Service Unavailable", "{\"status\":\"starting\"}")
     } else if health {
         ("200 OK", "{\"status\":\"ok\"}")
     } else if shutdown {
