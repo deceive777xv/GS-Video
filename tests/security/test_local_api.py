@@ -7,7 +7,6 @@ from pathlib import Path
 from threading import Event
 
 import pytest
-import uvicorn
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -1383,12 +1382,12 @@ def test_run_api_rejects_empty_launcher_token_before_invoking_uvicorn(
 ) -> None:
     calls = 0
 
-    def fake_run(app: FastAPI, **kwargs: object) -> None:
+    def fake_run_server(app: FastAPI, **kwargs: object) -> None:
         del app, kwargs
         nonlocal calls
         calls += 1
 
-    monkeypatch.setattr(uvicorn, "run", fake_run)
+    monkeypatch.setattr(local_app, "run_server", fake_run_server)
 
     with pytest.raises(ValueError, match="session token"):
         local_app.run_api(object(), "")  # type: ignore[arg-type]
@@ -1418,11 +1417,11 @@ def test_run_api_uses_launcher_token_and_bounded_uvicorn_options(
         preview_service=UnusedPreviewService(),
     )
 
-    def fake_run(app: FastAPI, **kwargs: object) -> None:
+    def fake_run_server(app: FastAPI, **kwargs: object) -> None:
         captured["app"] = app
         captured.update(kwargs)
 
-    monkeypatch.setattr(uvicorn, "run", fake_run)
+    monkeypatch.setattr(local_app, "run_server", fake_run_server)
     monkeypatch.setattr(
         local_app,
         "assemble_api_services",
@@ -1437,10 +1436,9 @@ def test_run_api_uses_launcher_token_and_bounded_uvicorn_options(
     token = api.state.settings.session_token.get_secret_value()
     assert token == TOKEN
     assert captured == {
-        "host": "127.0.0.1",
+        "bind_host": "127.0.0.1",
         "port": 0,
-        "access_log": False,
-        "log_config": None,
+        "startup_handshake": False,
     }
     assert token not in repr(captured)
     output = capsys.readouterr()

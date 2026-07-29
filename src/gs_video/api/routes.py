@@ -318,6 +318,19 @@ def build_router() -> APIRouter:
     async def health() -> HealthResponse:
         return HealthResponse(status="ok")
 
+    @protected.post("/api/v1/shutdown", status_code=status.HTTP_202_ACCEPTED)
+    async def shutdown(request: Request) -> Response:
+        callback = getattr(request.app.state, "request_shutdown", None)
+        if not callable(callback):
+            raise ApiError(
+                503,
+                code="shutdown_unavailable",
+                category="runtime",
+                message="The local service cannot be stopped by this host.",
+            )
+        callback()
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
     @protected.get("/api/v1/bootstrap", response_model=BootstrapResponse)
     async def bootstrap(request: Request) -> BootstrapResponse:
         services = _services(request)

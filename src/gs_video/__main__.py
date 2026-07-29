@@ -16,6 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-config", type=Path)
     parser.add_argument("--session-token-stdin", action="store_true")
     parser.add_argument("--browser-origin", action="append", default=[])
+    parser.add_argument("--startup-handshake", action="store_true")
     return parser
 
 
@@ -34,6 +35,9 @@ def _read_private_token() -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.startup_handshake and not args.serve:
+        raise SystemExit("--startup-handshake requires --serve")
 
     if args.doctor:
         report = EnvironmentDoctor().check()
@@ -55,7 +59,12 @@ def main(argv: list[str] | None = None) -> int:
         token = _read_private_token()
         from gs_video.app import run_api
 
-        return run_api(config, token, tuple(args.browser_origin))
+        return run_api(
+            config,
+            token,
+            tuple(args.browser_origin),
+            startup_handshake=args.startup_handshake,
+        )
 
     parser.print_help()
     return 0

@@ -1,0 +1,14 @@
+{
+  "name": "@gs-video/desktop",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2"
+  },
+  "engines": {
+    "node": ">=24.14.0 <25"
+  }
+}

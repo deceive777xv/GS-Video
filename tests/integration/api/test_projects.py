@@ -124,6 +124,20 @@ def test_health_and_bootstrap_return_bounded_session_state(
     assert TOKEN not in bootstrap.text
 
 
+def test_authenticated_shutdown_requests_server_exit(
+    api_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    calls: list[str] = []
+    api_client.app.state.request_shutdown = lambda: calls.append("shutdown")
+
+    rejected = api_client.post("/api/v1/shutdown")
+    accepted = api_client.post("/api/v1/shutdown", headers=auth_headers)
+
+    assert rejected.status_code == 401
+    assert accepted.status_code == 202
+    assert calls == ["shutdown"]
+
+
 def test_project_patch_is_strict_and_persists(
     api_client: TestClient, auth_headers: dict[str, str]
 ) -> None:

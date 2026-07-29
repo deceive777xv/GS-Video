@@ -1,7 +1,7 @@
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
 
-function localProxyTarget(value: string): string {
+export function localProxyTarget(value: string): string {
   const url = new URL(value)
   const hostname = url.hostname.replace(/^\[|\]$/g, '')
   if (
@@ -18,33 +18,37 @@ function localProxyTarget(value: string): string {
   return url.origin
 }
 
-export default defineConfig(({ command }) => {
-  const configuredTarget = process.env.GS_VIDEO_DEV_API_ORIGIN
+export function localDevServer(configuredTarget?: string) {
   const target =
     configuredTarget === undefined
       ? undefined
       : localProxyTarget(configuredTarget)
-  if (command === 'serve' && target === undefined) {
-    throw new Error('GS_VIDEO_DEV_API_ORIGIN must name the local API origin')
+  return {
+    host: '127.0.0.1',
+    port: 1420,
+    strictPort: true,
+    ...(target === undefined
+      ? {}
+      : {
+          proxy: {
+            '/api': { target, ws: true as const },
+            '/ws': {
+              target,
+              ws: true as const,
+              rewrite: (requestPath: string) =>
+                requestPath.replace(/^\/ws/, ''),
+            },
+          },
+        }),
   }
+}
+
+export default defineConfig(() => {
+  const configuredTarget = process.env.GS_VIDEO_DEV_API_ORIGIN
 
   return {
     base: './',
     plugins: react(),
-    ...(target === undefined
-      ? {}
-      : {
-          server: {
-            proxy: {
-              '/api': { target, ws: true as const },
-              '/ws': {
-                target,
-                ws: true as const,
-                rewrite: (requestPath: string) =>
-                  requestPath.replace(/^\/ws/, ''),
-              },
-            },
-          },
-        }),
+    server: localDevServer(configuredTarget),
   }
 })

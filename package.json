@@ -8,10 +8,16 @@
     "npm": ">=11.12.1 <12"
   },
   "workspaces": [
-    "apps/web"
+    "apps/web",
+    "apps/desktop"
   ],
   "scripts": {
+    "api:dev": ".venv\\Scripts\\python.exe tools\\run_browser_api.py",
     "build:web": "npm run build --workspace @gs-video/web",
+    "dev:desktop-web": "npm run prepare:desktop && npm run dev --workspace @gs-video/web",
+    "dev:web": "npm run dev --workspace @gs-video/web",
+    "prepare:desktop": ".venv\\Scripts\\python.exe tools\\prepare_desktop_runtime.py",
+    "tauri:dev": "node tools/run_tauri_dev.mjs",
     "test:web": "vitest run --config apps/web/vitest.config.ts",
     "typecheck:web": "npm run typecheck --workspace @gs-video/web"
   }

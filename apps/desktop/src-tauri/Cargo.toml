@@ -1,0 +1,39 @@
+[package]
+name = "gs-video-desktop"
+version = "0.1.0"
+description = "GS Video desktop development host"
+authors = ["GS Video contributors"]
+edition = "2021"
+rust-version = "1.77.2"
+default-run = "gs-video-desktop"
+
+[lib]
+name = "gs_video_desktop"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+getrandom = "0.3"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "gs-video-desktop"
+path = "src/main.rs"
+
+[[bin]]
+name = "fake_sidecar"
+path = "src/bin/fake_sidecar.rs"

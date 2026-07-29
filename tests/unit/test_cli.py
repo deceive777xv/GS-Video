@@ -64,12 +64,16 @@ def test_serve_loads_runtime_and_reads_one_bounded_private_token(
     runtime = (tmp_path / "runtime.json").absolute()
     runtime.write_text("{}", encoding="utf-8")
     loaded = object()
-    calls: list[tuple[object, str, tuple[str, ...]]] = []
+    calls: list[tuple[object, str, tuple[str, ...], bool]] = []
 
     def fake_run_api(
-        config: object, token: str, browser_origins: tuple[str, ...] = ()
+        config: object,
+        token: str,
+        browser_origins: tuple[str, ...] = (),
+        *,
+        startup_handshake: bool = False,
     ) -> int:
-        calls.append((config, token, browser_origins))
+        calls.append((config, token, browser_origins, startup_handshake))
         return 7
 
     monkeypatch.setattr(cli, "load_runtime_config", lambda path: loaded)
@@ -84,11 +88,12 @@ def test_serve_loads_runtime_and_reads_one_bounded_private_token(
             "--session-token-stdin",
             "--browser-origin",
             "http://127.0.0.1:4173",
+            "--startup-handshake",
         ]
     )
 
     assert exit_code == 7
-    assert calls == [(loaded, "private-token", ("http://127.0.0.1:4173",))]
+    assert calls == [(loaded, "private-token", ("http://127.0.0.1:4173",), True)]
     captured = capsys.readouterr()
     assert "private-token" not in captured.out
     assert "private-token" not in captured.err
@@ -97,3 +102,8 @@ def test_serve_loads_runtime_and_reads_one_bounded_private_token(
 def test_serve_requires_runtime_config_and_private_stdin_token() -> None:
     with pytest.raises(SystemExit):
         cli.main(["--serve"])
+
+
+def test_startup_handshake_requires_serve() -> None:
+    with pytest.raises(SystemExit, match="--startup-handshake requires --serve"):
+        cli.main(["--startup-handshake"])
