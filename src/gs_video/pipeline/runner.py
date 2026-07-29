@@ -139,7 +139,8 @@ class PipelineRunner:
         token: CancellationToken,
         emit: ProgressEmitter | None = None,
     ) -> StageState:
-        return self.run_outcome(name, token, emit).state
+        self.run_outcome(name, token, emit)
+        return self.project.stages.get(name, StageState())
 
     def run_outcome(
         self,

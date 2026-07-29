@@ -1426,7 +1426,7 @@ def test_run_api_uses_launcher_token_and_bounded_uvicorn_options(
     monkeypatch.setattr(
         local_app,
         "assemble_api_services",
-        lambda config, session_token: (settings, services),
+        lambda config, session_token, *, browser_origins=(): (settings, services),
     )
 
     exit_code = local_app.run_api(object(), TOKEN)  # type: ignore[arg-type]
