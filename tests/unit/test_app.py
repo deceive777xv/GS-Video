@@ -58,7 +58,12 @@ def test_run_server_emits_one_bounded_handshake_and_uses_reserved_socket(
     lines = output.getvalue().splitlines()
     assert len(lines) == 1
     handshake = json.loads(lines[0])
-    assert handshake == {"port": port, "apiVersion": "v1", "pid": os.getpid()}
+    assert handshake == {
+        "port": port,
+        "apiVersion": "v1",
+        "pid": os.getpid(),
+        "parentPid": os.getppid(),
+    }
     assert token not in output.getvalue()
     assert calls == [[listener]]
     assert listener.fileno() == -1

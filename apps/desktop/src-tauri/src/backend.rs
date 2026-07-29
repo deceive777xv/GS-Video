@@ -24,8 +24,7 @@ pub enum BackendCommandError {
 
 impl BackendCommand {
     pub fn development(repo_root: &Path) -> Result<Self, BackendCommandError> {
-        let root = repo_root
-            .canonicalize()
+        let root = dunce::canonicalize(repo_root)
             .map_err(|_| BackendCommandError::RepositoryUnavailable)?;
         let program = root.join(".venv").join("Scripts").join("python.exe");
         if !program.is_file() {
@@ -88,5 +87,21 @@ mod tests {
         assert!(args.contains(&"--startup-handshake".into()));
         assert!(args.contains(&DEV_BROWSER_ORIGIN.into()));
         assert!(!args.iter().any(|value| value.contains("token=")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn manifest_development_command_avoids_verbatim_windows_paths() {
+        let command = BackendCommand::development_from_manifest().unwrap();
+        let runtime = command
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "--runtime-config")
+            .map(|pair| pair[1].to_string_lossy())
+            .unwrap();
+
+        assert!(!command.program.to_string_lossy().starts_with(r"\\?\"));
+        assert!(!command.current_dir.to_string_lossy().starts_with(r"\\?\"));
+        assert!(!runtime.starts_with(r"\\?\"));
     }
 }

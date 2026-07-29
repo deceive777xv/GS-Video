@@ -104,14 +104,14 @@ Python 在启动 Uvicorn 前自行创建 TCP socket，绑定 `127.0.0.1:0` 并�
 握手模式下，stdout 的第一条非空记录必须是单行 UTF-8 JSON：
 
 ```json
-{"port": 49152, "apiVersion": "v1", "pid": 12345}
+{"port": 49152, "apiVersion": "v1", "pid": 12345, "parentPid": 12344}
 ```
 
 约束：
 
 - `port` 是 1 至 65535 的整数；
 - `apiVersion` 必须等于宿主支持的版本；
-- `pid` 必须是正整数，并与已启动子进程一致；
+- `pid` 必须是正整数；它必须与 Rust 直接启动的进程一致，或由匹配的 `parentPid` 表明它是该进程通过 Windows Python 虚拟环境重定向器启动的一层子进程；
 - 行长度设置小上限，拒绝无限或超大输出；
 - token 和完整 runtime 配置不得出现在该记录中；
 - 握手后应用诊断写 stderr 或项目日志，不再复用 stdout 传输控制消息。
@@ -134,7 +134,8 @@ Ready → Stopping → Exited
 - 使用加密安全随机源生成至少 256 bit 会话令牌；
 - 子进程 stdin/stdout/stderr 使用管道，Windows 下不打开额外控制台窗口；
 - 从 spawn 开始计算 15 秒总启动期限，而非每阶段分别等待 15 秒；
-- 严格解析握手 schema 和 PID；
+- 严格解析握手 schema，并验证直接子进程或单层虚拟环境重定向关系；
+- 健康检查与关闭请求使用专用 loopback HTTP client，并显式禁用系统和环境代理；
 - 在期限内使用短退避重复调用认证 `/healthz`；
 - 任何解析错误、提前退出、版本不匹配或健康检查失败都会进入统一清理路径；
 - 日志只能包含阶段、错误类别、退出码和安全路径摘要，不包含 token；
@@ -212,8 +213,9 @@ API 继续只监听 `127.0.0.1`，并验证 Bearer token、WebSocket 首消息�
 
 ### 12.2 Rust
 
-- 合法、畸形、超长、版本不匹配和 PID 不匹配的握手；
+- 合法、畸形、超长、版本不匹配、PID 不匹配，以及虚拟环境重定向 PID 的握手；
 - fake sidecar 正常启动并通过 fake health endpoint；
+- 即使进程环境设置了代理且没有 `NO_PROXY`，loopback 健康检查也必须直连；
 - 无握手超时、握手后提前退出、健康检查失败；
 - token 只写 stdin，捕获日志中不可见；
 - 正常关闭和强制回收均不遗留 fake child；

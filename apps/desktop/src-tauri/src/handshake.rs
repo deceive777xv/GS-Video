@@ -10,6 +10,7 @@ pub struct StartupHandshake {
     pub port: u16,
     pub api_version: String,
     pub pid: u32,
+    pub parent_pid: u32,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -48,7 +49,8 @@ pub fn parse_handshake(
     if handshake.api_version != API_VERSION {
         return Err(HandshakeError::UnsupportedVersion);
     }
-    if handshake.pid != expected_pid {
+    if handshake.pid == 0 || (handshake.pid != expected_pid && handshake.parent_pid != expected_pid)
+    {
         return Err(HandshakeError::WrongProcess);
     }
     Ok(handshake)
@@ -60,25 +62,54 @@ mod tests {
 
     #[test]
     fn parses_strict_matching_handshake() {
-        let parsed = parse_handshake(br#"{"port":49152,"apiVersion":"v1","pid":42}"#, 42).unwrap();
+        let parsed = parse_handshake(
+            br#"{"port":49152,"apiVersion":"v1","pid":42,"parentPid":7}"#,
+            42,
+        )
+        .unwrap();
         assert_eq!(parsed.port, 49152);
+    }
+
+    #[test]
+    fn accepts_a_service_started_by_a_pid_redirector() {
+        let parsed = parse_handshake(
+            br#"{"port":49152,"apiVersion":"v1","pid":43,"parentPid":42}"#,
+            42,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.pid, 43);
+        assert_eq!(parsed.parent_pid, 42);
     }
 
     #[test]
     fn rejects_unknown_fields_version_pid_and_oversized_lines() {
         assert_eq!(
             parse_handshake(
-                br#"{"port":49152,"apiVersion":"v1","pid":42,"token":"leak"}"#,
+                br#"{"port":49152,"apiVersion":"v1","pid":42,"parentPid":7,"token":"leak"}"#,
                 42,
             ),
             Err(HandshakeError::InvalidJson)
         );
         assert_eq!(
-            parse_handshake(br#"{"port":49152,"apiVersion":"v2","pid":42}"#, 42),
+            parse_handshake(
+                br#"{"port":49152,"apiVersion":"v2","pid":42,"parentPid":7}"#,
+                42,
+            ),
             Err(HandshakeError::UnsupportedVersion)
         );
         assert_eq!(
-            parse_handshake(br#"{"port":49152,"apiVersion":"v1","pid":41}"#, 42),
+            parse_handshake(
+                br#"{"port":49152,"apiVersion":"v1","pid":41,"parentPid":7}"#,
+                42,
+            ),
+            Err(HandshakeError::WrongProcess)
+        );
+        assert_eq!(
+            parse_handshake(
+                br#"{"port":49152,"apiVersion":"v1","pid":0,"parentPid":42}"#,
+                42,
+            ),
             Err(HandshakeError::WrongProcess)
         );
         assert_eq!(

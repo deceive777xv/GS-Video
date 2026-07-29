@@ -207,6 +207,7 @@ def run_server(
             "port": actual_port,
             "apiVersion": API_VERSION,
             "pid": os.getpid(),
+            "parentPid": os.getppid(),
         }
         stream = sys.stdout if output is None else output
         stream.write(json.dumps(handshake, separators=(",", ":")) + "\n")

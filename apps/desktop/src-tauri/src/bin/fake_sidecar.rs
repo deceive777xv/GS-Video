@@ -4,7 +4,28 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 fn main() {
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(index) = arguments
+        .iter()
+        .position(|argument| argument == "--redirect-child")
+    {
+        arguments.remove(index);
+        arguments.push("--reported-parent-pid".into());
+        arguments.push(std::process::id().to_string());
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(arguments)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .unwrap();
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    let reported_parent_pid = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--reported-parent-pid")
+        .and_then(|pair| pair[1].parse::<u32>().ok())
+        .unwrap_or_else(std::process::id);
     if arguments
         .iter()
         .any(|argument| argument == "--grandchild-process")
@@ -45,8 +66,8 @@ fn main() {
         println!();
     }
     println!(
-        "{{\"port\":{port},\"apiVersion\":\"v1\",\"pid\":{}}}",
-        std::process::id()
+        "{{\"port\":{port},\"apiVersion\":\"v1\",\"pid\":{},\"parentPid\":{reported_parent_pid}}}",
+        std::process::id(),
     );
     std::io::stdout().flush().unwrap();
     if arguments

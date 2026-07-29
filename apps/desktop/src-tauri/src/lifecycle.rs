@@ -215,6 +215,7 @@ impl RunningBackend {
             }));
             let origin = format!("http://127.0.0.1:{}", handshake.port);
             let client = reqwest::Client::builder()
+                .no_proxy()
                 .timeout(HEALTH_REQUEST_TIMEOUT)
                 .build()
                 .map_err(StartupFailure::HttpClient)?;

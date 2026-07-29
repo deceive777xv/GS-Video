@@ -29,6 +29,57 @@ async fn starts_health_checks_and_gracefully_stops_fake_sidecar() {
 }
 
 #[tokio::test]
+async fn starts_a_sidecar_through_a_pid_redirector() {
+    let backend =
+        RunningBackend::start(fake_command(&["--redirect-child"]), Duration::from_secs(5))
+            .await
+            .unwrap();
+
+    backend.shutdown().await.unwrap();
+}
+
+#[test]
+fn loopback_health_ignores_process_proxy_environment() {
+    const PROBE_CHILD: &str = "GS_VIDEO_PROXY_PROBE_CHILD";
+
+    if std::env::var_os(PROBE_CHILD).is_some() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let backend = RunningBackend::start(fake_command(&[]), Duration::from_secs(2))
+                .await
+                .unwrap();
+            backend.shutdown().await.unwrap();
+        });
+        return;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "loopback_health_ignores_process_proxy_environment",
+            "--nocapture",
+        ])
+        .env(PROBE_CHILD, "1")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "proxy-isolation probe failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[tokio::test]
 async fn startup_timeout_does_not_wait_for_hung_sidecar() {
     let started = std::time::Instant::now();
     let result = RunningBackend::start(
