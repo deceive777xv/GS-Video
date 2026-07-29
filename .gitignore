@@ -7,6 +7,8 @@ __pycache__/
 .pytest-*/
 .tmp/
 .cache/
+.runtime/
+logs/
 tests/.assets/
 *.partial
 acceptance-report.json
