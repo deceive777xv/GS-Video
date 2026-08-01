@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "platform": "windows-amd64",
+  "resources": [
+    {
+      "id": "edgetam-source",
+      "kind": "archive",
+      "version": "EdgeTAM@7711e012",
+      "url": "https://codeload.github.com/facebookresearch/EdgeTAM/zip/7711e012a30a2402c4eaab637bdb00a521302c91",
+      "sha256": "e2b1983a10e403bc74980abfe85a3660670a4cae324e32618dc7748b790a2049",
+      "size": 168774855,
+      "target": "segmentation/EdgeTAM",
+      "extract_to": "segmentation/EdgeTAM",
+      "strip_prefix": "EdgeTAM-7711e012a30a2402c4eaab637bdb00a521302c91",
+      "markers": ["sam2/__init__.py"],
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/facebookresearch/EdgeTAM/blob/7711e012a30a2402c4eaab637bdb00a521302c91/LICENSE"
+    },
+    {
+      "id": "edgetam-config",
+      "kind": "file",
+      "version": "EdgeTAM@7711e012",
+      "url": "https://raw.githubusercontent.com/facebookresearch/EdgeTAM/7711e012a30a2402c4eaab637bdb00a521302c91/sam2/configs/edgetam.yaml",
+      "sha256": "251eca7a25c0acc415c477a696820b56c7f5efd63eb1f8d36de681403b6d0abc",
+      "size": 4242,
+      "target": "segmentation/EdgeTAM/sam2/configs/edgetam.yaml",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/facebookresearch/EdgeTAM/blob/7711e012a30a2402c4eaab637bdb00a521302c91/LICENSE"
+    },
+    {
+      "id": "edgetam-checkpoint",
+      "kind": "file",
+      "version": "EdgeTAM@7711e012",
+      "url": "https://raw.githubusercontent.com/facebookresearch/EdgeTAM/7711e012a30a2402c4eaab637bdb00a521302c91/checkpoints/edgetam.pt",
+      "sha256": "ed2d4850b8792c239689b043c47046ec239b6e808a3d9b6ae676c803fd8780df",
+      "size": 56116523,
+      "target": "segmentation/EdgeTAM/checkpoints/edgetam.pt",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/facebookresearch/EdgeTAM/blob/7711e012a30a2402c4eaab637bdb00a521302c91/LICENSE"
+    },
+    {
+      "id": "ffmpeg-essentials",
+      "kind": "archive",
+      "version": "8.1.2",
+      "url": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+      "sha256": "db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec",
+      "size": 109728040,
+      "target": "projects/default/.cache/ffmpeg",
+      "extract_to": "projects/default/.cache/ffmpeg",
+      "strip_prefix": "ffmpeg-8.1.2-essentials_build",
+      "markers": ["bin/ffmpeg.exe", "bin/ffprobe.exe"],
+      "license": "GPL-3.0-or-later",
+      "license_url": "https://www.gyan.dev/ffmpeg/builds/"
+    }
+  ],
+  "actions": [
+    {
+      "type": "create_venv",
+      "target": "segmentation/.venv"
+    },
+    {
+      "type": "create_venv",
+      "target": "renderer/.venv"
+    },
+    {
+      "type": "install_packages",
+      "target": "segmentation/.venv",
+      "packages": ["torch==2.6.0+cu126"],
+      "index_url": "https://download.pytorch.org/whl/cu126"
+    },
+    {
+      "type": "install_packages",
+      "target": "renderer/.venv",
+      "packages": ["torch==2.6.0+cu126"],
+      "index_url": "https://download.pytorch.org/whl/cu126"
+    },
+    {
+      "type": "install_packages",
+      "target": "renderer/.venv",
+      "packages": ["gsplat==1.5.3"],
+      "index_url": "https://pypi.org/simple"
+    },
+    {
+      "type": "install_editable",
+      "target": "segmentation/.venv",
+      "source": "segmentation/EdgeTAM",
+      "resources": ["edgetam-source"]
+    },
+    {
+      "type": "install_editable",
+      "target": "segmentation/.venv"
+    },
+    {
+      "type": "install_editable",
+      "target": "renderer/.venv"
+    }
+  ]
+}

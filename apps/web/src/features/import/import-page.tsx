@@ -1,7 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 
 import type { BackendClient } from '../../api/backend-client'
-import type { AssetKind, EnvironmentDto, ProjectDto } from '../../api/types'
+import { BackendClientError } from '../../api/http-backend-client'
+import type {
+  AssetKind,
+  EnvironmentDto,
+  EnvironmentRepairSnapshotDto,
+  ProjectDto,
+} from '../../api/types'
 import type { PlatformBridge } from '../../platform/platform-bridge'
 import { sha256Hex } from './incremental-sha256'
 import {
@@ -20,6 +26,13 @@ function isMissingUpload(error: unknown): boolean {
     && error.status === 404
 }
 
+function formatBytes(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return '未知大小'
+  if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`
+  return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`
+}
+
 interface ImportPageProps {
   backend: BackendClient
   busy: boolean
@@ -27,6 +40,7 @@ interface ImportPageProps {
   platform: PlatformBridge
   project: ProjectDto
   onError(value: unknown): void
+  onEnvironmentRefresh(): Promise<void>
   onProjectChange(project: ProjectDto): void
   onStartStage(stage: 'ingest'): Promise<unknown>
 }
@@ -38,6 +52,7 @@ export function ImportPage({
   platform,
   project,
   onError,
+  onEnvironmentRefresh,
   onProjectChange,
   onStartStage,
 }: ImportPageProps) {
@@ -45,11 +60,13 @@ export function ImportPage({
   const [uploadId, setUploadId] = useState<string | null>(null)
   const [importing, setImporting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
+  const [repair, setRepair] = useState<EnvironmentRepairSnapshotDto | null>(null)
   const uploadAbort = useRef<AbortController | null>(null)
   const importAdmission = useRef<AbortController | null>(null)
   const cancelAdmission = useRef(false)
   const resumable = useRef<UploadResumeRecord | null>(null)
   const disposed = useRef(false)
+  const repairedJob = useRef<string | null>(null)
 
   useEffect(() => {
     disposed.current = false
@@ -58,6 +75,38 @@ export function ImportPage({
       uploadAbort.current?.abort()
     }
   }, [])
+
+  useEffect(() => {
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const poll = async (): Promise<void> => {
+      try {
+        const next = await backend.getEnvironmentRepair()
+        if (stopped) return
+        setRepair(next)
+        if (next.state === 'succeeded' && next.job_id !== null
+          && repairedJob.current !== next.job_id) {
+          repairedJob.current = next.job_id
+          await onEnvironmentRefresh()
+          if (!stopped) setStatus('环境修复完成，已重新检测本机环境。')
+        }
+        if (next.state === 'running' || next.state === 'cancelling') {
+          timer = setTimeout(() => void poll(), 1_000)
+        }
+      } catch (error) {
+        if (stopped) return
+        if (!(error instanceof BackendClientError)
+          || error.code !== 'environment_repair_unavailable') {
+          onError(error)
+        }
+      }
+    }
+    void poll()
+    return () => {
+      stopped = true
+      if (timer !== null) clearTimeout(timer)
+    }
+  }, [backend, onEnvironmentRefresh, onError, repair?.state])
 
   const refresh = async (signal?: AbortSignal): Promise<ProjectDto> => {
     const next = await backend.getProject()
@@ -212,8 +261,36 @@ export function ImportPage({
     }
   }
 
+  const startRepair = async (): Promise<void> => {
+    if (repair?.state === 'running' || repair?.state === 'cancelling') return
+    setStatus('正在准备环境修复…')
+    try {
+      const next = await backend.startEnvironmentRepair()
+      setRepair(next)
+      if (next.state === 'running') setStatus('环境修复已开始，正在下载和配置资源。')
+    } catch (error) {
+      onError(error)
+    }
+  }
+
+  const cancelRepair = async (): Promise<void> => {
+    if (repair?.state !== 'running' && repair?.state !== 'cancelling') return
+    try {
+      setRepair(await backend.cancelEnvironmentRepair())
+    } catch (error) {
+      onError(error)
+    }
+  }
+
   const video = project.workflow.source_summary
   const scene = project.workflow.scene_summary
+  const repairing = repair?.state === 'running' || repair?.state === 'cancelling'
+  const showRepairAction = !environment.ready
+    || repair?.state === 'failed'
+    || repair?.state === 'cancelled'
+  const repairButtonLabel = repair?.state === 'cancelled' || repair?.state === 'failed'
+    ? '继续修复环境'
+    : '修复环境'
   return (
     <section aria-labelledby="import-title" className="page-grid">
       <div className="page-heading">
@@ -248,10 +325,45 @@ export function ImportPage({
         </article>
       </div>
       <aside className={`environment-card ${environment.ready ? 'is-ready' : 'has-issues'}`}>
-        <div><span className="status-dot" /><strong>{environment.ready ? '本机环境可用' : '环境需要修复'}</strong></div>
+        <div className="environment-heading">
+          <span><span className="status-dot" /><strong>{environment.ready ? '本机环境可用' : '环境需要修复'}</strong></span>
+          {showRepairAction ? (
+            <button
+              className="button-repair"
+              disabled={importing || cancelling || repairing}
+              onClick={() => void startRepair()}
+              type="button"
+            >
+              {repairButtonLabel}
+            </button>
+          ) : null}
+        </div>
         <p>检测显存 {environment.vram_mb.toLocaleString()} MB；处理按阶段串行，实时性不是目标。</p>
         {environment.issues.length > 0 ? (
           <ul>{environment.issues.map((issue) => <li key={issue.code}><code>{issue.code}</code> {issue.message}</li>)}</ul>
+        ) : null}
+        {repair !== null && repairing ? (
+          <div aria-live="polite" className="environment-repair-progress">
+            <div className="environment-repair-meta">
+              <strong>{repair.message ?? '正在修复环境…'}</strong>
+              <span>{formatBytes(repair.downloaded_bytes)} / {formatBytes(repair.total_bytes)}</span>
+            </div>
+            <progress max={1} value={repair.progress} />
+            <div className="environment-repair-actions">
+              <small>{repair.resource_name ?? repair.step ?? '准备中'}</small>
+              <button className="button-secondary" onClick={() => void cancelRepair()} type="button">
+                {repair.state === 'cancelling' ? '正在取消…' : '取消修复'}
+              </button>
+            </div>
+          </div>
+        ) : null}
+        {repair?.state === 'failed' && repair.error !== null ? (
+          <p className="environment-repair-error" role="alert">
+            {repair.error.message}（{repair.error.code}）
+          </p>
+        ) : null}
+        {repair?.restart_required ? (
+          <p className="environment-repair-note">主 API 环境将在重启应用后生效。</p>
         ) : null}
       </aside>
       {status !== null ? <p aria-live="polite" className="inline-status">{status}</p> : null}

@@ -62,9 +62,14 @@ def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
                     await app.state.services.worker_registry.terminate_all()
                 finally:
                     try:
-                        await app.state.task_service.finish_shutdown()
+                        repair = app.state.services.environment_repair
+                        if repair is not None:
+                            await repair.shutdown()
                     finally:
-                        await asyncio.to_thread(app.state.upload_manager.close)
+                        try:
+                            await app.state.task_service.finish_shutdown()
+                        finally:
+                            await asyncio.to_thread(app.state.upload_manager.close)
 
     app = FastAPI(
         title="GS Video local API",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 from pathlib import Path
 import sys
 
@@ -55,7 +56,11 @@ def main(argv: list[str] | None = None) -> int:
         if not args.session_token_stdin:
             raise SystemExit("--serve requires --session-token-stdin")
         try:
-            config = load_runtime_config(args.runtime_config)
+            loader = load_runtime_config
+            if "allow_missing_resources" in inspect.signature(loader).parameters:
+                config = loader(args.runtime_config, allow_missing_resources=True)
+            else:  # Keeps embedders that provide the legacy loader contract working.
+                config = loader(args.runtime_config)
         except (OSError, ValueError) as error:
             raise SystemExit(f"runtime configuration is invalid: {error}") from error
         token = _read_private_token()

@@ -19,7 +19,7 @@ def main() -> int:
     from gs_video.app import run_api
     from gs_video.runtime import load_runtime_config
 
-    runtime_path = prepare_desktop_runtime(repo_root)
+    runtime_path = prepare_desktop_runtime(repo_root, allow_missing_resources=True)
     token = secrets.token_urlsafe(32)
     print(
         "Browser session token (memory only): " + token,
@@ -32,7 +32,7 @@ def main() -> int:
         flush=True,
     )
     return run_api(
-        load_runtime_config(runtime_path),
+        load_runtime_config(runtime_path, allow_missing_resources=True),
         token,
         ("http://127.0.0.1:1420",),
         startup_handshake=True,

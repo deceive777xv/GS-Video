@@ -27,6 +27,7 @@ from gs_video.api.schemas import (
     BootstrapResponse,
     CameraConfirmationRequest,
     CameraInput,
+    EnvironmentRepairSnapshot,
     HealthResponse,
     PickRequest,
     PickResponse,
@@ -61,6 +62,7 @@ from gs_video.domain.models import (
     SubjectPromptState,
 )
 from gs_video.environment.doctor import EnvironmentReport
+from gs_video.environment.repair import EnvironmentRepairBusyError
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter, discard_progress
 from gs_video.pipeline.workflow import ChangeKind, invalidate_for_change
@@ -79,6 +81,18 @@ class ProjectRepositoryLike(Protocol):
 
 class EnvironmentDoctorLike(Protocol):
     def check(self) -> EnvironmentReport: ...
+
+
+class EnvironmentRepairLike(Protocol):
+    def snapshot(self) -> EnvironmentRepairSnapshot: ...
+
+    def start(self) -> EnvironmentRepairSnapshot: ...
+
+    def cancel(self) -> EnvironmentRepairSnapshot: ...
+
+    def is_busy(self) -> bool: ...
+
+    async def shutdown(self) -> None: ...
 
 
 class PipelineRunnerLike(Protocol):
@@ -105,6 +119,7 @@ class ApiServices:
     preview_service: PreviewServiceLike | None = None
     asset_inspector: AssetInspectorLike | None = None
     export_inspector: ExportInspectorLike | None = None
+    environment_repair: EnvironmentRepairLike | None = None
 
 
 def _services(request: Request) -> ApiServices:
@@ -121,6 +136,19 @@ def _task_service(request: Request) -> TaskService:
 
 def _upload_manager(request: Request) -> UploadManager:
     return cast(UploadManager, request.app.state.upload_manager)
+
+
+def _environment_repair(request: Request) -> EnvironmentRepairLike:
+    repair = _services(request).environment_repair
+    if repair is None:
+        raise ApiError(
+            503,
+            code="environment_repair_unavailable",
+            category="environment",
+            message="Environment repair is not available in this local service.",
+            retryable=False,
+        )
+    return repair
 
 
 def _preview_service(request: Request) -> PreviewServiceLike:
@@ -335,12 +363,55 @@ def build_router() -> APIRouter:
     async def bootstrap(request: Request) -> BootstrapResponse:
         services = _services(request)
         environment = await asyncio.to_thread(services.environment_doctor.check)
+        capabilities: tuple[str, ...] = (
+            "projects",
+            "assets",
+            "uploads",
+            "tasks",
+            "events",
+        )
+        if services.environment_repair is not None:
+            capabilities = (*capabilities, "environment_repair")
         return BootstrapResponse(
             api_version=API_VERSION,
-            capabilities=("projects", "assets", "uploads", "tasks", "events"),
+            capabilities=capabilities,
             project=_load_project(services.project_repository),
             environment=environment,
         )
+
+    @protected.get(
+        "/api/v1/environment/repair",
+        response_model=EnvironmentRepairSnapshot,
+    )
+    async def get_environment_repair(request: Request) -> EnvironmentRepairSnapshot:
+        return await asyncio.to_thread(_environment_repair(request).snapshot)
+
+    @protected.post(
+        "/api/v1/environment/repair",
+        response_model=EnvironmentRepairSnapshot,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def start_environment_repair(request: Request) -> EnvironmentRepairSnapshot:
+        repair = _environment_repair(request)
+        try:
+            return await asyncio.to_thread(repair.start)
+        except EnvironmentRepairBusyError as error:
+            raise ApiError(
+                409,
+                code="environment_repair_busy",
+                category="environment",
+                message="Another environment repair is already active.",
+                retryable=True,
+            ) from error
+
+    @protected.delete(
+        "/api/v1/environment/repair",
+        response_model=EnvironmentRepairSnapshot,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def cancel_environment_repair(request: Request) -> EnvironmentRepairSnapshot:
+        repair = _environment_repair(request)
+        return await asyncio.to_thread(repair.cancel)
 
     @protected.get("/api/v1/projects/current", response_model=Project)
     async def get_current_project(request: Request) -> Project:
@@ -716,6 +787,15 @@ def build_router() -> APIRouter:
             StageName.COMPOSITE,
             StageName.EXPORT,
         }:
+            repair = services.environment_repair
+            if repair is not None and repair.is_busy():
+                raise ApiError(
+                    503,
+                    code="environment_repair_in_progress",
+                    category="environment",
+                    message="Wait for environment repair to finish before starting this stage.",
+                    retryable=True,
+                )
             report = await asyncio.to_thread(services.environment_doctor.check)
             if not report.ready:
                 issue_codes = ", ".join(issue.code for issue in report.issues[:8])

@@ -250,6 +250,13 @@ export function App({
     return next
   }, [backend])
 
+  const refreshBootstrap = useCallback(async (): Promise<void> => {
+    const next = await backend.bootstrap()
+    setBootstrap(next)
+    acceptProject(next.project)
+    setStep(workflowStepForProject(next.project))
+  }, [acceptProject, backend])
+
   useEffect(() => {
     const latest = taskState.latestEvent
     if (latest === null) return
@@ -418,7 +425,7 @@ export function App({
   let page: ReactNode
   switch (step) {
     case 'import':
-      page = <ImportPage backend={backend} busy={workflowBusy} environment={bootstrap.environment} onError={reportError} onProjectChange={acceptProject} onStartStage={runStage} platform={platform} project={project} />
+      page = <ImportPage backend={backend} busy={workflowBusy} environment={bootstrap.environment} onEnvironmentRefresh={refreshBootstrap} onError={reportError} onProjectChange={acceptProject} onStartStage={runStage} platform={platform} project={project} />
       break
     case 'subject':
       page = <SubjectPage backend={backend} busy={workflowBusy} onError={reportError} onProjectChange={acceptProject} onStartStage={runStage} project={project} />

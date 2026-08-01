@@ -24,6 +24,9 @@ const task = (revision = 9): TaskDto => ({
 
 const fakeBackendClient = (currentTask = task()): BackendClient => ({
   bootstrap: vi.fn(),
+  getEnvironmentRepair: vi.fn(),
+  startEnvironmentRepair: vi.fn(),
+  cancelEnvironmentRepair: vi.fn(),
   importLocalPath: vi.fn(),
   createUpload: vi.fn(),
   putUploadChunk: vi.fn(),

@@ -18,10 +18,14 @@ import type {
   CompositePreviewDto,
   SubjectMediaDto,
   SubjectMediaRole,
+  EnvironmentRepairSnapshotDto,
 } from './types'
 
 export interface BackendClient {
   bootstrap(signal?: AbortSignal): Promise<BootstrapDto>
+  getEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto>
+  startEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto>
+  cancelEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto>
   importLocalPath(kind: AssetKind, path: string): Promise<AssetDto>
   createUpload(input: UploadInit): Promise<UploadSessionDto>
   putUploadChunk(

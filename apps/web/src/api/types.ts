@@ -169,6 +169,36 @@ export interface BootstrapDto {
   environment: EnvironmentDto
 }
 
+export type EnvironmentRepairState =
+  | 'idle'
+  | 'running'
+  | 'cancelling'
+  | 'cancelled'
+  | 'succeeded'
+  | 'failed'
+
+export interface EnvironmentRepairErrorDto {
+  code: string
+  message: string
+  retryable: boolean
+}
+
+export interface EnvironmentRepairSnapshotDto {
+  state: EnvironmentRepairState
+  job_id: string | null
+  step: string | null
+  resource_id: string | null
+  resource_name: string | null
+  progress: number
+  downloaded_bytes: number
+  total_bytes: number | null
+  message: string | null
+  resume_available: boolean
+  restart_required: boolean
+  error: EnvironmentRepairErrorDto | null
+  environment: EnvironmentDto | null
+}
+
 export interface ProjectPatch {
   name?: string
   subject_prompt?: SubjectPromptDto | null

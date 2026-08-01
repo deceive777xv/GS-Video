@@ -1,6 +1,6 @@
 # GS Video 运行环境一键修复设计
 
-- 文档状态：已确认，待实施规划
+- 文档状态：已确认，已实施
 - 日期：2026-08-01
 - 目标范围：在应用内下载、配置并验证工程目录内的运行时资源
 - 关联文档：`2026-07-29-tauri-development-host-design.md`、`2026-07-11-gs-video-mvp-design.md`、`2026-07-11-gs-video-mvp-implementation.md`
@@ -257,7 +257,7 @@ running ─────────────────────→ succe
 
 ## 10. 代码边界
 
-预计实现拆分为：
+实现拆分为：
 
 - `src/gs_video/environment/manifest.py`：清单 schema、平台匹配、URL/路径/操作校验；
 - `src/gs_video/environment/download.py`：从现有测试资产下载器抽取的 HTTPS、续传、hash 和安全解压能力；

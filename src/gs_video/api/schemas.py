@@ -103,6 +103,37 @@ class BootstrapResponse(StrictModel):
     environment: EnvironmentReport
 
 
+class EnvironmentRepairState(StrEnum):
+    IDLE = "idle"
+    RUNNING = "running"
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class EnvironmentRepairError(StrictModel):
+    code: str = Field(min_length=1, max_length=128)
+    message: str = Field(min_length=1, max_length=512)
+    retryable: bool
+
+
+class EnvironmentRepairSnapshot(StrictModel):
+    state: EnvironmentRepairState
+    job_id: str | None = Field(default=None, max_length=128)
+    step: str | None = Field(default=None, max_length=64)
+    resource_id: str | None = Field(default=None, max_length=128)
+    resource_name: str | None = Field(default=None, max_length=256)
+    progress: float = Field(default=0.0, ge=0.0, le=1.0, allow_inf_nan=False)
+    downloaded_bytes: int = Field(default=0, ge=0)
+    total_bytes: int | None = Field(default=None, ge=0)
+    message: str | None = Field(default=None, max_length=512)
+    resume_available: bool = False
+    restart_required: bool = False
+    error: EnvironmentRepairError | None = None
+    environment: EnvironmentReport | None = None
+
+
 class SubjectPromptInput(StrictModel):
     frame_index: int = Field(ge=0)
     x: int = Field(ge=0)

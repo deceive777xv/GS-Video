@@ -12,10 +12,16 @@ class DesktopRuntimeError(RuntimeError):
     """Raised when the project-local desktop runtime is incomplete."""
 
 
-def _confined_path(path: Path, label: str, repo_root: Path) -> Path:
+def _confined_path(
+    path: Path,
+    label: str,
+    repo_root: Path,
+    *,
+    strict: bool = True,
+) -> Path:
     absolute = path.absolute()
     try:
-        resolved = absolute.resolve(strict=True)
+        resolved = absolute.resolve(strict=strict)
     except OSError as error:
         raise DesktopRuntimeError(f"{label} is missing: {absolute}") from error
     if not resolved.is_relative_to(repo_root):
@@ -23,14 +29,24 @@ def _confined_path(path: Path, label: str, repo_root: Path) -> Path:
     return resolved
 
 
-def _required_file(path: Path, label: str, repo_root: Path) -> Path:
-    resolved = _confined_path(path, label, repo_root)
-    if not resolved.is_file() or path.is_symlink():
+def _required_file(
+    path: Path,
+    label: str,
+    repo_root: Path,
+    *,
+    allow_missing: bool = False,
+) -> Path:
+    resolved = _confined_path(path, label, repo_root, strict=not allow_missing)
+    if resolved.exists() and (not resolved.is_file() or path.is_symlink()):
+        raise DesktopRuntimeError(f"{label} is missing: {path.absolute()}")
+    if not resolved.exists() and not allow_missing:
         raise DesktopRuntimeError(f"{label} is missing: {path.absolute()}")
     return resolved
 
 
-def _runtime_payload(repo_root: Path) -> dict[str, Any]:
+def _runtime_payload(
+    repo_root: Path, *, allow_missing_resources: bool = False
+) -> dict[str, Any]:
     try:
         root = repo_root.resolve(strict=True)
     except OSError as error:
@@ -38,27 +54,31 @@ def _runtime_payload(repo_root: Path) -> dict[str, Any]:
             f"repository root is unavailable: {repo_root.absolute()}"
         ) from error
     _required_file(root / ".venv" / "Scripts" / "python.exe", "project Python", root)
-    runtime_root = _confined_path(root / ".runtime", "project runtime", root)
+    runtime_root = _confined_path(root / ".runtime", "project runtime", root, strict=False)
     edgetam_root = runtime_root / "segmentation" / "EdgeTAM"
     segmentation_python = _required_file(
         runtime_root / "segmentation" / ".venv" / "Scripts" / "python.exe",
         "segmentation worker Python",
         root,
+        allow_missing=allow_missing_resources,
     )
     renderer_python = _required_file(
         runtime_root / "renderer" / ".venv" / "Scripts" / "python.exe",
         "renderer worker Python",
         root,
+        allow_missing=allow_missing_resources,
     )
     model_config = _required_file(
         edgetam_root / "sam2" / "configs" / "edgetam.yaml",
         "EdgeTAM model config",
         root,
+        allow_missing=allow_missing_resources,
     )
     checkpoint = _required_file(
         edgetam_root / "checkpoints" / "edgetam.pt",
         "EdgeTAM checkpoint",
         root,
+        allow_missing=allow_missing_resources,
     )
     return {
         "project_root": str(runtime_root / "projects" / "default"),
@@ -73,7 +93,12 @@ def _runtime_payload(repo_root: Path) -> dict[str, Any]:
     }
 
 
-def prepare_desktop_runtime(repo_root: Path, *, validate: bool = True) -> Path:
+def prepare_desktop_runtime(
+    repo_root: Path,
+    *,
+    validate: bool = True,
+    allow_missing_resources: bool = False,
+) -> Path:
     try:
         root = repo_root.resolve(strict=True)
     except OSError as error:
@@ -82,7 +107,7 @@ def prepare_desktop_runtime(repo_root: Path, *, validate: bool = True) -> Path:
         ) from error
     if not root.is_dir():
         raise DesktopRuntimeError(f"repository root is unavailable: {root}")
-    payload = _runtime_payload(root)
+    payload = _runtime_payload(root, allow_missing_resources=allow_missing_resources)
     runtime_root = root / ".runtime"
     project_root = runtime_root / "projects" / "default"
     project_root.mkdir(parents=True, exist_ok=True)
@@ -107,7 +132,10 @@ def prepare_desktop_runtime(repo_root: Path, *, validate: bool = True) -> Path:
         from gs_video.runtime import load_runtime_config
 
         try:
-            load_runtime_config(runtime_path)
+            load_runtime_config(
+                runtime_path,
+                allow_missing_resources=allow_missing_resources,
+            )
         except (OSError, ValueError) as error:
             raise DesktopRuntimeError(f"desktop runtime is invalid: {error}") from error
     return runtime_path
@@ -120,13 +148,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(__file__).resolve().parents[1],
     )
+    parser.add_argument("--allow-missing-resources", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        path = prepare_desktop_runtime(args.repo_root)
+        path = prepare_desktop_runtime(
+            args.repo_root,
+            allow_missing_resources=args.allow_missing_resources,
+        )
     except DesktopRuntimeError as error:
         raise SystemExit(str(error)) from error
     print(path)

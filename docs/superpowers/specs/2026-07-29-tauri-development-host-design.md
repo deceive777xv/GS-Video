@@ -31,7 +31,7 @@
 - PyInstaller onefile/onedir 构建；
 - Tauri `externalBin` 发布包；
 - NSIS、MSI、签名、自动更新或安装器测试；
-- 自动下载缺失的 Python、Node、Rust、模型或 GPU 依赖；
+- Tauri 宿主自动下载或修改系统级 Python、Node、Rust、模型或 GPU 依赖；项目运行资源的下载和修复由 API 运行后的“导入”页环境修复任务负责；
 - 面向最终用户的运行时配置编辑界面；
 - sidecar 崩溃后的自动任务重启。
 
@@ -75,13 +75,13 @@ npm run tauri:dev
 
 1. 定位仓库根目录；
 2. 校验主 `.venv/Scripts/python.exe`；
-3. 校验分割与渲染 worker 的 Python、EdgeTAM 配置和 checkpoint；
+3. 校验分割与渲染 worker 的 Python、EdgeTAM 配置和 checkpoint；允许缺失的 worker 资源由 API 修复任务补齐；
 4. 创建 `.runtime/projects/default` 等必要的本地目录；
 5. 将绝对路径写入 `.runtime/desktop-runtime.json`；
 6. 使用现有 `WorkflowRuntimeConfig` 读取器回读验证；
 7. 只在内容变化时重写文件。
 
-准备脚本不下载依赖、不写用户配置目录，也不把令牌、端口或 Origin 写入 JSON。路径全部留在工程目录内。缺少依赖时，它以非零状态退出并指出缺失路径。
+准备脚本不下载依赖、不写用户配置目录，也不把令牌、端口或 Origin 写入 JSON。路径全部留在工程目录内。桌面启动使用允许缺少 worker 资源的配置模式，以便页面可以展示环境修复入口；主 `.venv` 缺失或路径不安全时仍以非零状态退出。运行资源由 API 的独立修复进程按固定 HTTPS 清单下载到 `.runtime`，不修改系统环境。
 
 `npm run tauri:dev` 在启动 Tauri 前运行该准备步骤。Rust 仍会再次检查配置和 Python 路径，避免脚本完成后文件被移动造成难以理解的启动失败。
 

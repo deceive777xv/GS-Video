@@ -186,9 +186,20 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 .environment-card { padding: 1rem 1.2rem; border: 1px solid var(--line); border-left-width: 3px; border-radius: 8px; background: var(--panel); }
 .environment-card.is-ready { border-left-color: var(--cyan); }
 .environment-card.has-issues { border-left-color: var(--danger); }
-.environment-card > div { display: flex; align-items: center; gap: 0.55rem; }
+.environment-heading { display: flex; align-items: center; justify-content: space-between; gap: 0.8rem; }
+.environment-heading > span { display: flex; align-items: center; gap: 0.55rem; }
 .environment-card p { margin: 0.4rem 0 0; color: var(--muted); font-size: 0.78rem; }
 .environment-card ul { color: #f4b7b7; }
+.button-repair { border: 1px solid rgba(183,246,61,0.45); border-radius: 6px; padding: 0.42rem 0.72rem; color: var(--lime); background: rgba(183,246,61,0.08); font-size: 0.72rem; }
+.button-repair:hover:not(:disabled) { background: rgba(183,246,61,0.16); }
+.environment-repair-progress { margin-top: 0.85rem; padding-top: 0.75rem; border-top: 1px solid var(--line); }
+.environment-repair-meta, .environment-repair-actions { display: flex; align-items: center; justify-content: space-between; gap: 0.8rem; }
+.environment-repair-meta { color: var(--text); font-size: 0.74rem; }
+.environment-repair-meta span, .environment-repair-actions small { color: var(--muted); }
+.environment-repair-progress progress { width: 100%; height: 0.38rem; margin: 0.65rem 0 0.45rem; accent-color: var(--lime); }
+.environment-repair-actions .button-secondary { padding: 0.32rem 0.58rem; font-size: 0.7rem; }
+.environment-repair-error { color: #f4b7b7 !important; }
+.environment-repair-note { color: var(--lime) !important; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--cyan); }
 .has-issues .status-dot { background: var(--danger); }
 .inline-status { margin: 0; color: var(--cyan); font-size: 0.8rem; }

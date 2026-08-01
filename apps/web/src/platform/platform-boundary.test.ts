@@ -51,6 +51,23 @@ const bootstrap = {
 
 const fakeClient = (): BackendClient => ({
   bootstrap: vi.fn().mockResolvedValue(bootstrap),
+  getEnvironmentRepair: vi.fn().mockResolvedValue({
+    state: 'idle',
+    job_id: null,
+    step: null,
+    resource_id: null,
+    resource_name: null,
+    progress: 0,
+    downloaded_bytes: 0,
+    total_bytes: null,
+    message: null,
+    resume_available: false,
+    restart_required: false,
+    error: null,
+    environment: null,
+  }),
+  startEnvironmentRepair: vi.fn(),
+  cancelEnvironmentRepair: vi.fn(),
   importLocalPath: vi.fn().mockResolvedValue({
     kind: 'source_video',
     path: 'source/video.mp4',

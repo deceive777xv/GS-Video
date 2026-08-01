@@ -21,6 +21,7 @@ import type {
   CompositePreviewDto,
   SubjectMediaDto,
   SubjectMediaRole,
+  EnvironmentRepairSnapshotDto,
 } from './types'
 
 const API_PREFIX = '/api/v1'
@@ -185,6 +186,18 @@ export class HttpBackendClient implements BackendClient {
     return signal === undefined
       ? this.#request('/bootstrap')
       : this.#request('/bootstrap', { signal })
+  }
+
+  getEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto> {
+    return this.#request('/environment/repair')
+  }
+
+  startEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto> {
+    return this.#request('/environment/repair', { method: 'POST' })
+  }
+
+  cancelEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto> {
+    return this.#request('/environment/repair', { method: 'DELETE' })
   }
 
   importLocalPath(kind: AssetKind, path: string): Promise<AssetDto> {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from ipaddress import ip_address
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path, PurePosixPath
@@ -26,6 +27,8 @@ from gs_video.api.workflow import WorkerPreviewService
 from gs_video.domain.contracts import SegmentationBackend
 from gs_video.domain.errors import GsVideoError
 from gs_video.environment.doctor import EnvironmentDoctor
+from gs_video.environment.repair import EnvironmentRepairManager
+from gs_video.media.toolchain import executable_name
 from gs_video.pipeline.services import (
     CameraSolveWorkflowService,
     CompositeWorkflowService,
@@ -112,6 +115,7 @@ class WorkflowRuntimeConfig(BaseModel):
 
     _workspace_root: Path | None = PrivateAttr(default=None)
     _runtime_path: Path | None = PrivateAttr(default=None)
+    _allow_missing_resources: bool = PrivateAttr(default=False)
 
     @field_validator(
         "project_root",
@@ -182,9 +186,10 @@ def _resolved_inside(
     label: str,
     *,
     root_label: str = "application workspace",
+    strict: bool = True,
 ) -> Path:
     try:
-        resolved = path.resolve(strict=True)
+        resolved = path.resolve(strict=strict)
     except OSError as error:
         raise ValueError(f"{label} is unavailable") from error
     if resolved != path or not resolved.is_relative_to(root):
@@ -193,10 +198,23 @@ def _resolved_inside(
 
 
 def _validate_loaded_config(
-    config: WorkflowRuntimeConfig, *, workspace: Path, runtime_path: Path
+    config: WorkflowRuntimeConfig,
+    *,
+    workspace: Path,
+    runtime_path: Path,
+    allow_missing_resources: bool = False,
 ) -> None:
-    model_root = _resolved_inside(config.model_root, workspace, "model_root")
-    if not model_root.is_dir() or has_reparse_component(model_root):
+    model_root = _resolved_inside(
+        config.model_root,
+        workspace,
+        "model_root",
+        strict=not allow_missing_resources,
+    )
+    if (
+        (model_root.exists() and not model_root.is_dir())
+        or has_reparse_component(model_root)
+        or (not model_root.exists() and not allow_missing_resources)
+    ):
         raise ValueError("model_root must be an ordinary directory")
     project_root = config.project_root
     if project_root == workspace or not project_root.is_relative_to(workspace):
@@ -210,20 +228,43 @@ def _validate_loaded_config(
         (config.segmentation_model_config, "segmentation_model_config"),
         (config.segmentation_checkpoint, "segmentation_checkpoint"),
     ):
-        resolved = _resolved_inside(path, model_root, label, root_label="model_root")
-        _ordinary_file(resolved, label)
+        resolved = _resolved_inside(
+            path,
+            model_root,
+            label,
+            root_label="model_root",
+            strict=not allow_missing_resources,
+        )
+        if resolved.exists():
+            _ordinary_file(resolved, label)
+        elif not allow_missing_resources:
+            raise ValueError(f"{label} is unavailable")
     if not is_wsl_prefix(config.segmentation_worker_prefix):
         executable = _resolved_inside(
-            Path(config.segmentation_worker_prefix[0]), workspace, "segmentation worker"
+            Path(config.segmentation_worker_prefix[0]),
+            workspace,
+            "segmentation worker",
+            strict=not allow_missing_resources,
         )
-        _ordinary_file(executable, "segmentation worker")
+        if executable.exists():
+            _ordinary_file(executable, "segmentation worker")
+        elif not allow_missing_resources:
+            raise ValueError("segmentation worker is unavailable")
     renderer_executable = _resolved_inside(
-        Path(config.renderer_worker_prefix[0]), workspace, "renderer worker"
+        Path(config.renderer_worker_prefix[0]),
+        workspace,
+        "renderer worker",
+        strict=not allow_missing_resources,
     )
-    _ordinary_file(renderer_executable, "renderer worker")
+    if renderer_executable.exists():
+        _ordinary_file(renderer_executable, "renderer worker")
+    elif not allow_missing_resources:
+        raise ValueError("renderer worker is unavailable")
 
 
-def load_runtime_config(path: Path) -> WorkflowRuntimeConfig:
+def load_runtime_config(
+    path: Path, *, allow_missing_resources: bool = False
+) -> WorkflowRuntimeConfig:
     requested = Path(path)
     if not requested.is_absolute():
         raise ValueError("runtime configuration path must be absolute")
@@ -248,9 +289,15 @@ def load_runtime_config(path: Path) -> WorkflowRuntimeConfig:
     if not payload or len(payload) > 64 * 1024:
         raise ValueError("runtime configuration must be between 1 byte and 64 KiB")
     config = WorkflowRuntimeConfig.model_validate_json(payload, strict=True)
-    _validate_loaded_config(config, workspace=workspace, runtime_path=resolved)
+    _validate_loaded_config(
+        config,
+        workspace=workspace,
+        runtime_path=resolved,
+        allow_missing_resources=allow_missing_resources,
+    )
     config._workspace_root = workspace
     config._runtime_path = resolved
+    config._allow_missing_resources = allow_missing_resources
     return config
 
 
@@ -291,6 +338,7 @@ def assemble_api_services(
             config,
             workspace=config._workspace_root,
             runtime_path=config._runtime_path,
+            allow_missing_resources=config._allow_missing_resources,
         )
     config.project_root.mkdir(parents=True, exist_ok=True)
     if has_reparse_component(config.project_root):
@@ -397,7 +445,20 @@ def assemble_api_services(
         with gpu_gate.hold(CancellationToken()):
             return cast(Any, subprocess.run)(command, **options)
 
+    def runtime_which(command: str) -> str | None:
+        local = (
+            config.project_root
+            / ".cache"
+            / "ffmpeg"
+            / "bin"
+            / executable_name(command)
+        )
+        if local.is_file() and not has_reparse_component(local):
+            return str(local)
+        return shutil.which(command)
+
     doctor = EnvironmentDoctor(
+        which=runtime_which,
         cuda_probe=external_cuda_probe,
         segmentation_backend=config.segmentation_backend,
         worker_prefix=config.segmentation_worker_prefix,
@@ -407,6 +468,14 @@ def assemble_api_services(
         renderer_probe=external_renderer_probe,
         process_runner=admitted_process_run,
         vram_limit_mb=config.available_vram_limit_mb,
+    )
+    runtime_root = config._workspace_root or config.project_root.parent.parent
+    runtime_path = config._runtime_path or (runtime_root / "desktop-runtime.json")
+    repair = EnvironmentRepairManager(
+        repo_root=runtime_root.parent,
+        runtime_root=runtime_root,
+        runtime_config=runtime_path,
+        environment_doctor=doctor,
     )
     settings = ApiSettings(
         bind_host="127.0.0.1",
@@ -430,6 +499,7 @@ def assemble_api_services(
             available_vram_limit_mb=config.available_vram_limit_mb,
         ),
         asset_inspector=AssetInspector(),
+        environment_repair=repair,
     )
     return settings, services
 
