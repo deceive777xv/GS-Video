@@ -1,5 +1,32 @@
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+
 import react from '@vitejs/plugin-react'
-import { defineConfig } from 'vite'
+import { defineConfig, type Plugin } from 'vite'
+
+function sharedAppIcon(): Plugin {
+  const appIconPath = fileURLToPath(
+    new URL('../desktop/app-icon.svg', import.meta.url),
+  )
+
+  return {
+    name: 'gs-video-shared-app-icon',
+    configureServer(server) {
+      server.middlewares.use('/app-icon.svg', (_request, response) => {
+        response.statusCode = 200
+        response.setHeader('Content-Type', 'image/svg+xml')
+        response.end(readFileSync(appIconPath))
+      })
+    },
+    generateBundle() {
+      this.emitFile({
+        type: 'asset',
+        fileName: 'app-icon.svg',
+        source: readFileSync(appIconPath),
+      })
+    },
+  }
+}
 
 export function localProxyTarget(value: string): string {
   const url = new URL(value)
@@ -48,7 +75,7 @@ export default defineConfig(() => {
 
   return {
     base: './',
-    plugins: react(),
+    plugins: [sharedAppIcon(), react()],
     server: localDevServer(configuredTarget),
   }
 })
