@@ -338,7 +338,7 @@ export function ImportPage({
             </button>
           ) : null}
         </div>
-        <p>检测显存 {environment.vram_mb.toLocaleString()} MB；处理按阶段串行，实时性不是目标。</p>
+        <p>检测显存 {environment.vram_mb.toLocaleString()} MB；处理按阶段串行。</p>
         {environment.issues.length > 0 ? (
           <ul>{environment.issues.map((issue) => <li key={issue.code}><code>{issue.code}</code> {issue.message}</li>)}</ul>
         ) : null}
