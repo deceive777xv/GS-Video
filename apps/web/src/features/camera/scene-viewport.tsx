@@ -1,6 +1,5 @@
 import {
   type PointerEvent as ReactPointerEvent,
-  type WheelEvent as ReactWheelEvent,
   useEffect,
   useRef,
   useState,
@@ -14,11 +13,22 @@ import type {
   PreviewFrameDto,
   ProjectDto,
 } from '../../api/types'
+import { nextPreviewGeneration } from './preview-generation'
 
 export interface ImageSize { width: number; height: number }
 export interface Point { x: number; y: number }
 export interface PointEvent { clientX: number; clientY: number }
 export interface PointBounds { left: number; top: number; width: number; height: number }
+
+export function toCameraInput(camera: CameraInput): CameraInput {
+  return {
+    target: [...camera.target],
+    distance: camera.distance,
+    yaw: camera.yaw,
+    pitch: camera.pitch,
+    fov_y_degrees: camera.fov_y_degrees,
+  }
+}
 
 export function cameraFingerprint(camera: CameraInput): string {
   return [
@@ -28,6 +38,15 @@ export function cameraFingerprint(camera: CameraInput): string {
     camera.pitch,
     camera.fov_y_degrees,
   ].map((value) => Object.is(value, -0) ? '0' : String(value)).join('|')
+}
+
+function formatAngleInput(value: number): string {
+  return String(Number(value.toFixed(3)))
+}
+
+function normalizeYaw(value: number): number {
+  const normalized = ((value + 180) % 360 + 360) % 360 - 180
+  return Object.is(normalized, -0) ? 0 : normalized
 }
 
 export function toImagePoint(
@@ -66,7 +85,7 @@ export function SceneViewport({
   onProjectChange,
   onFootPoint,
 }: SceneViewportProps) {
-  const [camera, setCamera] = useState(initialCamera)
+  const [camera, setCamera] = useState(() => toCameraInput(initialCamera))
   const [frame, setFrame] = useState<PreviewFrameDto | null>(initialPreview === null ? null : {
     artifact_id: initialPreview.artifact_id,
     generation: initialPreview.generation,
@@ -80,6 +99,8 @@ export function SceneViewport({
   )
   const [frameUrl, setFrameUrl] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const [yawInput, setYawInput] = useState(() => formatAngleInput(initialCamera.yaw))
+  const [pitchInput, setPitchInput] = useState(() => formatAngleInput(initialCamera.pitch))
   const [footX, setFootX] = useState('')
   const [footY, setFootY] = useState('')
   const generation = useRef(initialPreview?.generation ?? 0)
@@ -100,6 +121,22 @@ export function SceneViewport({
 
   useEffect(() => { onErrorRef.current = onError }, [onError])
   useEffect(() => { onPreviewRef.current = onPreview }, [onPreview])
+  useEffect(() => { setYawInput(formatAngleInput(camera.yaw)) }, [camera.yaw])
+  useEffect(() => { setPitchInput(formatAngleInput(camera.pitch)) }, [camera.pitch])
+  useEffect(() => {
+    const viewport = viewportRef.current
+    if (viewport === null) return
+    const updateDistance = (event: WheelEvent): void => {
+      event.preventDefault()
+      const factor = event.deltaY > 0 ? 1.08 : 0.92
+      setCamera((current) => ({
+        ...current,
+        distance: Math.min(100, Math.max(0.1, current.distance * factor)),
+      }))
+    }
+    viewport.addEventListener('wheel', updateDistance, { passive: false })
+    return () => viewport.removeEventListener('wheel', updateDistance)
+  }, [])
 
   const replaceFrameUrl = (next: string | null): void => {
     if (frameUrlRef.current !== null && frameUrlRef.current !== next) {
@@ -112,7 +149,11 @@ export function SceneViewport({
   useEffect(() => () => replaceFrameUrl(null), [])
 
   useEffect(() => {
-    setCamera(initialCamera)
+    setCamera((current) => (
+      cameraFingerprint(current) === cameraFingerprint(initialCamera)
+        ? current
+        : toCameraInput(initialCamera)
+    ))
     requestAuthority.current += 1
     setFrame(null)
     setFrameCameraFingerprint(null)
@@ -185,13 +226,14 @@ export function SceneViewport({
     const controller = new AbortController()
     const authority = ++requestAuthority.current
     const timeout = setTimeout(() => {
-      const nextGeneration = ++generation.current
+      const nextGeneration = nextPreviewGeneration(generation.current)
+      generation.current = nextGeneration
       setLoading(true)
       void backend.renderPreview({
         generation: nextGeneration,
         width: 960,
         height: 540,
-        camera,
+        camera: toCameraInput(camera),
       }, controller.signal).then(async (nextFrame) => {
         const blob = await backend.fetchPreviewArtifact(nextFrame.artifact_id, controller.signal)
         if (controller.signal.aborted || authority !== requestAuthority.current) return
@@ -213,10 +255,24 @@ export function SceneViewport({
     }
   }, [backend, camera])
 
-  const updateDistance = (event: ReactWheelEvent<HTMLDivElement>): void => {
-    event.preventDefault()
-    const factor = event.deltaY > 0 ? 1.08 : 0.92
-    setCamera((current) => ({ ...current, distance: Math.min(100, Math.max(0.1, current.distance * factor)) }))
+  const restoreAngleInput = (axis: 'yaw' | 'pitch'): void => {
+    if (axis === 'yaw') setYawInput(formatAngleInput(camera.yaw))
+    else setPitchInput(formatAngleInput(camera.pitch))
+  }
+
+  const commitAngleInput = (axis: 'yaw' | 'pitch'): void => {
+    const input = axis === 'yaw' ? yawInput : pitchInput
+    const parsed = input.trim() === '' ? Number.NaN : Number(input)
+    if (!Number.isFinite(parsed)) {
+      restoreAngleInput(axis)
+      return
+    }
+    const value = axis === 'yaw'
+      ? normalizeYaw(parsed)
+      : Math.min(89, Math.max(-89, parsed))
+    if (axis === 'yaw') setYawInput(formatAngleInput(value))
+    else setPitchInput(formatAngleInput(value))
+    setCamera((current) => current[axis] === value ? current : { ...current, [axis]: value })
   }
 
   const pointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
@@ -320,7 +376,6 @@ export function SceneViewport({
         onPointerMove={pointerMove}
         onPointerUp={pointerUp}
         onPointerCancel={pointerUp}
-        onWheel={updateDistance}
         ref={viewportRef}
         tabIndex={0}
       >
@@ -333,8 +388,48 @@ export function SceneViewport({
       </div>
       <aside className="viewport-controls" aria-label="机位控制">
         <div className="camera-readout">
-          <span>Yaw {camera.yaw.toFixed(1)}°</span>
-          <span>Pitch {camera.pitch.toFixed(1)}°</span>
+          <label>
+            Yaw 角度
+            <input
+              aria-label="Yaw 角度"
+              inputMode="decimal"
+              onBlur={() => commitAngleInput('yaw')}
+              onChange={(event) => setYawInput(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  commitAngleInput('yaw')
+                } else if (event.key === 'Escape') {
+                  restoreAngleInput('yaw')
+                }
+              }}
+              step="0.1"
+              type="number"
+              value={yawInput}
+            />
+          </label>
+          <label>
+            Pitch 角度
+            <input
+              aria-label="Pitch 角度"
+              inputMode="decimal"
+              max="89"
+              min="-89"
+              onBlur={() => commitAngleInput('pitch')}
+              onChange={(event) => setPitchInput(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  commitAngleInput('pitch')
+                } else if (event.key === 'Escape') {
+                  restoreAngleInput('pitch')
+                }
+              }}
+              step="0.1"
+              type="number"
+              value={pitchInput}
+            />
+          </label>
           <span>距离 {camera.distance.toFixed(2)}</span>
         </div>
         <label>
@@ -343,7 +438,12 @@ export function SceneViewport({
             aria-label="垂直视场角"
             max="100"
             min="20"
-            onChange={(event) => setCamera((current) => ({ ...current, fov_y_degrees: Number(event.currentTarget.value) }))}
+            onChange={(event) => {
+              const value = Number(event.currentTarget.value)
+              if (!Number.isFinite(value)) return
+              const fov = Math.min(100, Math.max(20, value))
+              setCamera((current) => ({ ...current, fov_y_degrees: fov }))
+            }}
             onKeyDown={(event) => {
               if (!['ArrowLeft', 'ArrowDown', 'ArrowRight', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
               event.preventDefault()

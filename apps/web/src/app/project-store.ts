@@ -20,7 +20,11 @@ export function creativeInteractionCount(project: ProjectDto): number {
 
 export function workflowStepForProject(project: ProjectDto): WorkflowStep {
   const workflow = project.workflow
-  if (workflow.source_summary === null || workflow.scene_summary === null) return 'import'
+  if (
+    workflow.source_summary === null
+    || workflow.scene_summary === null
+    || !stageSucceeded(project, 'ingest')
+  ) return 'import'
   if (
     workflow.subject_prompt === null
     || !stageSucceeded(project, 'segment')
@@ -40,7 +44,9 @@ export function canVisitStep(project: ProjectDto, step: WorkflowStep): boolean {
   switch (step) {
     case 'import': return true
     case 'subject':
-      return workflow.source_summary !== null && workflow.scene_summary !== null
+      return workflow.source_summary !== null
+        && workflow.scene_summary !== null
+        && stageSucceeded(project, 'ingest')
     case 'camera':
       return workflow.subject_prompt !== null
         && stageSucceeded(project, 'segment')

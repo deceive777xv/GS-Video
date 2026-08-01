@@ -84,6 +84,10 @@ function isTaskNotFound(error: unknown): boolean {
         || ('code' in error && error.code === 'task_not_found'))
 }
 
+function formatTaskSeconds(value: number): string {
+  return value.toFixed(3)
+}
+
 function AppShell({ children }: { children: ReactNode }) {
   return <div className="app-shell">{children}</div>
 }
@@ -525,11 +529,11 @@ export function App({
                   ? <span>{authoritativeProgress.current} / {authoritativeProgress.total}</span>
                   : null}
                 {authoritativeProgress?.elapsed_seconds !== undefined
-                  ? <span>已用时 {authoritativeProgress.elapsed_seconds} 秒</span>
+                  ? <span className="task-time task-time-elapsed">已用时 {formatTaskSeconds(authoritativeProgress.elapsed_seconds)} 秒</span>
                   : null}
                 {authoritativeProgress?.eta_seconds !== null
                   && authoritativeProgress?.eta_seconds !== undefined
-                  ? <span>预计剩余 {authoritativeProgress.eta_seconds} 秒</span>
+                  ? <span className="task-time task-time-eta">预计剩余 {formatTaskSeconds(authoritativeProgress.eta_seconds)} 秒</span>
                   : null}
                 <span>{taskState.connection}</span>
               </small>

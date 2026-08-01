@@ -293,6 +293,7 @@ describe('guided workflow', () => {
       estimated_vram_mb: 128,
     }
     recovered.workflow.subject_prompt = { frame_index: 0, x: 100, y: 120 }
+    recovered.stages.ingest = stage('succeeded')
     recovered.stages.segment = stage('succeeded')
     recovered.stages.solve_camera = stage('succeeded')
     recovered.workflow.target_camera = {
@@ -333,6 +334,7 @@ describe('guided workflow', () => {
       estimated_vram_mb: 128,
     }
     gated.workflow.subject_prompt = { frame_index: 0, x: 10, y: 10 }
+    gated.stages.ingest = stage('succeeded')
     gated.stages.segment = stage('succeeded')
     const harness = createHarness(gated)
     vi.mocked(harness.client.startTask).mockImplementation(async () => new Promise<TaskDto>(() => undefined))
@@ -720,6 +722,7 @@ describe('guided workflow', () => {
       estimated_vram_mb: 128,
     }
     recovered.workflow.subject_prompt = { frame_index: 0, x: 100, y: 120 }
+    recovered.stages.ingest = stage('succeeded')
     recovered.stages.segment = stage('succeeded')
     recovered.stages.solve_camera = stage('succeeded')
     recovered.workflow.target_camera = {
@@ -764,6 +767,7 @@ describe('guided workflow', () => {
       estimated_vram_mb: 128,
     }
     ready.workflow.subject_prompt = { frame_index: 0, x: 10, y: 10 }
+    ready.stages.ingest = stage('succeeded')
     ready.stages.segment = stage('succeeded')
     ready.stages.solve_camera = stage('succeeded')
     ready.stages.composite = stage('succeeded')
@@ -841,6 +845,7 @@ describe('guided workflow', () => {
     }
     ready.workflow.scene_summary = { filename: 'garden.ply', size: 20, sha256: 'g', gaussian_count: 100, estimated_vram_mb: 128 }
     ready.workflow.subject_prompt = { frame_index: 0, x: 10, y: 10 }
+    ready.stages.ingest = stage('succeeded')
     ready.stages.segment = stage('succeeded')
     ready.stages.solve_camera = stage('succeeded')
     ready.workflow.target_camera = { target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50, revision: 1 }
@@ -899,7 +904,7 @@ describe('guided workflow', () => {
         total: 30,
         message: '渲染背景 12/30',
         elapsed_seconds: 8,
-        eta_seconds: 12,
+        eta_seconds: 12.3456,
         error: null,
       },
     }
@@ -913,8 +918,8 @@ describe('guided workflow', () => {
 
     expect(screen.getByText('渲染背景 12/30')).toBeVisible()
     expect(screen.getByText('12 / 30')).toBeVisible()
-    expect(screen.getByText('已用时 8 秒')).toBeVisible()
-    expect(screen.getByText('预计剩余 12 秒')).toBeVisible()
+    expect(screen.getByText('已用时 8.000 秒')).toBeVisible()
+    expect(screen.getByText('预计剩余 12.346 秒')).toBeVisible()
   })
 
   it('uses the matching REST task snapshot and omits a null ETA without inventing one', () => {
@@ -944,7 +949,7 @@ describe('guided workflow', () => {
 
     expect(screen.getByText('REST 恢复渲染 15/30')).toBeVisible()
     expect(screen.getByText('15 / 30')).toBeVisible()
-    expect(screen.getByText('已用时 10 秒')).toBeVisible()
+    expect(screen.getByText('已用时 10.000 秒')).toBeVisible()
     expect(screen.queryByText(/预计剩余/)).toBeNull()
     expect(screen.queryByText('过期事件')).toBeNull()
   })

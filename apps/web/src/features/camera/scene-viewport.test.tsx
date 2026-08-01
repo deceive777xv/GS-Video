@@ -1,10 +1,12 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { BackendClient } from '../../api/backend-client'
-import type { PreviewFrameDto, PreviewRequest } from '../../api/types'
+import type { CameraDto, PreviewFrameDto, PreviewRequest } from '../../api/types'
 import { SceneViewport, toImagePoint } from './scene-viewport'
+
+afterEach(() => vi.useRealTimers())
 
 describe('toImagePoint', () => {
   it('maps letterboxed CSS coordinates to integer image pixels', () => {
@@ -25,6 +27,174 @@ describe('toImagePoint', () => {
 })
 
 describe('SceneViewport', () => {
+  it('commits precise Yaw and Pitch inputs with camera bounds', async () => {
+    vi.useFakeTimers()
+    const requests: PreviewRequest[] = []
+    const backend = {
+      renderPreview: vi.fn((input: PreviewRequest) => {
+        requests.push(input)
+        return new Promise<PreviewFrameDto>(() => undefined)
+      }),
+    } as unknown as BackendClient
+    render(
+      <SceneViewport
+        backend={backend}
+        camera={{ target: [0, 0, 0], distance: 4, yaw: 10, pitch: 5, fov_y_degrees: 50 }}
+        onError={vi.fn()}
+        onPreview={vi.fn()}
+      />,
+    )
+
+    const yaw = screen.getByRole('spinbutton', { name: 'Yaw 角度' })
+    const pitch = screen.getByRole('spinbutton', { name: 'Pitch 角度' })
+    expect(yaw).toHaveValue(10)
+    expect(pitch).toHaveValue(5)
+
+    fireEvent.change(yaw, { target: { value: '190' } })
+    fireEvent.keyDown(yaw, { key: 'Enter' })
+    expect(yaw).toHaveValue(-170)
+
+    fireEvent.change(pitch, { target: { value: '-100' } })
+    fireEvent.blur(pitch)
+    expect(pitch).toHaveValue(-89)
+
+    await vi.advanceTimersByTimeAsync(150)
+    expect(requests).toHaveLength(1)
+    expect(requests[0]!.camera).toMatchObject({ yaw: -170, pitch: -89 })
+
+    const viewport = screen.getByLabelText('Gaussian 场景视口')
+    fireEvent.pointerDown(viewport, { clientX: 10, clientY: 10, pointerId: 1 })
+    fireEvent.pointerMove(viewport, { clientX: 50, clientY: 30, pointerId: 1 })
+    fireEvent.pointerUp(viewport, { clientX: 50, clientY: 30, pointerId: 1 })
+    expect(yaw).toHaveValue(-160)
+    expect(pitch).toHaveValue(-84)
+  })
+
+  it('keeps a cancellable wheel gesture inside the Gaussian viewport', () => {
+    const backend = {
+      renderPreview: vi.fn(() => new Promise<PreviewFrameDto>(() => undefined)),
+    } as unknown as BackendClient
+    const view = render(
+      <SceneViewport
+        backend={backend}
+        camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        onError={vi.fn()}
+        onPreview={vi.fn()}
+      />,
+    )
+    const viewport = screen.getByLabelText('Gaussian 场景视口')
+    const wheel = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 100 })
+
+    let propagated = true
+    act(() => { propagated = viewport.dispatchEvent(wheel) })
+
+    expect(propagated).toBe(false)
+    expect(wheel.defaultPrevented).toBe(true)
+    expect(screen.getByText('距离 4.32')).toBeVisible()
+
+    view.unmount()
+    const afterUnmount = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 100 })
+    expect(viewport.dispatchEvent(afterUnmount)).toBe(true)
+    expect(afterUnmount.defaultPrevented).toBe(false)
+  })
+
+  it('does not retain the React change event across batched FOV updates', async () => {
+    const backend = {
+      fetchPreviewArtifact: vi.fn(async () => new Blob(['preview'])),
+      renderPreview: vi.fn(() => new Promise<PreviewFrameDto>(() => undefined)),
+    } as unknown as BackendClient
+    render(
+      <SceneViewport
+        backend={backend}
+        camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        initialPreview={{
+          artifact_id: 'preview-1', artifact_size: 1, artifact_sha256: 'a',
+          generation: 1, width: 960, height: 540, camera_revision: 1,
+          pick_buffer_revision: 1,
+        }}
+        onError={vi.fn()}
+        onPreview={vi.fn()}
+      />,
+    )
+    await act(async () => { await Promise.resolve() })
+    const slider = screen.getByRole('slider', { name: '垂直视场角' })
+
+    expect(() => {
+      act(() => {
+        fireEvent.change(slider, { target: { value: '51' } })
+        fireEvent.change(slider, { target: { value: '52' } })
+      })
+    }).not.toThrow()
+    expect(slider).toHaveValue('52')
+  })
+
+  it('projects a restored camera to the strict preview request contract', async () => {
+    vi.useFakeTimers()
+    const requests: PreviewRequest[] = []
+    const backend = {
+      renderPreview: vi.fn((input: PreviewRequest) => {
+        requests.push(input)
+        return new Promise<PreviewFrameDto>(() => undefined)
+      }),
+    } as unknown as BackendClient
+    const restoredCamera: CameraDto = {
+      target: [0, 0, 0], distance: 4, yaw: 15, pitch: 5,
+      fov_y_degrees: 50, revision: 7,
+    }
+
+    render(
+      <SceneViewport
+        backend={backend}
+        camera={restoredCamera}
+        onError={vi.fn()}
+        onPreview={vi.fn()}
+      />,
+    )
+    await vi.advanceTimersByTimeAsync(150)
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]!.camera).toEqual({
+      target: [0, 0, 0], distance: 4, yaw: 15, pitch: 5, fov_y_degrees: 50,
+    })
+    expect(requests[0]!.camera).not.toHaveProperty('revision')
+  })
+
+  it('allocates a newer generation after remount while the old request is pending', async () => {
+    vi.useFakeTimers()
+    const requests: PreviewRequest[] = []
+    const backend = {
+      renderPreview: vi.fn((input: PreviewRequest) => {
+        requests.push(input)
+        return new Promise<PreviewFrameDto>(() => undefined)
+      }),
+    } as unknown as BackendClient
+    const props = {
+      backend,
+      onError: vi.fn(),
+      onPreview: vi.fn(),
+    }
+
+    const first = render(
+      <SceneViewport
+        {...props}
+        camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+      />,
+    )
+    await vi.advanceTimersByTimeAsync(150)
+    first.unmount()
+
+    render(
+      <SceneViewport
+        {...props}
+        camera={{ target: [0, 0, 0], distance: 4, yaw: 15, pitch: 0, fov_y_degrees: 50 }}
+      />,
+    )
+    await vi.advanceTimersByTimeAsync(150)
+
+    expect(requests).toHaveLength(2)
+    expect(requests[1]!.generation).toBeGreaterThan(requests[0]!.generation)
+  })
+
   it('invalidates confirm and pick immediately when the camera no longer matches the frame', async () => {
     vi.useFakeTimers()
     const backend = {

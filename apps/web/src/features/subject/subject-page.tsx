@@ -1,8 +1,11 @@
 import { type PointerEvent, useEffect, useRef, useState } from 'react'
 
 import type { BackendClient } from '../../api/backend-client'
+import { BackendClientError } from '../../api/http-backend-client'
 import type { ProjectDto, SubjectMediaDto } from '../../api/types'
 import { toImagePoint } from '../camera/scene-viewport'
+
+const SUBJECT_MEDIA_RETRY_DELAYS_MS = [250, 500, 1_000] as const
 
 interface SubjectPageProps {
   backend: BackendClient
@@ -36,17 +39,40 @@ export function SubjectPage({ backend, busy, project, onError, onProjectChange, 
   }
 
   useEffect(() => {
+    if (project.stages.ingest?.status !== 'succeeded') return
     const controller = new AbortController()
-    void backend.getSubjectMedia('proxy').then(async (descriptor) => {
-      const blob = await backend.fetchSubjectMediaArtifact('proxy', descriptor.artifact_id, controller.signal)
-      if (controller.signal.aborted) return
-      setProxy(descriptor)
-      replaceUrl('proxy', blob)
-    }).catch((error: unknown) => {
-      if (!controller.signal.aborted) onErrorRef.current(error instanceof Error ? error : '代表帧尚未生成，请重试导入阶段。')
-    })
-    return () => controller.abort()
-  }, [backend])
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let attempt = 0
+    const load = async (): Promise<void> => {
+      try {
+        const descriptor = await backend.getSubjectMedia('proxy')
+        const blob = await backend.fetchSubjectMediaArtifact(
+          'proxy', descriptor.artifact_id, controller.signal,
+        )
+        if (controller.signal.aborted) return
+        setProxy(descriptor)
+        replaceUrl('proxy', blob)
+      } catch (error) {
+        if (controller.signal.aborted) return
+        const delay = SUBJECT_MEDIA_RETRY_DELAYS_MS[attempt]
+        if (
+          error instanceof BackendClientError
+          && error.code === 'subject_media_not_ready'
+          && delay !== undefined
+        ) {
+          attempt += 1
+          timer = setTimeout(() => void load(), delay)
+          return
+        }
+        onErrorRef.current(error instanceof Error ? error : '代表帧尚未生成，请重试导入阶段。')
+      }
+    }
+    void load()
+    return () => {
+      controller.abort()
+      if (timer !== null) clearTimeout(timer)
+    }
+  }, [backend, project.stages.ingest?.cache_key, project.stages.ingest?.status])
 
   useEffect(() => {
     if (project.stages.segment?.status !== 'succeeded' || project.workflow.subject_prompt === null) return

@@ -186,23 +186,25 @@ export function PreviewPage({
       </div>
       <div className="preview-layout">
         <article className="preview-card">
-          {compositeAuthority !== null ? (
-            displayedComposite === null
-              ? <div className="viewport-empty">正在验证合成预览…</div>
-              : (
-                  <video
-                    aria-label="低分辨率合成预览"
-                    controls
-                    playsInline
-                    preload="metadata"
-                    src={displayedComposite.url}
-                  />
-                )
-          ) : (
-            frameUrl === null
-              ? <div className="viewport-empty">暂无相机参考帧</div>
-              : <img alt="相机参考帧（非合成视频）" src={frameUrl} />
-          )}
+          <div className="preview-media">
+            {compositeAuthority !== null ? (
+              displayedComposite === null
+                ? <div className="viewport-empty">正在验证合成预览…</div>
+                : (
+                    <video
+                      aria-label="低分辨率合成预览"
+                      controls
+                      playsInline
+                      preload="metadata"
+                      src={displayedComposite.url}
+                    />
+                  )
+            ) : (
+              frameUrl === null
+                ? <div className="viewport-empty">暂无相机参考帧</div>
+                : <img alt="相机参考帧（非合成视频）" src={frameUrl} />
+            )}
+          </div>
           <div className="preview-caption">
             <span>{compositeAuthority === null ? '相机参考 · 非合成视频' : '后端验证 · 低分辨率合成'}</span>
             <span>垂直 FOV {project.workflow.target_camera?.fov_y_degrees.toFixed(0) ?? '—'}°</span>
