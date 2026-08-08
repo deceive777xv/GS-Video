@@ -24,6 +24,7 @@ def test_checked_in_manifest_contains_pinned_edge_tam_and_ffmpeg_resources() -> 
         "bin/ffprobe.exe",
     )
     assert ffmpeg.size == 109728040
+    assert ffmpeg.target.as_posix() == "data/cache/ffmpeg"
     assert any(
         action.source is not None
         and action.source.as_posix() == "segmentation/EdgeTAM"

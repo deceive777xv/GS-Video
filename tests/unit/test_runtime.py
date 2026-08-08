@@ -160,11 +160,14 @@ def test_production_assembly_registers_every_stage(tmp_path: Path) -> None:
     settings, services = assemble_api_services(config, SecretStr("secret"))
 
     assert isinstance(config, WorkflowRuntimeConfig)
+    assert services.project_manager is not None
+    services.project_manager.create("Assembly test")
     assert all(services.pipeline_runner.supports(stage) for stage in StageName)
     assert services.preview_service is not None
     assert callable(services.preview_service.render_live)
     assert settings.bind_host == "127.0.0.1"
     assert settings.port == 0
+    asyncio.run(services.worker_registry.terminate_all())
 
 
 def test_production_assembly_locks_then_reconciles_and_reopens_project(
@@ -196,6 +199,25 @@ def test_production_assembly_locks_then_reconciles_and_reopens_project(
     )
     assert claim.claimed
     asyncio.run(reopened.worker_registry.terminate_all())
+
+
+def test_production_assembly_adopts_project_from_previous_runtime_layout(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-upgrade"
+    workspace.mkdir()
+    payload = runtime_payload(workspace)
+    payload["project_root"] = str(workspace / "data" / "projects" / "default")
+    config = load_runtime_config(write_runtime(workspace, payload))
+    old_repository = ProjectRepository(workspace / "projects" / "default")
+    old_repository.save(old_repository.create("Existing project"))
+
+    _settings, services = assemble_api_services(config, SecretStr("secret"))
+
+    assert services.project_manager is not None
+    assert services.project_manager.active_project() is not None
+    assert services.project_manager.active_project().name == "Existing project"
+    asyncio.run(services.worker_registry.terminate_all())
 
 
 def test_production_assembly_adds_explicit_loopback_browser_origin(

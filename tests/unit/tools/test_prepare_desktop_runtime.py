@@ -37,7 +37,7 @@ def test_prepare_desktop_runtime_writes_confined_absolute_configuration(
     payload = json.loads(runtime_path.read_text(encoding="utf-8"))
     runtime_root = root / ".runtime"
     assert payload == {
-        "project_root": str(runtime_root / "projects" / "default"),
+        "project_root": str(runtime_root / "data" / "projects" / "default"),
         "model_root": str(runtime_root / "segmentation" / "EdgeTAM"),
         "segmentation_backend": "edgetam",
         "segmentation_worker_prefix": [
@@ -55,7 +55,7 @@ def test_prepare_desktop_runtime_writes_confined_absolute_configuration(
         "renderer_sh_degree": 3,
         "available_vram_limit_mb": 8192,
     }
-    assert (runtime_root / "projects" / "default").is_dir()
+    assert (runtime_root / "data" / "projects" / "default").is_dir()
 
 
 def test_prepare_desktop_runtime_does_not_rewrite_unchanged_file(

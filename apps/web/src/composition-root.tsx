@@ -74,6 +74,7 @@ function ConnectedShell({
         eventSource={eventSource}
         initialBootstrap={bootstrap}
         platform={bridge}
+        startAtHome
       />
     </>
   )

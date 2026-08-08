@@ -208,7 +208,7 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
         bind_host="127.0.0.1",
         port=0,
         session_token=TOKEN,
-        allowed_origins=(ORIGIN,),
+        allowed_origins=("http://tauri.localhost", ORIGIN),
     )
     with TestClient(create_app(settings, services)) as client:
         yield client
@@ -765,7 +765,7 @@ def test_replacing_source_video_clears_all_source_derived_authority(
         response = workflow_client.post(
             "/api/v1/assets/import",
             json={"path": str(selected), "kind": "source_video"},
-            headers=auth_headers,
+            headers={**auth_headers, "Origin": "http://tauri.localhost"},
         )
     else:
         created = workflow_client.post(

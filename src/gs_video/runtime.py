@@ -23,7 +23,7 @@ from pydantic import (
 from gs_video.api.assets import AssetInspector
 from gs_video.api.routes import ApiServices
 from gs_video.api.schemas import ApiSettings
-from gs_video.api.workflow import WorkerPreviewService
+from gs_video.api.workflow import PreviewArtifactStore, WorkerPreviewService
 from gs_video.domain.contracts import SegmentationBackend
 from gs_video.domain.errors import GsVideoError
 from gs_video.environment.doctor import EnvironmentDoctor
@@ -43,7 +43,16 @@ from gs_video.pipeline.services import (
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.gpu import GpuAdmissionGate
 from gs_video.pipeline.workflow import WorkflowServices, build_mvp_workflow
-from gs_video.project.repository import ProjectInstanceLock, ProjectRepository
+from gs_video.project.assets import AssetKind as LibraryAssetKind, AssetLibrary
+from gs_video.project.catalog import ProjectCatalog
+from gs_video.project.manager import (
+    ActivePipelineRunner,
+    ActivePreviewArtifactStore,
+    ActiveProjectManager,
+    ActiveProjectRepository,
+    ActiveProjectSession,
+)
+from gs_video.project.repository import ProjectInstanceLock
 from gs_video.scene.worker_client import RendererWorkerClient
 from gs_video.scene.preview_session import PreviewSession
 from gs_video.segmentation.client import VideoSegmenterClient
@@ -308,11 +317,11 @@ class WorkerRegistry:
         self,
         *workers: Any,
         gpu_gate: GpuAdmissionGate | None = None,
-        project_lock: ProjectInstanceLock | None = None,
+        project_manager: ActiveProjectManager | None = None,
     ) -> None:
         self._workers = tuple(workers)
         self._gpu_gate = gpu_gate
-        self._project_lock = project_lock
+        self._project_manager = project_manager
 
     async def terminate_all(self) -> None:
         if self._gpu_gate is not None:
@@ -323,8 +332,8 @@ class WorkerRegistry:
                 return_exceptions=True,
             )
         finally:
-            if self._project_lock is not None:
-                self._project_lock.close()
+            if self._project_manager is not None:
+                self._project_manager.close()
 
 
 def assemble_api_services(
@@ -342,29 +351,121 @@ def assemble_api_services(
             runtime_path=config._runtime_path,
             allow_missing_resources=config._allow_missing_resources,
         )
+    runtime_root = config._workspace_root or config.project_root.parent.parent
+    data_root = config.project_root.parent.parent
     config.project_root.mkdir(parents=True, exist_ok=True)
     if has_reparse_component(config.project_root):
         raise ValueError("project_root contains a link or reparse point")
-    project_lock = ProjectInstanceLock.acquire(config.project_root)
-    repository = ProjectRepository(config.project_root)
-    if repository.path.exists():
-        project = repository.reconcile_interrupted_runs()
-    else:
-        project = repository.create("GS Video project")
-        repository.save(project)
+    catalog = ProjectCatalog(data_root)
+    if not catalog.list():
+        legacy_root = data_root.parent / "projects" / "default"
+        adoption_root = (
+            config.project_root
+            if (config.project_root / "project.json").is_file()
+            else legacy_root
+            if (legacy_root / "project.json").is_file()
+            else None
+        )
+        if adoption_root is not None:
+            catalog.adopt(adoption_root)
+        else:
+            try:
+                config.project_root.rmdir()
+            except OSError:
+                pass
+    asset_library = AssetLibrary(data_root / "assets")
+    asset_inspector = AssetInspector()
+
+    def migrate_legacy_assets() -> None:
+        for summary in catalog.list():
+            repository = catalog.repository(summary.project_id)
+            project = repository.load()
+            imported_paths: list[Path] = []
+            updates: dict[str, object] = {}
+            legacy_inputs = (
+                (
+                    "source_video",
+                    project.source_video,
+                    LibraryAssetKind.VIDEO,
+                    "source_video",
+                ),
+                (
+                    "scene_ply",
+                    project.scene_ply,
+                    LibraryAssetKind.PLY,
+                    "scene_ply",
+                ),
+            )
+            for field, relative_value, library_kind, inspector_kind in legacy_inputs:
+                asset_field = f"{field}_asset_id"
+                if getattr(project, asset_field) is not None or relative_value is None:
+                    continue
+                relative = Path(relative_value)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("legacy project input path is unsafe")
+                source = (repository.root / relative).absolute()
+                resolved_root = repository.root.resolve(strict=True)
+                resolved_source = source.resolve(strict=True)
+                if (
+                    resolved_source != source
+                    or not resolved_source.is_relative_to(resolved_root / "source")
+                    or has_reparse_component(resolved_source)
+                ):
+                    raise ValueError("legacy project input path is unsafe")
+
+                def inspect(
+                    path: Path,
+                    size: int,
+                    sha256: str,
+                    *,
+                    kind: str = inspector_kind,
+                ) -> Any:
+                    return asset_inspector.inspect(
+                        kind, path, size=size, sha256=sha256
+                    )
+
+                record, _ = asset_library.import_file(
+                    library_kind, resolved_source, inspect
+                )
+                updates[asset_field] = record.asset_id
+                updates[field] = None
+                if library_kind is LibraryAssetKind.VIDEO:
+                    updates["source_summary"] = record.video_summary
+                else:
+                    updates["scene_summary"] = record.scene_summary
+                imported_paths.append(resolved_source)
+            if not updates:
+                continue
+
+            def apply_migration(latest: Any) -> None:
+                for key, value in updates.items():
+                    if key == "source_summary":
+                        latest.workflow.source_summary = value
+                    elif key == "scene_summary":
+                        latest.workflow.scene_summary = value
+                    else:
+                        setattr(latest, key, value)
+
+            repository.update(apply_migration)
+            for path in imported_paths:
+                path.unlink()
+
+    migrate_legacy_assets()
+    log_root = data_root / "logs"
+    log_root.mkdir(exist_ok=True)
     gpu_gate = GpuAdmissionGate()
     segmentation = VideoSegmenterClient(
         backend=config.segmentation_backend,
         worker_prefix=config.segmentation_worker_prefix,
         model_config=config.segmentation_model_config,
         checkpoint=config.segmentation_checkpoint,
-        log_path=config.project_root / "logs" / "segmentation-worker.log",
+        log_path=log_root / "segmentation-worker.log",
         gpu_gate=gpu_gate,
         cache_root=config.model_root / ".cache",
     )
     renderer = RendererWorkerClient(
         worker_prefix=config.renderer_worker_prefix,
-        log_path=config.project_root / "logs" / "renderer-worker.log",
+        log_path=log_root / "renderer-worker.log",
         gpu_gate=gpu_gate,
     )
     identity_lock = Lock()
@@ -386,7 +487,6 @@ def assemble_api_services(
         identity = probe_identity()
         return int(getattr(identity, "total_vram_mb", 0))
 
-    runtime_root = config._workspace_root or config.project_root.parent.parent
     vram_budget = VramBudgetManager(
         runtime_root / "user-settings.json",
         total_vram_probe=total_vram_probe,
@@ -397,33 +497,61 @@ def assemble_api_services(
         sh_degree=config.renderer_sh_degree,
         available_vram_limit_mb=config.available_vram_limit_mb,
         vram_limit_provider=vram_budget.current_limit_mb,
-        log_path=config.project_root / "logs" / "preview-session-worker.log",
+        log_path=log_root / "preview-session-worker.log",
         gpu_gate=gpu_gate,
     )
-    paths = WorkflowPaths(config.project_root, update_project=repository.update)
-    workflow_services = WorkflowServices(
-        media_ingest=MediaIngestService(paths),
-        segmenter=SegmentWorkflowService(paths, segmentation),
-        camera_solver=CameraSolveWorkflowService(paths),
-        trajectory_mapper=TrajectoryMapWorkflowService(paths),
-        renderer=RendererWorkflowService(
-            paths,
-            renderer,
-            sh_degree=config.renderer_sh_degree,
-            available_vram_limit_mb=config.available_vram_limit_mb,
-            vram_limit_provider=vram_budget.current_limit_mb,
-        ),
-        compositor=CompositeWorkflowService(paths),
-        exporter=ExportWorkflowService(paths),
-    )
-    runner = build_mvp_workflow(
-        workflow_services,
-        project,
-        save=repository.save,
-        persist_stage=repository.update_stage,
-        compare_and_set_stage=repository.compare_and_set_stage,
-        claim_stage=repository.claim_stage,
-    )
+    def resolve_asset(asset_id: str, kind: str) -> Path:
+        expected = (
+            LibraryAssetKind.VIDEO if kind == "video" else LibraryAssetKind.PLY
+        )
+        return asset_library.resolve(asset_id, expected)
+
+    def build_project_session(project_id: str) -> ActiveProjectSession:
+        repository = catalog.repository(project_id)
+        project_lock = ProjectInstanceLock.acquire(repository.root)
+        try:
+            project = repository.reconcile_interrupted_runs()
+            paths = WorkflowPaths(
+                repository.root,
+                update_project=repository.update,
+                resolve_asset=resolve_asset,
+            )
+            workflow_services = WorkflowServices(
+                media_ingest=MediaIngestService(paths),
+                segmenter=SegmentWorkflowService(paths, segmentation),
+                camera_solver=CameraSolveWorkflowService(paths),
+                trajectory_mapper=TrajectoryMapWorkflowService(paths),
+                renderer=RendererWorkflowService(
+                    paths,
+                    renderer,
+                    sh_degree=config.renderer_sh_degree,
+                    available_vram_limit_mb=config.available_vram_limit_mb,
+                    vram_limit_provider=vram_budget.current_limit_mb,
+                ),
+                compositor=CompositeWorkflowService(paths),
+                exporter=ExportWorkflowService(paths),
+            )
+            runner = build_mvp_workflow(
+                workflow_services,
+                project,
+                save=repository.save,
+                persist_stage=repository.update_stage,
+                compare_and_set_stage=repository.compare_and_set_stage,
+                claim_stage=repository.claim_stage,
+            )
+            return ActiveProjectSession(
+                repository=repository,
+                project_lock=project_lock,
+                pipeline_runner=runner,
+                preview_artifacts=PreviewArtifactStore(repository.root),
+            )
+        except BaseException:
+            project_lock.close()
+            raise
+
+    project_manager = ActiveProjectManager(catalog, build_project_session)
+    repository = ActiveProjectRepository(project_manager)
+    runner = ActivePipelineRunner(project_manager)
 
     def external_cuda_probe() -> tuple[bool, int]:
         identity = probe_identity()
@@ -462,8 +590,8 @@ def assemble_api_services(
 
     def runtime_which(command: str) -> str | None:
         local = (
-            config.project_root
-            / ".cache"
+            data_root
+            / "cache"
             / "ffmpeg"
             / "bin"
             / executable_name(command)
@@ -516,12 +644,17 @@ def assemble_api_services(
             renderer,
             preview_session,
             gpu_gate=gpu_gate,
-            project_lock=project_lock,
+            project_manager=project_manager,
         ),
         preview_service=preview_service,
-        asset_inspector=AssetInspector(),
+        asset_inspector=asset_inspector,
         environment_repair=repair,
         vram_budget=vram_budget,
+        project_catalog=catalog,
+        asset_library=asset_library,
+        project_manager=project_manager,
+        preview_artifacts=ActivePreviewArtifactStore(project_manager),
+        upload_root=data_root / "upload-staging",
     )
     return settings, services
 

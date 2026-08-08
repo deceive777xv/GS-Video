@@ -86,7 +86,7 @@ def _runtime_payload(
         allow_missing=allow_missing_resources,
     )
     return {
-        "project_root": str(runtime_root / "projects" / "default"),
+        "project_root": str(runtime_root / "data" / "projects" / "default"),
         "model_root": str(edgetam_root),
         "segmentation_backend": "edgetam",
         "segmentation_worker_prefix": [str(segmentation_python)],
@@ -116,7 +116,7 @@ def prepare_desktop_runtime(
         raise DesktopRuntimeError(f"repository root is unavailable: {root}")
     payload = _runtime_payload(root, allow_missing_resources=allow_missing_resources)
     runtime_root = root / ".runtime"
-    project_root = runtime_root / "projects" / "default"
+    project_root = runtime_root / "data" / "projects" / "default"
     project_root.mkdir(parents=True, exist_ok=True)
     runtime_path = runtime_root / "desktop-runtime.json"
     serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"

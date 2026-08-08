@@ -781,9 +781,11 @@ class UploadManager:
             assert directory_identity is not None
             completed = UploadComplete(
                 path=f"source/{destination.name}",
+                filename=request.filename,
                 kind=request.kind,
                 size=request.total_size,
                 sha256=request.sha256,
+                assign_to_current=request.assign_to_current,
             )
             self._records[upload_id] = _UploadRecord(
                 id=upload_id,
@@ -805,6 +807,21 @@ class UploadManager:
         with self._lock:
             try:
                 return self._records[upload_id]
+            except KeyError as error:
+                raise ApiError(
+                    404,
+                    code="upload_not_found",
+                    category="upload",
+                    message="The requested upload was not found.",
+                ) from error
+
+    def assigns_to_current(self, upload_id: str) -> bool:
+        with self._lock:
+            completed = self._completed.get(upload_id)
+            if completed is not None:
+                return completed.assign_to_current
+            try:
+                return self._records[upload_id].completed.assign_to_current
             except KeyError as error:
                 raise ApiError(
                     404,
@@ -971,6 +988,7 @@ class UploadManager:
         self,
         upload_id: str,
         persist: Callable[[UploadComplete], None] | None = None,
+        persist_stream: Callable[[UploadComplete, BinaryIO], None] | None = None,
     ) -> UploadComplete:
         with self._lock:
             completed = self._completed.get(upload_id)
@@ -991,10 +1009,15 @@ class UploadManager:
                 if record.state is _UploadState.ACTIVE
                 else self._prepared(record)
             )
-            if persist is None:
+            if persist is None and persist_stream is None:
                 return completed
             if not record.persisted:
-                persist(completed)
+                if persist_stream is not None:
+                    record.destination.verify_link()
+                    persist_stream(completed, record.destination.stream)
+                else:
+                    assert persist is not None
+                    persist(completed)
                 record.persisted = True
             if not record.destination.closed:
                 record.destination.keep()

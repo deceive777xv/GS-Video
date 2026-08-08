@@ -4,6 +4,7 @@ export interface PickFileOptions {
   kind: AssetKind
   extensions: string[]
   description?: string
+  assignToCurrent?: boolean
 }
 
 export type PickedFile =

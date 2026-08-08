@@ -44,7 +44,7 @@ def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
         shutdown_timeout=settings.shutdown_timeout,
     )
     upload_manager = UploadManager(
-        services.project_repository.root,
+        services.upload_root or services.project_repository.root,
         settings.max_upload_size,
         settings.max_active_uploads,
     )
@@ -86,7 +86,7 @@ def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
     app.state.runtime_change_lock = asyncio.Lock()
     app.state.upload_manager = upload_manager
     app.state.preview_service = services.preview_service
-    app.state.preview_artifacts = PreviewArtifactStore(
+    app.state.preview_artifacts = services.preview_artifacts or PreviewArtifactStore(
         services.project_repository.root
     )
     app.state.preview_coordinator = PreviewCoordinator()

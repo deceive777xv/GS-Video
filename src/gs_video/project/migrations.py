@@ -2,7 +2,7 @@ from copy import deepcopy
 from typing import cast
 
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 def migrate_project_dict(raw: dict[str, object]) -> dict[str, object]:
@@ -69,6 +69,12 @@ def migrate_project_dict(raw: dict[str, object]) -> dict[str, object]:
                 workflow_value["foot_point"] = None
             data["schema_version"] = 3
             version = 3
+        elif version == 3:
+            data.setdefault("updated_at", data.get("created_at"))
+            data.setdefault("source_video_asset_id", None)
+            data.setdefault("scene_ply_asset_id", None)
+            data["schema_version"] = 4
+            version = 4
         else:
             raise ValueError(f"不支持的项目版本: {version}")
 

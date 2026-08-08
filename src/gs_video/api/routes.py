@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
-from typing import Any, Protocol, cast
+from typing import Any, BinaryIO, Protocol, cast
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Request, Response, WebSocket, status
@@ -23,6 +23,7 @@ from gs_video.api.schemas import (
     ApiSettings,
     AssetImportRequest,
     AssetKind,
+    AssetListItem,
     AssetResponse,
     BootstrapResponse,
     CameraConfirmationRequest,
@@ -35,6 +36,9 @@ from gs_video.api.schemas import (
     PreviewFrameRequest,
     PreviewFrameResponse,
     ProjectPatch,
+    ProjectAssetSelection,
+    ProjectCreate,
+    ProjectRename,
     TaskCreateRequest,
     TaskSnapshot,
     UploadComplete,
@@ -76,11 +80,40 @@ from gs_video.environment.vram import (
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter, discard_progress
 from gs_video.pipeline.workflow import ChangeKind, invalidate_for_change
+from gs_video.project.assets import (
+    AssetKind as LibraryAssetKind,
+    AssetLibrary,
+    AssetRecord,
+)
+from gs_video.project.catalog import ProjectCatalog, ProjectSummary
+from gs_video.project.manager import (
+    ActiveProjectManager,
+    ActiveProjectRequiredError,
+)
 from gs_video.scene.camera import OrbitCamera
 
 
+_DESKTOP_ORIGINS = {
+    "tauri://localhost",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+}
+
+
+def _require_desktop_path_import(request: Request) -> None:
+    origin = request.headers.get("origin")
+    if origin not in _DESKTOP_ORIGINS:
+        raise ApiError(
+            403,
+            code="desktop_import_required",
+            category="authorization",
+            message="Local path import is available only in the desktop application.",
+        )
+
+
 class ProjectRepositoryLike(Protocol):
-    root: Path
+    @property
+    def root(self) -> Path: ...
 
     def load(self) -> Project: ...
 
@@ -131,6 +164,11 @@ class ApiServices:
     export_inspector: ExportInspectorLike | None = None
     environment_repair: EnvironmentRepairLike | None = None
     vram_budget: VramBudgetManager | None = None
+    project_catalog: ProjectCatalog | None = None
+    asset_library: AssetLibrary | None = None
+    project_manager: ActiveProjectManager | None = None
+    preview_artifacts: Any | None = None
+    upload_root: Path | None = None
 
 
 def _services(request: Request) -> ApiServices:
@@ -286,6 +324,13 @@ def _unproject(
 def _load_project(repository: ProjectRepositoryLike) -> Project:
     try:
         return repository.load()
+    except ActiveProjectRequiredError as error:
+        raise ApiError(
+            409,
+            code="active_project_required",
+            category="project",
+            message="Open or create a project before using the workflow.",
+        ) from error
     except (OSError, ValueError) as error:
         raise ApiError(
             404,
@@ -295,6 +340,39 @@ def _load_project(repository: ProjectRepositoryLike) -> Project:
         ) from error
 
 
+def _scene_input(
+    services: ApiServices, project: Project
+) -> tuple[str | Path, str]:
+    if project.scene_ply_asset_id is not None:
+        if services.asset_library is None:
+            raise ApiError(
+                503,
+                code="asset_library_unavailable",
+                category="asset",
+                message="The shared asset library is unavailable.",
+            )
+        try:
+            return (
+                services.asset_library.resolve(
+                    project.scene_ply_asset_id, LibraryAssetKind.PLY
+                ),
+                project.scene_ply_asset_id,
+            )
+        except (KeyError, ValueError, OSError) as error:
+            raise ApiError(
+                409,
+                code="scene_unavailable",
+                category="project",
+                message="The selected Gaussian scene is unavailable.",
+            ) from error
+    if project.scene_ply is not None:
+        return project.scene_ply, project.scene_ply
+    raise ApiError(
+        409,
+        code="scene_required",
+        category="project",
+        message="Import a Gaussian scene before rendering a preview.",
+    )
 def _confined_destination(root: Path, directory: str, filename: str) -> Path:
     canonical_root = root.resolve()
     destination_dir = (canonical_root / directory).resolve()
@@ -375,6 +453,60 @@ def _import_asset_sync(
             category="filesystem",
             message="The selected asset is unavailable.",
         )
+    if services.asset_library is not None:
+        library_kind = (
+            LibraryAssetKind.VIDEO
+            if asset.kind == AssetKind.SOURCE_VIDEO.value
+            else LibraryAssetKind.PLY
+        )
+
+        def inspect(path: Path, size: int, sha256: str) -> Any:
+            if services.asset_inspector is None:
+                raise ValueError("asset inspection is unavailable")
+            return services.asset_inspector.inspect(
+                asset.kind, path, size=size, sha256=sha256
+            )
+
+        try:
+            record, _ = services.asset_library.import_file(
+                library_kind, source, inspect
+            )
+        except ValueError as error:
+            raise ApiError(
+                422,
+                code="unsupported_asset",
+                category="validation",
+                message="The selected asset is outside the supported MVP limits.",
+            ) from error
+        except OSError as error:
+            raise ApiError(
+                400,
+                code="asset_import_failed",
+                category="filesystem",
+                message="The selected asset could not be imported.",
+                retryable=True,
+            ) from error
+        if asset.assign_to_current:
+            suspension = (
+                _suspend_live_preview_if_supported(services.preview_service)
+                if library_kind is LibraryAssetKind.PLY
+                else None
+            )
+            try:
+                services.project_repository.update(
+                    lambda project: _select_library_asset(project, record)
+                )
+            finally:
+                _resume_live_preview_if_supported(
+                    services.preview_service, suspension
+                )
+        return AssetResponse(
+            kind=asset.kind,
+            path=record.asset_id,
+            size=record.size,
+            sha256=record.sha256,
+            asset_id=record.asset_id,
+        )
     suspension = (
         _suspend_live_preview_if_supported(services.preview_service)
         if asset.kind == AssetKind.SCENE_PLY.value
@@ -432,6 +564,24 @@ def _replace_source_video(project: Project, relative: str, summary: Any) -> None
     project.workflow.export_result = None
     project.workflow.active_task_id = None
     invalidate_for_change(project, ChangeKind.SOURCE_VIDEO)
+
+
+def _select_library_asset(project: Project, record: AssetRecord) -> None:
+    if record.kind is LibraryAssetKind.VIDEO:
+        project.source_video_asset_id = record.asset_id
+        project.source_video = None
+        project.workflow.source_summary = record.video_summary
+        project.workflow.subject_prompt = None
+        project.workflow.active_task_id = None
+        invalidate_for_change(project, ChangeKind.SOURCE_VIDEO)
+    else:
+        project.scene_ply_asset_id = record.asset_id
+        project.scene_ply = None
+        project.workflow.scene_summary = record.scene_summary
+        project.workflow.target_camera = None
+        invalidate_for_change(project, ChangeKind.TARGET_CAMERA)
+    _clear_preview_authority(project)
+    project.workflow.export_result = None
 
 
 def _clear_preview_authority(project: Project) -> None:
@@ -500,10 +650,30 @@ def build_router() -> APIRouter:
             if services.vram_budget is not None
             else _fallback_vram_snapshot(environment)
         )
+        projects = (
+            services.project_manager.list()
+            if services.project_manager is not None
+            else ()
+        )
+        active_project = (
+            services.project_manager.active_project()
+            if services.project_manager is not None
+            else _load_project(services.project_repository)
+        )
+        asset_counts = (
+            {
+                kind: len(services.asset_library.list(kind))
+                for kind in LibraryAssetKind
+            }
+            if services.asset_library is not None
+            else {}
+        )
         return BootstrapResponse(
             api_version=API_VERSION,
             capabilities=capabilities,
-            project=_load_project(services.project_repository),
+            project=active_project,
+            projects=projects,
+            asset_counts=asset_counts,
             environment=environment,
             vram_budget=budget,
         )
@@ -622,35 +792,192 @@ def build_router() -> APIRouter:
 
     @protected.patch("/api/v1/projects/current", response_model=Project)
     async def patch_current_project(request: Request, patch: ProjectPatch) -> Project:
-        repository = _services(request).project_repository
+        services = _services(request)
+        repository = services.project_repository
 
-        def mutate(project: Project) -> None:
-            if patch.name is not None:
-                project.name = patch.name
-            if "subject_prompt" in patch.model_fields_set:
-                prompt = (
-                    None
-                    if patch.subject_prompt is None
-                    else SubjectPromptState.model_validate(
-                        patch.subject_prompt.model_dump()
+        async with _runtime_change_lock(request):
+            if patch.name is not None and services.project_manager is not None:
+                current = _load_project(repository)
+                try:
+                    await asyncio.to_thread(
+                        services.project_manager.rename,
+                        current.project_id,
+                        patch.name,
                     )
-                )
-                if prompt is not None:
-                    validate_subject_prompt(project, repository.root, prompt)
-                project.workflow.subject_prompt = prompt
-                invalidate_for_change(project, ChangeKind.SUBJECT_PROMPT)
-                project.workflow.export_result = None
-            if patch.motion_scale is not None:
-                project.workflow.motion_scale = patch.motion_scale
-                invalidate_for_change(project, ChangeKind.MOTION_SCALE)
-                project.workflow.export_result = None
-            if patch.preview_height is not None:
-                project.workflow.preview_height = patch.preview_height
-                invalidate_for_change(project, ChangeKind.TARGET_CAMERA)
-                _clear_preview_authority(project)
-                project.workflow.export_result = None
+                except ValueError as error:
+                    raise ApiError(
+                        409,
+                        code="project_name_conflict",
+                        category="project",
+                        message=str(error),
+                    ) from error
 
-        return await asyncio.to_thread(repository.update, mutate)
+            def mutate(project: Project) -> None:
+                if patch.name is not None and services.project_manager is None:
+                    project.name = patch.name
+                if "subject_prompt" in patch.model_fields_set:
+                    prompt = (
+                        None
+                        if patch.subject_prompt is None
+                        else SubjectPromptState.model_validate(
+                            patch.subject_prompt.model_dump()
+                        )
+                    )
+                    if prompt is not None:
+                        validate_subject_prompt(project, repository.root, prompt)
+                    project.workflow.subject_prompt = prompt
+                    invalidate_for_change(project, ChangeKind.SUBJECT_PROMPT)
+                    project.workflow.export_result = None
+                if patch.motion_scale is not None:
+                    project.workflow.motion_scale = patch.motion_scale
+                    invalidate_for_change(project, ChangeKind.MOTION_SCALE)
+                    project.workflow.export_result = None
+                if patch.preview_height is not None:
+                    project.workflow.preview_height = patch.preview_height
+                    invalidate_for_change(project, ChangeKind.TARGET_CAMERA)
+                    _clear_preview_authority(project)
+                    project.workflow.export_result = None
+
+            if patch.model_fields_set == {"name"} and services.project_manager is not None:
+                return _load_project(repository)
+            return await asyncio.to_thread(repository.update, mutate)
+
+    def require_project_manager(request: Request) -> ActiveProjectManager:
+        manager = _services(request).project_manager
+        if manager is None:
+            raise ApiError(
+                503,
+                code="project_catalog_unavailable",
+                category="project",
+                message="Project management is unavailable in this local service.",
+            )
+        return manager
+
+    def reject_project_change_while_busy(request: Request) -> None:
+        if _task_service(request).is_busy():
+            raise ApiError(
+                409,
+                code="project_task_active",
+                category="conflict",
+                message="Wait for the active task to finish or cancel it first.",
+                retryable=True,
+            )
+
+    @protected.get("/api/v1/projects", response_model=tuple[ProjectSummary, ...])
+    async def list_projects(request: Request) -> tuple[ProjectSummary, ...]:
+        return await asyncio.to_thread(require_project_manager(request).list)
+
+    @protected.post(
+        "/api/v1/projects",
+        response_model=Project,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_project(request: Request, body: ProjectCreate) -> Project:
+        async with _runtime_change_lock(request):
+            reject_project_change_while_busy(request)
+            try:
+                return await asyncio.to_thread(
+                    require_project_manager(request).create,
+                    body.name,
+                    lambda: _close_live_preview_if_supported(
+                        _services(request).preview_service
+                    ),
+                )
+            except ValueError as error:
+                raise ApiError(
+                    409,
+                    code="project_name_conflict",
+                    category="project",
+                    message=str(error),
+                ) from error
+
+    @protected.post(
+        "/api/v1/projects/{project_id}/activate",
+        response_model=Project,
+    )
+    async def activate_project(request: Request, project_id: str) -> Project:
+        async with _runtime_change_lock(request):
+            reject_project_change_while_busy(request)
+            services = _services(request)
+            try:
+                return await asyncio.to_thread(
+                    require_project_manager(request).activate,
+                    project_id,
+                    lambda: _close_live_preview_if_supported(
+                        services.preview_service
+                    ),
+                )
+            except (KeyError, ValueError) as error:
+                raise ApiError(
+                    404,
+                    code="project_not_found",
+                    category="project",
+                    message="The requested project is unavailable.",
+                ) from error
+            except RuntimeError as error:
+                raise ApiError(
+                    409,
+                    code="project_locked",
+                    category="project",
+                    message="The requested project is open in another application instance.",
+                    retryable=True,
+                ) from error
+
+    @protected.patch(
+        "/api/v1/projects/{project_id}",
+        response_model=ProjectSummary,
+    )
+    async def rename_project(
+        request: Request, project_id: str, body: ProjectRename
+    ) -> ProjectSummary:
+        try:
+            return await asyncio.to_thread(
+                require_project_manager(request).rename, project_id, body.name
+            )
+        except KeyError as error:
+            raise ApiError(
+                404,
+                code="project_not_found",
+                category="project",
+                message="The requested project is unavailable.",
+            ) from error
+        except ValueError as error:
+            raise ApiError(
+                409,
+                code="project_name_conflict",
+                category="project",
+                message=str(error),
+            ) from error
+
+    @protected.delete(
+        "/api/v1/projects/{project_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def delete_project(request: Request, project_id: str) -> Response:
+        async with _runtime_change_lock(request):
+            reject_project_change_while_busy(request)
+            services = _services(request)
+            active = require_project_manager(request).active_project()
+            try:
+                await asyncio.to_thread(
+                    require_project_manager(request).delete,
+                    project_id,
+                    (
+                        lambda: _close_live_preview_if_supported(
+                            services.preview_service
+                        )
+                        if active is not None and active.project_id == project_id
+                        else None
+                    ),
+                )
+            except KeyError as error:
+                raise ApiError(
+                    404,
+                    code="project_not_found",
+                    category="project",
+                    message="The requested project is unavailable.",
+                ) from error
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @protected.post(
         "/api/v1/projects/current/preview/live",
@@ -663,17 +990,18 @@ def build_router() -> APIRouter:
         repository = services.project_repository
         project = _load_project(repository)
         scene_summary = project.workflow.scene_summary
-        if project.scene_ply is None or scene_summary is None:
+        if scene_summary is None:
             raise ApiError(
                 409,
                 code="scene_required",
                 category="project",
                 message="Import a Gaussian scene before rendering a preview.",
             )
+        scene_input, _scene_reference = _scene_input(services, project)
         payload = await asyncio.to_thread(
             _preview_service(request).render_live,
             repository.root,
-            project.scene_ply,
+            scene_input,
             scene_summary.model_copy(deep=True),
             preview.request_id,
             _camera(preview.camera),
@@ -710,7 +1038,7 @@ def build_router() -> APIRouter:
         repository = services.project_repository
         project = _load_project(repository)
         scene_summary = project.workflow.scene_summary
-        if project.scene_ply is None or scene_summary is None:
+        if scene_summary is None:
             raise ApiError(
                 409,
                 code="scene_required",
@@ -726,7 +1054,7 @@ def build_router() -> APIRouter:
                 message="A newer preview generation is already authoritative.",
             )
         camera = _camera(preview.camera)
-        scene_path = project.scene_ply
+        scene_path, scene_reference = _scene_input(services, project)
         scene_authority = scene_summary.model_copy(deep=True)
         preview_epoch = project.workflow.preview_epoch
         request_fingerprint: PreviewRequestFingerprint = (
@@ -745,7 +1073,7 @@ def build_router() -> APIRouter:
         buffer: PickBuffer = await _preview_coordinator(request).render(
             (
                 project.project_id,
-                scene_path,
+                scene_reference,
                 scene_authority.sha256,
                 scene_authority.size,
                 preview_epoch,
@@ -766,7 +1094,9 @@ def build_router() -> APIRouter:
         def persist(latest: Project) -> None:
             nonlocal response
             if (
-                latest.scene_ply != scene_path
+                (
+                    latest.scene_ply_asset_id or latest.scene_ply
+                ) != scene_reference
                 or latest.workflow.scene_summary != scene_authority
                 or latest.workflow.preview_epoch != preview_epoch
             ):
@@ -901,7 +1231,7 @@ def build_router() -> APIRouter:
         project = _load_project(repository)
         preview = project.workflow.preview
         camera_state = project.workflow.target_camera
-        scene_path = project.scene_ply
+        scene_path = project.scene_ply_asset_id or project.scene_ply
         scene_authority = project.workflow.scene_summary
         preview_epoch = project.workflow.preview_epoch
         if (
@@ -968,7 +1298,7 @@ def build_router() -> APIRouter:
             latest_preview = latest.workflow.preview
             if (
                 latest_preview is None
-                or latest.scene_ply != scene_path
+                or (latest.scene_ply_asset_id or latest.scene_ply) != scene_path
                 or latest.workflow.scene_summary != scene_authority
                 or latest.workflow.preview_epoch != preview_epoch
                 or latest_preview.artifact_id != pick.preview_artifact_id
@@ -1006,11 +1336,151 @@ def build_router() -> APIRouter:
         status_code=status.HTTP_201_CREATED,
     )
     async def import_asset(request: Request, asset: AssetImportRequest) -> AssetResponse:
+        _require_desktop_path_import(request)
         services = _services(request)
         settings = _settings(request)
+        if asset.assign_to_current:
+            async with _runtime_change_lock(request):
+                reject_project_change_while_busy(request)
+                return await asyncio.to_thread(
+                    _import_asset_sync, services, settings, asset
+                )
         return await asyncio.to_thread(
             _import_asset_sync, services, settings, asset
         )
+
+    @protected.get("/api/v1/assets", response_model=tuple[AssetListItem, ...])
+    async def list_assets(
+        request: Request, kind: LibraryAssetKind
+    ) -> tuple[AssetListItem, ...]:
+        services = _services(request)
+        if services.asset_library is None or services.project_catalog is None:
+            raise ApiError(
+                503,
+                code="asset_library_unavailable",
+                category="asset",
+                message="The shared asset library is unavailable.",
+            )
+        records = await asyncio.to_thread(services.asset_library.list, kind)
+        return tuple(
+            AssetListItem(
+                asset=record,
+                references=services.project_catalog.references(record.asset_id),
+            )
+            for record in records
+        )
+
+    @protected.delete(
+        "/api/v1/assets/{asset_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def delete_asset(request: Request, asset_id: str) -> Response:
+        services = _services(request)
+        if services.asset_library is None or services.project_catalog is None:
+            raise ApiError(
+                503,
+                code="asset_library_unavailable",
+                category="asset",
+                message="The shared asset library is unavailable.",
+            )
+        async with _runtime_change_lock(request):
+            references = await asyncio.to_thread(
+                services.project_catalog.references, asset_id
+            )
+            if references:
+                names = ", ".join(reference.name for reference in references[:8])
+                raise ApiError(
+                    409,
+                    code="asset_in_use",
+                    category="conflict",
+                    message=f"Remove this asset from its projects first: {names}",
+                )
+            try:
+                await asyncio.to_thread(services.asset_library.delete, asset_id)
+            except KeyError as error:
+                raise ApiError(
+                    404,
+                    code="asset_not_found",
+                    category="asset",
+                    message="The requested asset is unavailable.",
+                ) from error
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @protected.patch(
+        "/api/v1/projects/current/assets",
+        response_model=Project,
+    )
+    async def select_project_assets(
+        request: Request, selection: ProjectAssetSelection
+    ) -> Project:
+        services = _services(request)
+        if services.asset_library is None:
+            raise ApiError(
+                503,
+                code="asset_library_unavailable",
+                category="asset",
+                message="The shared asset library is unavailable.",
+            )
+        async with _runtime_change_lock(request):
+            reject_project_change_while_busy(request)
+            records: dict[str, AssetRecord | None] = {}
+            for field, kind in (
+                ("source_video_asset_id", LibraryAssetKind.VIDEO),
+                ("scene_ply_asset_id", LibraryAssetKind.PLY),
+            ):
+                if field not in selection.model_fields_set:
+                    continue
+                asset_id = getattr(selection, field)
+                if asset_id is None:
+                    records[field] = None
+                    continue
+                try:
+                    record = services.asset_library.get(asset_id)
+                except KeyError as error:
+                    raise ApiError(
+                        404,
+                        code="asset_not_found",
+                        category="asset",
+                        message="The selected asset is unavailable.",
+                    ) from error
+                if record.kind is not kind:
+                    raise ApiError(
+                        422,
+                        code="asset_kind_mismatch",
+                        category="validation",
+                        message="The selected asset has the wrong kind.",
+                    )
+                records[field] = record
+            if not records:
+                raise ApiError(
+                    422,
+                    code="asset_selection_required",
+                    category="validation",
+                    message="Select at least one project asset field.",
+                )
+
+            def persist(project: Project) -> None:
+                for field, record in records.items():
+                    if record is not None:
+                        _select_library_asset(project, record)
+                    elif field == "source_video_asset_id":
+                        project.source_video_asset_id = None
+                        project.workflow.source_summary = None
+                        project.workflow.subject_prompt = None
+                        invalidate_for_change(project, ChangeKind.SOURCE_VIDEO)
+                        _clear_preview_authority(project)
+                        project.workflow.export_result = None
+                    else:
+                        project.scene_ply_asset_id = None
+                        project.workflow.scene_summary = None
+                        project.workflow.target_camera = None
+                        invalidate_for_change(project, ChangeKind.TARGET_CAMERA)
+                        _clear_preview_authority(project)
+                        project.workflow.export_result = None
+
+            return await asyncio.to_thread(
+                services.project_repository.update, persist
+            )
 
     @protected.post(
         "/api/v1/tasks",
@@ -1153,8 +1623,48 @@ def build_router() -> APIRouter:
     )
     async def complete_upload(request: Request, upload_id: str) -> UploadComplete:
         services = _services(request)
+        library_record: AssetRecord | None = None
 
-        def persist(completed: UploadComplete) -> None:
+        def persist(completed: UploadComplete, source_stream: BinaryIO) -> None:
+            nonlocal library_record
+            if services.asset_library is not None:
+                assert services.upload_root is not None
+                library_kind = (
+                    LibraryAssetKind.VIDEO
+                    if completed.kind == AssetKind.SOURCE_VIDEO.value
+                    else LibraryAssetKind.PLY
+                )
+
+                def inspect(path: Path, size: int, sha256: str) -> Any:
+                    if services.asset_inspector is None:
+                        raise ValueError("asset inspection is unavailable")
+                    return services.asset_inspector.inspect(
+                        completed.kind, path, size=size, sha256=sha256
+                    )
+
+                library_record, _ = services.asset_library.import_stream(
+                    library_kind,
+                    completed.filename,
+                    source_stream,
+                    inspect,
+                )
+                if completed.assign_to_current:
+                    suspension = (
+                        _suspend_live_preview_if_supported(services.preview_service)
+                        if library_kind is LibraryAssetKind.PLY
+                        else None
+                    )
+                    try:
+                        services.project_repository.update(
+                            lambda project: _select_library_asset(
+                                project, library_record
+                            )
+                        )
+                    finally:
+                        _resume_live_preview_if_supported(
+                            services.preview_service, suspension
+                        )
+                return
             summary = None
             if services.asset_inspector is not None:
                 path = services.project_repository.root / completed.path
@@ -1198,9 +1708,26 @@ def build_router() -> APIRouter:
                     services.preview_service, suspension
                 )
 
-        return await asyncio.to_thread(
-            _upload_manager(request).complete, upload_id, persist
-        )
+        upload_manager = _upload_manager(request)
+        if upload_manager.assigns_to_current(upload_id):
+            async with _runtime_change_lock(request):
+                reject_project_change_while_busy(request)
+                completed = await asyncio.to_thread(
+                    upload_manager.complete,
+                    upload_id,
+                    persist_stream=persist,
+                )
+        else:
+            completed = await asyncio.to_thread(
+                upload_manager.complete,
+                upload_id,
+                persist_stream=persist,
+            )
+        if library_record is not None:
+            assert services.upload_root is not None
+            (services.upload_root / completed.path).unlink(missing_ok=True)
+            return completed.model_copy(update={"path": library_record.asset_id})
+        return completed
 
     @protected.delete(
         "/api/v1/uploads/{upload_id}",

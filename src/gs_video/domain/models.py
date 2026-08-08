@@ -179,10 +179,15 @@ class WorkflowState(BaseModel):
 class Project(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 3
+    schema_version: int = 4
     project_id: str = Field(default_factory=lambda: str(uuid4()))
     name: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    source_video_asset_id: str | None = None
+    scene_ply_asset_id: str | None = None
+    # Transitional read compatibility for schema <= 3. Catalog migration clears
+    # these after the inputs have been committed to the shared asset library.
     source_video: str | None = None
     scene_ply: str | None = None
     stages: dict[StageName, StageState] = Field(default_factory=dict)

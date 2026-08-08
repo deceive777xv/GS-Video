@@ -381,7 +381,7 @@ class ProductionHarness:
             bind_host="127.0.0.1",
             port=0,
             session_token=SecretStr(TOKEN),
-            allowed_origins=(ORIGIN,),
+            allowed_origins=("http://tauri.localhost", ORIGIN),
             task_workers=1,
         )
         headers = {"Authorization": f"Bearer {TOKEN}"}
@@ -394,7 +394,7 @@ class ProductionHarness:
                 imported = client.post(
                     "/api/v1/assets/import",
                     json={"kind": kind, "path": str(path)},
-                    headers=headers,
+                    headers={**headers, "Origin": "http://tauri.localhost"},
                 )
                 assert imported.status_code == 201
 

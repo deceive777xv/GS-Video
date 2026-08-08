@@ -14,11 +14,13 @@ import {
   type TaskStore,
   useTaskStore,
 } from '../api/task-events'
-import type { BootstrapDto, ProjectDto, StageName, TaskDto, VramBudgetDto } from '../api/types'
+import type { BootstrapDto, ProjectDto, ProjectSummaryDto, StageName, TaskDto, VramBudgetDto } from '../api/types'
 import type { PlatformBridge } from '../platform/platform-bridge'
 import { CameraPage } from '../features/camera/camera-page'
 import { ExportPage } from '../features/export/export-page'
 import { ImportPage } from '../features/import/import-page'
+import { HomePage } from '../features/home/home-page'
+import { AssetLibraryPage } from '../features/assets/asset-library-page'
 import { PreviewPage } from '../features/preview/preview-page'
 import { SubjectPage } from '../features/subject/subject-page'
 import { VramBudgetControl } from '../features/settings/vram-budget-control'
@@ -47,6 +49,7 @@ export interface AppProps {
   eventSource?: TaskEventSource
   initialBootstrap?: BootstrapDto
   createOwnedTaskStore?: (backend: BackendClient) => TaskStore
+  startAtHome?: boolean
 }
 
 interface UiError {
@@ -93,20 +96,72 @@ function AppShell({ children }: { children: ReactNode }) {
   return <div className="app-shell">{children}</div>
 }
 
+function HubHeader({ project }: { project: ProjectDto | null }) {
+  return (
+    <header className="topbar hub-topbar">
+      <a className="brand" href="#/" aria-label="返回项目首页">
+        <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
+        <span><strong>GS VIDEO</strong><small>GAUSSIAN COMPOSITOR</small></span>
+      </a>
+      <nav className="hub-nav" aria-label="主导航"><a href="#/">项目</a><a href="#/assets/video">素材库</a></nav>
+      <div className="project-heading"><span>当前项目</span><strong>{project?.name ?? '未选择'}</strong></div>
+    </header>
+  )
+}
+
+type AppView = 'home' | 'workflow' | 'assets-video' | 'assets-ply'
+
+interface WorkflowRoute {
+  projectId: string
+  step: WorkflowStep
+}
+
+function workflowRouteFromHash(hash: string): WorkflowRoute | null {
+  const match = /^#\/projects\/([^/]+)\/workflow\/(import|subject|camera|preview|export)$/.exec(hash)
+  if (match === null) return null
+  return {
+    projectId: decodeURIComponent(match[1] ?? ''),
+    step: match[2] as WorkflowStep,
+  }
+}
+
+function routeFromHash(hash: string, fallback: AppView): AppView {
+  if (hash === '#/' || hash === '#') return 'home'
+  if (hash.startsWith('#/assets/ply')) return 'assets-ply'
+  if (hash.startsWith('#/assets/video') || hash.startsWith('#/assets')) return 'assets-video'
+  if (hash.startsWith('#/workflow') || workflowRouteFromHash(hash) !== null) return 'workflow'
+  return fallback
+}
+
 export function App({
   backend,
   platform,
   eventSource,
   initialBootstrap,
   createOwnedTaskStore = createTaskStore,
+  startAtHome = false,
 }: AppProps) {
-  const [taskStore] = useState(() => createOwnedTaskStore(backend))
+  const [taskStore] = useState(() => {
+    const store = createOwnedTaskStore(backend)
+    if (initialBootstrap !== undefined) {
+      store.reset?.(initialBootstrap.project?.workflow.active_task_id)
+    }
+    return store
+  })
   const taskState = useTaskStore(taskStore)
   const [bootstrap, setBootstrap] = useState<BootstrapDto | null>(initialBootstrap ?? null)
   const [project, setProject] = useState<ProjectDto | null>(initialBootstrap?.project ?? null)
-  const [step, setStep] = useState<WorkflowStep>(() => initialBootstrap === undefined
+  const [step, setStep] = useState<WorkflowStep>(() => initialBootstrap?.project === null
+    || initialBootstrap === undefined
     ? 'import'
     : workflowStepForProject(initialBootstrap.project))
+  const [view, setView] = useState<AppView>(() => routeFromHash(
+    startAtHome ? window.location.hash : '#/workflow',
+    startAtHome ? 'home' : 'workflow',
+  ))
+  const [workflowRoute, setWorkflowRoute] = useState<WorkflowRoute | null>(() => (
+    startAtHome ? workflowRouteFromHash(window.location.hash) : null
+  ))
   const [error, setError] = useState<UiError | null>(null)
   const [loading, setLoading] = useState(initialBootstrap === undefined)
   const [startingStage, setStartingStage] = useState(false)
@@ -116,7 +171,45 @@ export function App({
   const recoveredTaskId = useRef<string | null>(null)
   const autoSolveKey = useRef<string | null>(null)
   const projectAuthority = useRef(0)
+  const activeProjectId = useRef<string | null>(initialBootstrap?.project?.project_id ?? null)
   const stageAdmission = useRef(false)
+
+  useEffect(() => {
+    const syncRoute = (): void => {
+      const nextWorkflowRoute = workflowRouteFromHash(window.location.hash)
+      setWorkflowRoute(nextWorkflowRoute)
+      if (nextWorkflowRoute !== null) setStep(nextWorkflowRoute.step)
+      setView(routeFromHash(window.location.hash, 'home'))
+    }
+    window.addEventListener('hashchange', syncRoute)
+    return () => window.removeEventListener('hashchange', syncRoute)
+  }, [])
+
+  const navigate = useCallback((next: AppView): void => {
+    const hash = next === 'home' ? '#/'
+      : next === 'workflow' ? '#/workflow'
+        : next === 'assets-ply' ? '#/assets/ply' : '#/assets/video'
+    if (window.location.hash === hash) setView(next)
+    else window.location.hash = hash
+  }, [])
+
+  const navigateWorkflow = useCallback((projectId: string, nextStep: WorkflowStep): void => {
+    const hash = `#/projects/${encodeURIComponent(projectId)}/workflow/${nextStep}`
+    if (window.location.hash === hash) {
+      setWorkflowRoute({ projectId, step: nextStep })
+      setStep(nextStep)
+      setView('workflow')
+    } else {
+      window.location.hash = hash
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!loading && bootstrap !== null && project === null && view === 'workflow'
+      && workflowRoute === null) {
+      navigate('home')
+    }
+  }, [bootstrap, loading, navigate, project, view, workflowRoute])
 
   const reportError = useCallback((value: unknown): void => setError(uiError(value)), [])
   const reportUnknownError = useCallback((value: unknown): void => setError(uiError(value)), [])
@@ -135,9 +228,19 @@ export function App({
         || (snapshot.task?.id === taskId && snapshot.task.revision >= latest.revision)
   }, [taskStore])
   const acceptProject = useCallback((next: ProjectDto): void => {
+    if (activeProjectId.current !== next.project_id) {
+      taskStore.reset?.(next.workflow.active_task_id)
+    }
+    activeProjectId.current = next.project_id
     projectAuthority.current += 1
     setProject(next)
-  }, [])
+  }, [taskStore])
+  const clearProject = useCallback((): void => {
+    if (activeProjectId.current !== null) taskStore.reset?.(null)
+    activeProjectId.current = null
+    projectAuthority.current += 1
+    setProject(null)
+  }, [taskStore])
 
   useEffect(() => {
     const cycle = ++disposalCycle.current
@@ -165,15 +268,18 @@ export function App({
     void backend.bootstrap(controller.signal).then((next) => {
       if (controller.signal.aborted) return
       setBootstrap(next)
-      acceptProject(next.project)
-      setStep(workflowStepForProject(next.project))
+      if (next.project === null) clearProject()
+      else {
+        acceptProject(next.project)
+        setStep(workflowStepForProject(next.project))
+      }
     }).catch((value: unknown) => {
       if (!controller.signal.aborted) reportUnknownError(value)
     }).finally(() => {
       if (!controller.signal.aborted) setLoading(false)
     })
     return () => controller.abort()
-  }, [acceptProject, backend, initialBootstrap, reportUnknownError])
+  }, [acceptProject, backend, clearProject, initialBootstrap, reportUnknownError])
 
   useEffect(() => {
     const taskId = project?.workflow.active_task_id
@@ -258,9 +364,67 @@ export function App({
   const refreshBootstrap = useCallback(async (): Promise<void> => {
     const next = await backend.bootstrap()
     setBootstrap(next)
-    acceptProject(next.project)
-    setStep(workflowStepForProject(next.project))
-  }, [acceptProject, backend])
+    if (next.project === null) clearProject()
+    else {
+      acceptProject(next.project)
+      setStep(workflowStepForProject(next.project))
+    }
+  }, [acceptProject, backend, clearProject])
+
+  useEffect(() => {
+    if (loading || bootstrap === null || workflowRoute === null) return
+    let stopped = false
+    const openRoute = async (): Promise<void> => {
+      try {
+        if (project?.project_id === workflowRoute.projectId) {
+          const reachableStep = canVisitStep(project, workflowRoute.step)
+            ? workflowRoute.step
+            : workflowStepForProject(project)
+          if (reachableStep === workflowRoute.step) setStep(reachableStep)
+          else navigateWorkflow(project.project_id, reachableStep)
+          return
+        }
+        const next = await backend.activateProject(workflowRoute.projectId)
+        if (stopped) return
+        acceptProject(next)
+        const reachableStep = canVisitStep(next, workflowRoute.step)
+          ? workflowRoute.step
+          : workflowStepForProject(next)
+        const nextBootstrap = await backend.bootstrap()
+        if (stopped) return
+        setBootstrap(nextBootstrap)
+        if (reachableStep === workflowRoute.step) setStep(reachableStep)
+        else navigateWorkflow(next.project_id, reachableStep)
+      } catch (value) {
+        if (stopped) return
+        reportUnknownError(value)
+        navigate('home')
+      }
+    }
+    void openRoute()
+    return () => { stopped = true }
+  }, [
+    acceptProject,
+    backend,
+    bootstrap === null,
+    loading,
+    navigate,
+    navigateWorkflow,
+    project?.project_id,
+    reportUnknownError,
+    workflowRoute,
+  ])
+
+  useEffect(() => {
+    if (loading || bootstrap === null || view !== 'home') return
+    const controller = new AbortController()
+    void backend.bootstrap(controller.signal).then((next) => {
+      if (!controller.signal.aborted) setBootstrap(next)
+    }).catch((value: unknown) => {
+      if (!controller.signal.aborted) reportUnknownError(value)
+    })
+    return () => controller.abort()
+  }, [backend, bootstrap === null, loading, reportUnknownError, view])
 
   const acceptVramBudget = useCallback((next: VramBudgetDto): void => {
     setBootstrap((current) => current === null ? null : {
@@ -381,7 +545,7 @@ export function App({
     } catch (value) { reportUnknownError(value) }
   }
 
-  if (loading || bootstrap === null || project === null) {
+  if (loading || bootstrap === null) {
     return (
       <AppShell>
         <main className="loading-screen" aria-live="polite">
@@ -390,6 +554,110 @@ export function App({
         </main>
       </AppShell>
     )
+  }
+
+  const shellTask = taskState.task
+  const shellBusy = startingStage
+    || (shellTask !== null && ['queued', 'running'].includes(shellTask.status))
+    || (project?.workflow.active_task_id !== null
+      && project?.workflow.active_task_id !== undefined
+      && missingTaskOwnerId !== project.workflow.active_task_id
+      && (shellTask === null || shellTask.id !== project.workflow.active_task_id))
+
+  const refreshCatalog = async (): Promise<BootstrapDto> => {
+    const next = await backend.bootstrap()
+    setBootstrap(next)
+    if (next.project === null) clearProject()
+    else acceptProject(next.project)
+    return next
+  }
+
+  const createProject = async (name: string): Promise<void> => {
+    try {
+      const next = await backend.createProject(name.trim())
+      acceptProject(next)
+      setStep(workflowStepForProject(next))
+      await refreshCatalog()
+      navigateWorkflow(next.project_id, workflowStepForProject(next))
+    } catch (value) {
+      reportUnknownError(value)
+      throw value
+    }
+  }
+
+  const openProject = async (summary: ProjectSummaryDto): Promise<void> => {
+    try {
+      const next = project?.project_id === summary.project_id
+        ? project
+        : await backend.activateProject(summary.project_id)
+      acceptProject(next)
+      setStep(workflowStepForProject(next))
+      await refreshCatalog()
+      navigateWorkflow(next.project_id, workflowStepForProject(next))
+    } catch (value) {
+      reportUnknownError(value)
+      throw value
+    }
+  }
+
+  const renameProject = async (summary: ProjectSummaryDto, name: string): Promise<void> => {
+    try {
+      await backend.renameProject(summary.project_id, name.trim())
+      await refreshCatalog()
+    } catch (value) {
+      reportUnknownError(value)
+      throw value
+    }
+  }
+
+  const deleteProject = async (summary: ProjectSummaryDto): Promise<void> => {
+    try {
+      await backend.deleteProject(summary.project_id)
+      await refreshCatalog()
+    } catch (value) {
+      reportUnknownError(value)
+      throw value
+    }
+  }
+
+  if (view === 'home' || view === 'assets-video' || view === 'assets-ply') {
+    return (
+      <AppShell>
+        <HubHeader project={project} />
+        {error !== null ? (
+          <div aria-atomic="true" className="error-banner hub-error" ref={errorRef} role="alert" tabIndex={-1}>
+            <div><strong>操作未完成</strong><p>{error.message}</p>{error.code !== null ? <code>{error.code}</code> : null}</div>
+            <button aria-label="关闭错误提示" onClick={() => setError(null)} type="button">×</button>
+          </div>
+        ) : null}
+        {view === 'home' ? (
+          <HomePage
+            activeProjectId={project?.project_id ?? null}
+            busy={shellBusy}
+            onCreate={createProject}
+            onDelete={deleteProject}
+            onOpen={openProject}
+            onRename={renameProject}
+            projects={bootstrap.projects ?? []}
+          />
+        ) : (
+          <AssetLibraryPage
+            backend={backend}
+            busy={shellBusy}
+            kind={view === 'assets-ply' ? 'ply' : 'video'}
+            onError={reportUnknownError}
+            onProjectChange={(next) => { acceptProject(next); void refreshCatalog() }}
+            platform={platform}
+            project={project}
+          />
+        )}
+        <footer className="hub-footer">GS VIDEO · 本地项目与共享素材</footer>
+      </AppShell>
+    )
+  }
+
+  if (project === null) {
+    return null
   }
 
   const interactionCount = creativeInteractionCount(project)
@@ -456,10 +724,10 @@ export function App({
         backend={backend}
         busy={workflowBusy}
         latestEvent={taskState.latestEvent}
-        onBackToCamera={() => setStep('camera')}
+        onBackToCamera={() => navigateWorkflow(project.project_id, 'camera')}
         onError={reportError}
         onProjectChange={acceptProject}
-        onReselectSubject={() => setStep('subject')}
+        onReselectSubject={() => navigateWorkflow(project.project_id, 'subject')}
         onStartStage={runStage}
         project={project}
       />
@@ -472,10 +740,11 @@ export function App({
   return (
     <AppShell>
       <header className="topbar">
-        <a className="brand" href="#workflow-main" aria-label="GS Video 工作流首页">
+        <a className="brand" href="#/" aria-label="返回项目首页">
           <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
           <span><strong>GS VIDEO</strong><small>GAUSSIAN COMPOSITOR</small></span>
         </a>
+        <nav className="workflow-global-nav" aria-label="主导航"><a href="#/">项目</a><a href="#/assets/video">素材库</a></nav>
         <div className="project-heading">
           <span>当前项目</span><strong>{project.name}</strong>
         </div>
@@ -501,7 +770,7 @@ export function App({
               const completed = WORKFLOW_STEPS.indexOf(item) < WORKFLOW_STEPS.indexOf(workflowStepForProject(project))
               return (
                 <li className={`${item === step ? 'is-current' : ''} ${completed ? 'is-complete' : ''}`} key={item}>
-                  <button disabled={!reachable} onClick={() => setStep(item)} type="button">
+                  <button disabled={!reachable} onClick={() => navigateWorkflow(project.project_id, item)} type="button">
                     <span className="step-number">{completed ? '✓' : meta.number}</span>
                     <span><strong>{meta.title}</strong><small>{meta.detail}</small></span>
                   </button>
@@ -574,8 +843,8 @@ export function App({
         <div className="footer-actions">
           {activeTaskRunning ? <button className="button-danger" onClick={() => void cancelActiveTask()} type="button">取消任务</button> : null}
           {activeTask !== null && retryableTask ? <button className="button-secondary" onClick={() => void runStage(activeTask.target_stage)} type="button">重试阶段</button> : null}
-          <button className="button-secondary" disabled={previous === undefined} onClick={() => previous !== undefined && setStep(previous)} type="button">上一步</button>
-          <button disabled={next === undefined || !canAdvance(project, step)} onClick={() => next !== undefined && setStep(next)} type="button">下一步</button>
+          <button className="button-secondary" disabled={previous === undefined} onClick={() => previous !== undefined && navigateWorkflow(project.project_id, previous)} type="button">上一步</button>
+          <button disabled={next === undefined || !canAdvance(project, step)} onClick={() => next !== undefined && navigateWorkflow(project.project_id, next)} type="button">下一步</button>
         </div>
       </footer>
     </AppShell>

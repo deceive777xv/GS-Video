@@ -18,6 +18,8 @@ from pydantic import (
 from gs_video.domain.models import Project, StageName
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.environment.vram import VramBudgetMode, VramBudgetSnapshot
+from gs_video.project.assets import AssetKind as LibraryAssetKind, AssetRecord
+from gs_video.project.catalog import ProjectSummary
 
 
 API_VERSION = "v1"
@@ -100,7 +102,9 @@ class HealthResponse(StrictModel):
 class BootstrapResponse(StrictModel):
     api_version: str
     capabilities: tuple[str, ...]
-    project: Project
+    project: Project | None
+    projects: tuple[ProjectSummary, ...] = ()
+    asset_counts: dict[LibraryAssetKind, int] = Field(default_factory=dict)
     environment: EnvironmentReport
     vram_budget: VramBudgetSnapshot
 
@@ -169,6 +173,24 @@ class ProjectPatch(StrictModel):
     subject_prompt: SubjectPromptInput | None = None
     motion_scale: float | None = Field(default=None, ge=0.1, le=4.0)
     preview_height: int | None = Field(default=None, ge=180, le=540)
+
+
+class ProjectCreate(StrictModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
+class ProjectRename(StrictModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
+class ProjectAssetSelection(StrictModel):
+    source_video_asset_id: str | None = None
+    scene_ply_asset_id: str | None = None
+
+
+class AssetListItem(StrictModel):
+    asset: AssetRecord
+    references: tuple[ProjectSummary, ...] = ()
 
 
 class CameraInput(StrictModel):
@@ -281,6 +303,7 @@ class AssetKind(StrEnum):
 class AssetImportRequest(StrictModel):
     path: str = Field(min_length=1)
     kind: str
+    assign_to_current: bool = True
 
     @field_validator("kind")
     @classmethod
@@ -296,6 +319,7 @@ class AssetResponse(StrictModel):
     path: str
     size: int
     sha256: str
+    asset_id: str | None = None
 
 
 class TaskCreateRequest(StrictModel):
@@ -382,6 +406,7 @@ class UploadCreateRequest(StrictModel):
     mime_type: str = Field(min_length=1, max_length=255)
     total_size: int = Field(ge=0)
     sha256: str
+    assign_to_current: bool = True
 
     @field_validator("kind")
     @classmethod
@@ -425,6 +450,8 @@ class UploadStatus(StrictModel):
 
 class UploadComplete(StrictModel):
     path: str
+    filename: str = ""
     kind: str = AssetKind.SOURCE_VIDEO.value
     size: int = Field(default=0, ge=0)
     sha256: str = "0" * 64
+    assign_to_current: bool = True

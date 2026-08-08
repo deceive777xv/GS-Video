@@ -29,6 +29,14 @@ const fakeBackendClient = (currentTask = task()): BackendClient => ({
   getEnvironmentRepair: vi.fn(),
   startEnvironmentRepair: vi.fn(),
   cancelEnvironmentRepair: vi.fn(),
+  listProjects: vi.fn(),
+  createProject: vi.fn(),
+  activateProject: vi.fn(),
+  renameProject: vi.fn(),
+  deleteProject: vi.fn(),
+  listAssets: vi.fn(),
+  deleteAsset: vi.fn(),
+  selectProjectAsset: vi.fn(),
   importLocalPath: vi.fn(),
   createUpload: vi.fn(),
   putUploadChunk: vi.fn(),
@@ -756,6 +764,37 @@ describe('WebSocketTaskEventSource', () => {
 })
 
 describe('recoverable task store', () => {
+  it('rejects delayed events from the previous project after authority resets', async () => {
+    const client = fakeBackendClient()
+    const store = createTaskStore(client)
+    store.onEvent({
+      type: 'task_event', task_id: 'task-old', revision: 1,
+      stage: 'segment', progress: 0.1, error: null,
+    })
+
+    store.reset?.('task-new')
+    store.onEvent({
+      type: 'task_event', task_id: 'task-old', revision: 20,
+      stage: 'segment', progress: 0.9, error: null,
+    })
+    store.onEvent({ type: 'resync_required', taskId: 'task-old', revision: 21 })
+
+    expect(store.snapshot()).toMatchObject({
+      revision: 1,
+      task: null,
+      latestEvent: null,
+    })
+    expect(client.getTask).not.toHaveBeenCalled()
+
+    store.onEvent({
+      type: 'task_event', task_id: 'task-new', revision: 22,
+      stage: 'render', progress: 0.2, error: null,
+    })
+    expect(store.snapshot().latestEvent).toMatchObject({
+      task_id: 'task-new', revision: 22,
+    })
+  })
+
   it('restores determinate progress from REST without fabricating an ETA', () => {
     const store = createTaskStore(fakeBackendClient())
     const restored: TaskDto = {

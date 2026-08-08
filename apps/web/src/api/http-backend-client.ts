@@ -1,10 +1,12 @@
 import type { BackendClient } from './backend-client'
 import type {
   AssetDto,
+  AssetListItemDto,
   AssetKind,
   BootstrapDto,
   ErrorEnvelopeDto,
   ProjectDto,
+  ProjectSummaryDto,
   ProjectPatch,
   PreviewFrameDto,
   LivePreviewRequest,
@@ -211,10 +213,47 @@ export class HttpBackendClient implements BackendClient {
     return this.#request('/environment/repair', { method: 'DELETE' })
   }
 
-  importLocalPath(kind: AssetKind, path: string): Promise<AssetDto> {
+  listProjects(): Promise<ProjectSummaryDto[]> {
+    return this.#request('/projects')
+  }
+
+  createProject(name: string): Promise<ProjectDto> {
+    return this.#request('/projects', { method: 'POST', json: { name } })
+  }
+
+  activateProject(id: string): Promise<ProjectDto> {
+    return this.#request(`/projects/${encodeURIComponent(id)}/activate`, { method: 'POST' })
+  }
+
+  renameProject(id: string, name: string): Promise<ProjectSummaryDto> {
+    return this.#request(`/projects/${encodeURIComponent(id)}`, {
+      method: 'PATCH', json: { name },
+    })
+  }
+
+  deleteProject(id: string): Promise<void> {
+    return this.#request(`/projects/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  }
+
+  listAssets(kind: 'video' | 'ply'): Promise<AssetListItemDto[]> {
+    return this.#request(`/assets?kind=${encodeURIComponent(kind)}`)
+  }
+
+  deleteAsset(id: string): Promise<void> {
+    return this.#request(`/assets/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  }
+
+  selectProjectAsset(kind: AssetKind, assetId: string | null): Promise<ProjectDto> {
+    const key = kind === 'source_video' ? 'source_video_asset_id' : 'scene_ply_asset_id'
+    return this.#request('/projects/current/assets', {
+      method: 'PATCH', json: { [key]: assetId },
+    })
+  }
+
+  importLocalPath(kind: AssetKind, path: string, assignToCurrent = true): Promise<AssetDto> {
     return this.#request('/assets/import', {
       method: 'POST',
-      json: { kind, path },
+      json: { kind, path, assign_to_current: assignToCurrent },
     })
   }
 

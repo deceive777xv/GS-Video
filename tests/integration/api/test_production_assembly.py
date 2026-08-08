@@ -47,8 +47,13 @@ def test_production_assembly_builds_runnable_api_without_spawning_workers(
 
     assert app.state.preview_service is services.preview_service
     assert all(services.pipeline_runner.supports(stage) for stage in StageName)
-    assert services.project_repository.load().name == "GS Video project"
+    assert services.project_manager is not None
+    assert services.project_manager.active_project() is None
     with TestClient(app) as client:
+        bootstrap = client.get(
+            "/api/v1/bootstrap",
+            headers={"Authorization": "Bearer session-secret"},
+        )
         preflight = client.options(
             "/api/v1/bootstrap",
             headers={
@@ -57,5 +62,8 @@ def test_production_assembly_builds_runnable_api_without_spawning_workers(
                 "Access-Control-Request-Headers": "authorization",
             },
         )
+    assert bootstrap.status_code == 200
+    assert bootstrap.json()["project"] is None
+    assert bootstrap.json()["projects"] == []
     assert preflight.status_code == 200
     assert preflight.headers["access-control-allow-origin"] == browser_origin

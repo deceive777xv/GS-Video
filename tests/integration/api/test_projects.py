@@ -78,7 +78,7 @@ def api_client(tmp_path: Path) -> Iterator[TestClient]:
         bind_host="127.0.0.1",
         port=0,
         session_token=TOKEN,
-        allowed_origins=(ORIGIN,),
+        allowed_origins=("http://tauri.localhost", ORIGIN),
     )
     with TestClient(create_app(settings, services)) as client:
         yield client
@@ -166,7 +166,7 @@ def test_local_asset_import_copies_into_project_source(
     response = api_client.post(
         "/api/v1/assets/import",
         json={"path": str(selected), "kind": "source_video"},
-        headers=auth_headers,
+        headers={**auth_headers, "Origin": "http://tauri.localhost"},
     )
 
     assert response.status_code == 201

@@ -72,6 +72,7 @@ _FRAME_NAME = re.compile(r"^(\d{6})\.(png|jpg)$")
 
 ProjectMutation = Callable[[Project], None]
 ProjectUpdater = Callable[[ProjectMutation], Project]
+AssetResolver = Callable[[str, str], Path]
 
 
 class ExportCallable(Protocol):
@@ -148,6 +149,7 @@ class RendererWorkerLike(Protocol):
 class WorkflowPaths:
     root: Path
     update_project: ProjectUpdater | None = None
+    resolve_asset: AssetResolver | None = None
     publisher: ArtifactPublisher = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -275,13 +277,25 @@ def _source_material(
     paths: WorkflowPaths, project: Project, token: CancellationToken
 ) -> tuple[Path, VideoSummary, _FileSnapshot]:
     summary = project.workflow.source_summary
-    if summary is None or project.source_video is None:
+    if summary is None or (
+        project.source_video_asset_id is None and project.source_video is None
+    ):
         raise RepairableError("尚未导入源视频")
     _require_exportable_dimensions(summary)
-    relative = Path(project.source_video)
-    if relative.is_absolute() or ".." in relative.parts or relative.parts[:1] != ("source",):
-        raise RepairableError("源视频路径不属于项目 source 目录")
-    source = paths.root / relative
+    if project.source_video_asset_id is not None:
+        if paths.resolve_asset is None:
+            raise RepairableError("共享素材解析器不可用")
+        source = paths.resolve_asset(project.source_video_asset_id, "video")
+    else:
+        assert project.source_video is not None
+        relative = Path(project.source_video)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.parts[:1] != ("source",)
+        ):
+            raise RepairableError("源视频路径不属于项目 source 目录")
+        source = paths.root / relative
     snapshot = _file_snapshot(source, "源视频", token)
     if snapshot != _FileSnapshot(summary.size, summary.sha256):
         raise RepairableError("源视频与已登记摘要不一致")
@@ -294,8 +308,19 @@ def _scene_material(
     token: CancellationToken,
 ) -> tuple[Path, SceneSummary, _FileSnapshot]:
     summary = project.workflow.scene_summary
-    if project.scene_ply is None or summary is None:
+    if summary is None or (
+        project.scene_ply_asset_id is None and project.scene_ply is None
+    ):
         raise RepairableError("尚未导入 Gaussian 场景")
+    if project.scene_ply_asset_id is not None:
+        if paths.resolve_asset is None:
+            raise RepairableError("共享素材解析器不可用")
+        resolved = paths.resolve_asset(project.scene_ply_asset_id, "ply")
+        snapshot = _file_snapshot(resolved, "Gaussian 场景", token)
+        if snapshot.size != summary.size or snapshot.sha256 != summary.sha256:
+            raise RepairableError("Gaussian 场景与已登记摘要不一致")
+        return resolved, summary, snapshot
+    assert project.scene_ply is not None
     relative = Path(project.scene_ply)
     if relative.is_absolute() or ".." in relative.parts:
         raise RepairableError("Gaussian 场景路径无效")

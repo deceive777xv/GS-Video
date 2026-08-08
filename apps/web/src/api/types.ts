@@ -31,6 +31,9 @@ export interface ProjectDto {
   project_id: string
   name: string
   created_at: string
+  updated_at?: string
+  source_video_asset_id?: string | null
+  scene_ply_asset_id?: string | null
   source_video: string | null
   scene_ply: string | null
   stages: Partial<Record<StageName, StageStateDto>>
@@ -181,9 +184,41 @@ export type VramBudgetUpdate =
 export interface BootstrapDto {
   api_version: string
   capabilities: string[]
-  project: ProjectDto
+  project: ProjectDto | null
+  projects?: ProjectSummaryDto[]
+  asset_counts?: Partial<Record<LibraryAssetKind, number>>
   environment: EnvironmentDto
   vram_budget: VramBudgetDto
+}
+
+export type LibraryAssetKind = 'video' | 'ply'
+
+export type WorkflowStepName = 'import' | 'subject' | 'camera' | 'preview' | 'export'
+
+export interface ProjectSummaryDto {
+  project_id: string
+  name: string
+  created_at: string
+  updated_at: string
+  workflow_step: WorkflowStepName
+  active_task_id: string | null
+}
+
+export interface LibraryAssetRecordDto {
+  asset_id: string
+  kind: LibraryAssetKind
+  original_filename: string
+  stored_relative_path: string
+  size: number
+  sha256: string
+  imported_at: string
+  video_summary: VideoSummaryDto | null
+  scene_summary: SceneSummaryDto | null
+}
+
+export interface AssetListItemDto {
+  asset: LibraryAssetRecordDto
+  references: ProjectSummaryDto[]
 }
 
 export type EnvironmentRepairState =
@@ -236,6 +271,7 @@ export interface UploadInit {
   mime_type: string
   total_size: number
   sha256: string
+  assign_to_current?: boolean
 }
 
 export interface UploadSessionDto {
@@ -252,9 +288,11 @@ export interface UploadStatusDto extends UploadSessionDto {
 
 export interface UploadCompleteDto {
   path: string
+  filename?: string
   kind: AssetKind
   size: number
   sha256: string
+  assign_to_current?: boolean
 }
 
 export interface PreviewRequest {

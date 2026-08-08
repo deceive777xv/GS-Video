@@ -1,8 +1,10 @@
 import type {
   AssetDto,
+  AssetListItemDto,
   AssetKind,
   BootstrapDto,
   ProjectDto,
+  ProjectSummaryDto,
   ProjectPatch,
   PreviewFrameDto,
   LivePreviewRequest,
@@ -31,7 +33,15 @@ export interface BackendClient {
   getEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto>
   startEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto>
   cancelEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto>
-  importLocalPath(kind: AssetKind, path: string): Promise<AssetDto>
+  listProjects(): Promise<ProjectSummaryDto[]>
+  createProject(name: string): Promise<ProjectDto>
+  activateProject(id: string): Promise<ProjectDto>
+  renameProject(id: string, name: string): Promise<ProjectSummaryDto>
+  deleteProject(id: string): Promise<void>
+  listAssets(kind: 'video' | 'ply'): Promise<AssetListItemDto[]>
+  deleteAsset(id: string): Promise<void>
+  selectProjectAsset(kind: AssetKind, assetId: string | null): Promise<ProjectDto>
+  importLocalPath(kind: AssetKind, path: string, assignToCurrent?: boolean): Promise<AssetDto>
   createUpload(input: UploadInit): Promise<UploadSessionDto>
   putUploadChunk(
     id: string,

@@ -20,6 +20,7 @@ import { App } from '../../app/app'
 import { readUploadResume, writeUploadResume } from '../import/upload-resume'
 
 afterEach(() => {
+  window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`)
   sessionStorage.clear()
   vi.useRealTimers()
 })
@@ -128,6 +129,14 @@ function createHarness(initial = project()) {
     }),
     startEnvironmentRepair: vi.fn(),
     cancelEnvironmentRepair: vi.fn(),
+    listProjects: vi.fn(),
+    createProject: vi.fn(),
+    activateProject: vi.fn(),
+    renameProject: vi.fn(),
+    deleteProject: vi.fn(),
+    listAssets: vi.fn(),
+    deleteAsset: vi.fn(),
+    selectProjectAsset: vi.fn(),
     importLocalPath: vi.fn(),
     createUpload: vi.fn(async (input) => ({ id: `upload-${input.kind}`, chunk_size: 4 })),
     putUploadChunk: vi.fn(async () => undefined),
@@ -263,6 +272,42 @@ function createHarness(initial = project()) {
 }
 
 describe('guided workflow', () => {
+  it('opens a project-aware workflow URL and restores its requested step', async () => {
+    const requested = project()
+    requested.project_id = 'project-2'
+    requested.name = 'Direct route project'
+    requested.source_video = 'opaque:source'
+    requested.scene_ply = 'opaque:scene'
+    requested.workflow.source_summary = {
+      filename: 'portrait.mp4', size: 10, sha256: 's', width: 640, height: 360,
+      duration_seconds: 12, fps: '30/1', has_audio: true, frame_count: 360,
+    }
+    requested.workflow.scene_summary = {
+      filename: 'garden.ply', size: 20, sha256: 'g', gaussian_count: 100,
+      estimated_vram_mb: 128,
+    }
+    requested.workflow.subject_prompt = { frame_index: 0, x: 100, y: 120 }
+    requested.stages.ingest = stage('succeeded')
+    requested.stages.segment = stage('succeeded')
+    requested.stages.solve_camera = stage('succeeded')
+    const harness = createHarness()
+    vi.mocked(harness.client.activateProject).mockResolvedValue(requested)
+    window.location.hash = '#/projects/project-2/workflow/camera'
+
+    render(
+      <App
+        backend={harness.client}
+        initialBootstrap={bootstrap(project())}
+        platform={harness.platform}
+        startAtHome
+      />,
+    )
+
+    expect(await screen.findByRole('heading', { name: '放置目标镜头' })).toBeInTheDocument()
+    expect(harness.client.activateProject).toHaveBeenCalledWith('project-2')
+    expect(window.location.hash).toBe('#/projects/project-2/workflow/camera')
+  })
+
   it('completes the happy path with exactly three authoritative creative interactions', async () => {
     const user = userEvent.setup()
     const harness = createHarness()
@@ -493,7 +538,7 @@ describe('guided workflow', () => {
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
-  it('switches App REST recovery from an old project owner to the newer gap event task', async () => {
+  it('rejects a gap event whose task owner differs from current project authority', async () => {
     const active = project()
     active.workflow.active_task_id = 'task-old'
     const harness = createHarness(active)
@@ -516,15 +561,41 @@ describe('guided workflow', () => {
     act(() => subscription?.onEvent({
       type: 'resync_required', task_id: 'task-new', revision: 9,
     }))
-    await waitFor(() => expect(harness.client.getTask).toHaveBeenCalledWith('task-new'))
-    await screen.findByText(/render · running/)
+    await act(async () => { await Promise.resolve() })
+    expect(harness.client.getTask).not.toHaveBeenCalledWith('task-new')
 
     resolveOld?.({
       id: 'task-old', target_stage: 'segment', status: 'running', revision: 1, error: null,
     })
+    expect(await screen.findByText(/segment · running/)).toBeInTheDocument()
+    expect(screen.queryByText(/render · running/)).toBeNull()
+  })
+
+  it('establishes initial bootstrap task ownership before subscribing to events', async () => {
+    const active = project()
+    active.workflow.active_task_id = 'task-current'
+    const harness = createHarness(active)
+    vi.mocked(harness.client.getTask).mockImplementation(
+      () => new Promise(() => undefined),
+    )
+    let subscription: Parameters<NonNullable<Parameters<typeof App>[0]['eventSource']>['subscribe']>[0] | undefined
+    const eventSource = {
+      subscribe: vi.fn((next: NonNullable<typeof subscription>) => {
+        subscription = next
+        return () => undefined
+      }),
+    }
+
+    render(<App backend={harness.client} eventSource={eventSource} initialBootstrap={bootstrap(active)} platform={harness.platform} />)
+    await waitFor(() => expect(harness.client.getTask).toHaveBeenCalledWith('task-current'))
+    act(() => subscription?.onEvent({
+      type: 'task_event', task_id: 'task-from-another-project', revision: 99,
+      stage: 'render', progress: 0.5, error: null,
+    }))
     await act(async () => { await Promise.resolve() })
-    expect(screen.getByText(/render · running/)).toBeInTheDocument()
-    expect(screen.queryByText(/segment · running/)).toBeNull()
+
+    expect(harness.client.getTask).not.toHaveBeenCalledWith('task-from-another-project')
+    expect(screen.queryByText(/render · running/)).toBeNull()
   })
 
   it('keeps a browser upload session for retry and focuses the structured error alert', async () => {

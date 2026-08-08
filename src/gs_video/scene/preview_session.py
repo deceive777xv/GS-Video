@@ -214,11 +214,16 @@ class PreviewSession(RendererWorkerClient):
 
     @staticmethod
     def _scene_authority(
-        project_root: Path, scene_path: str, summary: SceneSummary
+        project_root: Path, scene_path: str | Path, summary: SceneSummary
     ) -> tuple[Path, Path, tuple[object, ...]]:
         try:
             root = Path(project_root).resolve(strict=True)
-            scene = (root / scene_path).resolve(strict=True)
+            external = isinstance(scene_path, Path) and scene_path.is_absolute()
+            scene = (
+                Path(scene_path).resolve(strict=True)
+                if external
+                else (root / scene_path).resolve(strict=True)
+            )
             source_root = (root / "source").resolve(strict=True)
             previews = (root / "previews").resolve(strict=True)
             metadata = scene.stat()
@@ -227,7 +232,7 @@ class PreviewSession(RendererWorkerClient):
                 "Gaussian scene is unavailable for preview"
             ) from error
         if (
-            not scene.is_relative_to(source_root)
+            (not external and not scene.is_relative_to(source_root))
             or not scene.is_file()
             or has_reparse_component(scene)
             or not stat.S_ISREG(metadata.st_mode)
@@ -236,7 +241,9 @@ class PreviewSession(RendererWorkerClient):
             raise PreviewSceneUnavailableError(
                 "Gaussian scene is unavailable for preview"
             )
-        if metadata.st_size != summary.size or scene.name != summary.filename:
+        if metadata.st_size != summary.size or (
+            not external and scene.name != summary.filename
+        ):
             raise PreviewSceneChangedError(
                 "Gaussian scene no longer matches its imported authority"
             )
@@ -512,7 +519,7 @@ class PreviewSession(RendererWorkerClient):
     def _render_live_serial(
         self,
         project_root: Path,
-        scene_path: str,
+        scene_path: str | Path,
         scene_summary: SceneSummary,
         request_id: int,
         camera: OrbitCamera,
@@ -566,7 +573,7 @@ class PreviewSession(RendererWorkerClient):
     def render_live(
         self,
         project_root: Path,
-        scene_path: str,
+        scene_path: str | Path,
         scene_summary: SceneSummary,
         request_id: int,
         camera: OrbitCamera,
@@ -590,7 +597,7 @@ class PreviewSession(RendererWorkerClient):
     def _render_preview_pick_serial(
         self,
         project_root: Path,
-        scene_path: str,
+        scene_path: str | Path,
         scene_summary: SceneSummary,
         camera: OrbitCamera,
         width: int,
@@ -641,7 +648,7 @@ class PreviewSession(RendererWorkerClient):
     def render_preview_pick(
         self,
         project_root: Path,
-        scene_path: str,
+        scene_path: str | Path,
         scene_summary: SceneSummary,
         camera: OrbitCamera,
         width: int,

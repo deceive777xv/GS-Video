@@ -57,7 +57,9 @@ export class TauriPlatformBridge implements PlatformBridge {
     })
     const path = Array.isArray(selected) ? selected[0] : selected
     if (path === undefined || path === null) return null
-    const asset = await this.#client.importLocalPath(options.kind, path)
+    const asset = options.assignToCurrent === undefined
+      ? await this.#client.importLocalPath(options.kind, path)
+      : await this.#client.importLocalPath(options.kind, path, options.assignToCurrent)
     return { kind: 'local-asset', asset }
   }
 

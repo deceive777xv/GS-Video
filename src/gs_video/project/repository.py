@@ -1,10 +1,13 @@
 import json
 import os
 import sys
+import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import BinaryIO
+from uuid import uuid4
 
 from gs_video.domain.models import (
     Project,
@@ -189,6 +192,17 @@ class ProjectRepository:
         return Project.model_validate(migrate_project_dict(raw))
 
     def _save_unlocked(self, project: Project) -> None:
-        temporary = self.path.with_suffix(".json.tmp")
+        project.updated_at = datetime.now(timezone.utc)
+        temporary = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
         temporary.write_text(project.model_dump_json(indent=2), encoding="utf-8")
-        os.replace(temporary, self.path)
+        try:
+            for attempt in range(4):
+                try:
+                    os.replace(temporary, self.path)
+                    return
+                except PermissionError:
+                    if attempt == 3:
+                        raise
+                    time.sleep(0.01 * (attempt + 1))
+        finally:
+            temporary.unlink(missing_ok=True)

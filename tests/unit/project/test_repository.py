@@ -51,11 +51,11 @@ def test_repository_round_trips_project(tmp_path: Path) -> None:
 
     assert loaded == project
     assert loaded.project_id == project.project_id
-    assert loaded.schema_version == 3
+    assert loaded.schema_version == 4
     assert (tmp_path / "project.json").exists()
 
 
-def test_repository_load_migrates_v2_pick_authority_and_round_trips_v3(
+def test_repository_load_migrates_v2_pick_authority_and_round_trips_v4(
     tmp_path: Path,
 ) -> None:
     repository = ProjectRepository(tmp_path)
@@ -86,7 +86,7 @@ def test_repository_load_migrates_v2_pick_authority_and_round_trips_v3(
     repository.save(loaded)
     round_tripped = repository.load()
 
-    assert round_tripped.schema_version == 3
+    assert round_tripped.schema_version == 4
     assert round_tripped.workflow.confirmed_preview_artifact_id == artifact_id
     assert round_tripped.workflow.foot_point is not None
     assert round_tripped.workflow.foot_point.preview_artifact_id == artifact_id
@@ -134,9 +134,14 @@ def test_save_replaces_project_with_complete_valid_json(
 
     repo.save(replacement)
 
-    assert observations == [(tmp_path / "project.json.tmp", tmp_path / "project.json")]
+    assert len(observations) == 1
+    temporary, destination = observations[0]
+    assert temporary.parent == tmp_path
+    assert temporary.name.startswith(".project.json.")
+    assert temporary.name.endswith(".tmp")
+    assert destination == tmp_path / "project.json"
     assert json.loads(repo.path.read_text(encoding="utf-8"))["name"] == "replacement"
-    assert not (tmp_path / "project.json.tmp").exists()
+    assert not temporary.exists()
 
 
 def test_repository_round_trips_workflow_authority(tmp_path: Path) -> None:

@@ -566,7 +566,7 @@ class PreviewServiceLike(Protocol):
     def render_live(
         self,
         project_root: Path,
-        scene_path: str,
+        scene_path: str | Path,
         scene_summary: SceneSummary,
         request_id: int,
         camera: OrbitCamera,
@@ -577,7 +577,7 @@ class PreviewServiceLike(Protocol):
     def render_pick(
         self,
         project_root: Path,
-        scene_path: str,
+        scene_path: str | Path,
         scene_summary: SceneSummary,
         camera: OrbitCamera,
         width: int,
@@ -595,7 +595,7 @@ class LivePreviewSessionLike(Protocol):
     def render_live(
         self,
         project_root: Path,
-        scene_path: str,
+        scene_path: str | Path,
         scene_summary: SceneSummary,
         request_id: int,
         camera: OrbitCamera,
@@ -606,7 +606,7 @@ class LivePreviewSessionLike(Protocol):
     def render_preview_pick(
         self,
         project_root: Path,
-        scene_path: str,
+        scene_path: str | Path,
         scene_summary: SceneSummary,
         camera: OrbitCamera,
         width: int,
@@ -631,15 +631,20 @@ class GsplatPreviewService:
     def render_pick(
         self,
         project_root: Path,
-        scene_path: str,
+        scene_path: str | Path,
         scene_summary: SceneSummary,
         camera: OrbitCamera,
         width: int,
         height: int,
     ) -> PickBuffer:
         root = project_root.resolve(strict=True)
+        external = isinstance(scene_path, Path) and scene_path.is_absolute()
         try:
-            scene = (root / scene_path).resolve(strict=True)
+            scene = (
+                Path(scene_path).resolve(strict=True)
+                if external
+                else (root / scene_path).resolve(strict=True)
+            )
             before = scene.stat()
         except OSError as error:
             raise ApiError(
@@ -650,14 +655,14 @@ class GsplatPreviewService:
             ) from error
         source_root = (root / "source").resolve(strict=True)
         if (
-            not scene.is_relative_to(source_root)
+            (not external and not scene.is_relative_to(source_root))
             or not scene.is_file()
             or has_reparse_component(scene)
             or not stat.S_ISREG(before.st_mode)
             or (int(before.st_dev), int(before.st_ino)) == (0, 0)
             or before.st_nlink != 1
             or before.st_size != scene_summary.size
-            or scene.name != scene_summary.filename
+            or (not external and scene.name != scene_summary.filename)
         ):
             raise ApiError(
                 409,
@@ -807,7 +812,7 @@ class WorkerPreviewService:
     def render_live(
         self,
         project_root: Path,
-        scene_path: str,
+        scene_path: str | Path,
         scene_summary: SceneSummary,
         request_id: int,
         camera: OrbitCamera,
@@ -831,7 +836,7 @@ class WorkerPreviewService:
     def _render_live(
         self,
         project_root: Path,
-        scene_path: str,
+        scene_path: str | Path,
         scene_summary: SceneSummary,
         request_id: int,
         camera: OrbitCamera,
@@ -899,7 +904,7 @@ class WorkerPreviewService:
     def render_pick(
         self,
         project_root: Path,
-        scene_path: str,
+        scene_path: str | Path,
         scene_summary: SceneSummary,
         camera: OrbitCamera,
         width: int,
@@ -921,7 +926,7 @@ class WorkerPreviewService:
     def _render_pick(
         self,
         project_root: Path,
-        scene_path: str,
+        scene_path: str | Path,
         scene_summary: SceneSummary,
         camera: OrbitCamera,
         width: int,
@@ -978,7 +983,12 @@ class WorkerPreviewService:
                 ) from error
         try:
             root = project_root.resolve(strict=True)
-            scene = (root / scene_path).resolve(strict=True)
+            external = isinstance(scene_path, Path) and scene_path.is_absolute()
+            scene = (
+                Path(scene_path).resolve(strict=True)
+                if external
+                else (root / scene_path).resolve(strict=True)
+            )
             source_root = (root / "source").resolve(strict=True)
             before = scene.stat()
         except OSError as error:
@@ -989,14 +999,14 @@ class WorkerPreviewService:
                 message="The Gaussian scene is unavailable.",
             ) from error
         if (
-            not scene.is_relative_to(source_root)
+            (not external and not scene.is_relative_to(source_root))
             or not scene.is_file()
             or has_reparse_component(scene)
             or not stat.S_ISREG(before.st_mode)
             or (int(before.st_dev), int(before.st_ino)) == (0, 0)
             or before.st_nlink != 1
             or before.st_size != scene_summary.size
-            or scene.name != scene_summary.filename
+            or (not external and scene.name != scene_summary.filename)
         ):
             raise ApiError(
                 409,

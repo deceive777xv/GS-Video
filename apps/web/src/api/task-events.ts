@@ -248,6 +248,7 @@ export interface TaskStore {
   readonly onConnectionChange: (state: TaskEventConnection) => void
   readonly replaceFromRest: (task: TaskDto) => void
   readonly acknowledgeResync: (revision: number, task: TaskDto | null) => void
+  readonly reset?: (taskId?: string | null) => void
   readonly whenIdle: () => Promise<void>
   readonly dispose: () => void
 }
@@ -270,6 +271,7 @@ export function createTaskStore(
     latestEvent: null,
   })
   let trackedTaskId: string | undefined
+  let restrictToTrackedTask = false
   let recovery: Promise<void> | null = null
   let disposed = false
   let retryTimer: ReturnType<typeof setTimeout> | null = null
@@ -323,6 +325,7 @@ export function createTaskStore(
   const replaceFromRest = (task: TaskDto): void => {
     if (disposed) return
     trackedTaskId = task.id
+    restrictToTrackedTask = true
     const pendingResyncRevision = state.pendingResyncRevision !== null
       && task.revision >= state.pendingResyncRevision
       ? null
@@ -338,6 +341,7 @@ export function createTaskStore(
   const acknowledgeResync = (revision: number, task: TaskDto | null): void => {
     if (disposed) return
     trackedTaskId = task?.id
+    restrictToTrackedTask = true
     publish({
       ...state,
       task,
@@ -423,16 +427,21 @@ export function createTaskStore(
   const onEvent = (event: TaskEvent): void => {
     if (disposed) return
     if (event.type === 'resync_required') {
-      trackedTaskId = event.taskId ?? event.task_id
+      const eventTaskId = event.taskId ?? event.task_id
+      if (restrictToTrackedTask && eventTaskId !== undefined
+        && eventTaskId !== trackedTaskId) return
+      if (!restrictToTrackedTask) trackedTaskId = eventTaskId
       const pendingResyncRevision = Math.max(
         state.pendingResyncRevision ?? 0,
         event.revision,
       )
       publish({ ...state, pendingResyncRevision, latestEvent: event })
+      if (eventTaskId === undefined) return
       startRecovery()
       return
     }
     if (event.revision <= state.revision) return
+    if (restrictToTrackedTask && event.task_id !== trackedTaskId) return
     trackedTaskId = event.task_id
     publish({ ...state, revision: event.revision, latestEvent: event })
   }
@@ -451,6 +460,17 @@ export function createTaskStore(
     },
     replaceFromRest,
     acknowledgeResync,
+    reset: (taskId = null) => {
+      if (disposed) return
+      trackedTaskId = taskId ?? undefined
+      restrictToTrackedTask = true
+      publish({
+        ...state,
+        task: null,
+        pendingResyncRevision: null,
+        latestEvent: null,
+      })
+    },
     whenIdle: () => recovery ?? Promise.resolve(),
     dispose: () => {
       if (disposed) return
