@@ -99,6 +99,7 @@ export function SceneViewport({
   )
   const [frameUrl, setFrameUrl] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const [authoritativeTrigger, setAuthoritativeTrigger] = useState(0)
   const [yawInput, setYawInput] = useState(() => formatAngleInput(initialCamera.yaw))
   const [pitchInput, setPitchInput] = useState(() => formatAngleInput(initialCamera.pitch))
   const [footX, setFootX] = useState('')
@@ -118,6 +119,26 @@ export function SceneViewport({
   const firstRender = useRef(initialPreview !== null)
   const onErrorRef = useRef(onError)
   const onPreviewRef = useRef(onPreview)
+  const initialFingerprint = cameraFingerprint(initialCamera)
+  const liveSequence = useRef(1)
+  const latestLiveTarget = useRef({
+    sequence: 1,
+    fingerprint: initialFingerprint,
+    camera: toCameraInput(initialCamera),
+  })
+  const liveAttemptedSequence = useRef(0)
+  const liveRequestId = useRef(0)
+  const liveDisplayRequestId = useRef(0)
+  const liveInFlight = useRef(false)
+  const livePump = useRef<() => void>(() => undefined)
+  const livePumpEpoch = useRef(0)
+  const liveDisabled = useRef(false)
+  const forceAuthoritativeSequence = useRef<number | null>(null)
+  const pendingLiveClose = useRef<{
+    backend: BackendClient
+    timeout: ReturnType<typeof setTimeout>
+  } | null>(null)
+  const authoritativeDisplaySequence = useRef(0)
 
   useEffect(() => { onErrorRef.current = onError }, [onError])
   useEffect(() => { onPreviewRef.current = onPreview }, [onPreview])
@@ -147,6 +168,93 @@ export function SceneViewport({
   }
 
   useEffect(() => () => replaceFrameUrl(null), [])
+
+  useEffect(() => {
+    const pending = pendingLiveClose.current
+    if (pending?.backend === backend) {
+      clearTimeout(pending.timeout)
+      pendingLiveClose.current = null
+    }
+    return () => {
+      const closeLivePreview = backend.closeLivePreview?.bind(backend)
+      if (closeLivePreview === undefined) return
+      let timeout: ReturnType<typeof setTimeout>
+      timeout = setTimeout(() => {
+        if (pendingLiveClose.current?.timeout === timeout) {
+          pendingLiveClose.current = null
+        }
+        void closeLivePreview().catch(() => undefined)
+      }, 0)
+      pendingLiveClose.current = { backend, timeout }
+    }
+  }, [backend])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const epoch = ++livePumpEpoch.current
+    liveAttemptedSequence.current = 0
+    liveInFlight.current = false
+    liveDisabled.current = false
+    const renderLivePreview = backend.renderLivePreview?.bind(backend)
+    if (renderLivePreview === undefined) return () => controller.abort()
+
+    const pump = (): void => {
+      if (controller.signal.aborted
+        || epoch !== livePumpEpoch.current
+        || liveDisabled.current
+        || liveInFlight.current) return
+      const target = latestLiveTarget.current
+      if (target.sequence <= liveAttemptedSequence.current) return
+      liveAttemptedSequence.current = target.sequence
+      liveInFlight.current = true
+      const requestId = Math.max(Date.now(), liveRequestId.current + 1)
+      liveRequestId.current = requestId
+      void renderLivePreview({
+        request_id: requestId,
+        width: 960,
+        height: 540,
+        camera: toCameraInput(target.camera),
+      }, controller.signal).then((blob) => {
+        if (controller.signal.aborted
+          || requestId <= liveDisplayRequestId.current
+          || target.sequence <= authoritativeDisplaySequence.current) return
+        liveDisplayRequestId.current = requestId
+        replaceFrameUrl(URL.createObjectURL(blob))
+      }).catch(() => {
+        if (controller.signal.aborted || epoch !== livePumpEpoch.current) return
+        liveDisabled.current = true
+        forceAuthoritativeSequence.current = latestLiveTarget.current.sequence
+        onErrorRef.current('实时预览暂不可用，已切换到高质量预览。')
+        setAuthoritativeTrigger((current) => current + 1)
+      }).finally(() => {
+        if (epoch !== livePumpEpoch.current) return
+        liveInFlight.current = false
+        pump()
+      })
+    }
+    livePump.current = pump
+    pump()
+    return () => {
+      controller.abort()
+      if (epoch === livePumpEpoch.current) {
+        if (livePump.current === pump) livePump.current = () => undefined
+        liveInFlight.current = false
+      }
+    }
+  }, [backend])
+
+  useEffect(() => {
+    const fingerprint = cameraFingerprint(camera)
+    if (fingerprint !== latestLiveTarget.current.fingerprint) {
+      liveSequence.current += 1
+      latestLiveTarget.current = {
+        sequence: liveSequence.current,
+        fingerprint,
+        camera: toCameraInput(camera),
+      }
+    }
+    livePump.current()
+  }, [camera])
 
   useEffect(() => {
     setCamera((current) => (
@@ -193,6 +301,10 @@ export function SceneViewport({
       .then((blob) => {
         if (controller.signal.aborted || authority !== requestAuthority.current) return
         firstRender.current = false
+        authoritativeDisplaySequence.current = Math.max(
+          authoritativeDisplaySequence.current,
+          latestLiveTarget.current.sequence,
+        )
         replaceFrameUrl(URL.createObjectURL(blob))
         setFrame(nextFrame)
         setFrameCameraFingerprint(nextFingerprint)
@@ -225,6 +337,9 @@ export function SceneViewport({
     }
     const controller = new AbortController()
     const authority = ++requestAuthority.current
+    const authoritativeSequence = latestLiveTarget.current.sequence
+    const renderImmediately = forceAuthoritativeSequence.current === authoritativeSequence
+    if (renderImmediately) forceAuthoritativeSequence.current = null
     const timeout = setTimeout(() => {
       const nextGeneration = nextPreviewGeneration(generation.current)
       generation.current = nextGeneration
@@ -237,6 +352,10 @@ export function SceneViewport({
       }, controller.signal).then(async (nextFrame) => {
         const blob = await backend.fetchPreviewArtifact(nextFrame.artifact_id, controller.signal)
         if (controller.signal.aborted || authority !== requestAuthority.current) return
+        authoritativeDisplaySequence.current = Math.max(
+          authoritativeDisplaySequence.current,
+          authoritativeSequence,
+        )
         replaceFrameUrl(URL.createObjectURL(blob))
         setFrame(nextFrame)
         setFrameCameraFingerprint(cameraFingerprint(camera))
@@ -248,12 +367,12 @@ export function SceneViewport({
       }).finally(() => {
         if (authority === requestAuthority.current) setLoading(false)
       })
-    }, 150)
+    }, renderImmediately ? 0 : 120)
     return () => {
       clearTimeout(timeout)
       controller.abort()
     }
-  }, [backend, camera])
+  }, [authoritativeTrigger, backend, camera])
 
   const restoreAngleInput = (axis: 'yaw' | 'pitch'): void => {
     if (axis === 'yaw') setYawInput(formatAngleInput(camera.yaw))

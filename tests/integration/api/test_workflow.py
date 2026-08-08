@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Iterator
+from dataclasses import replace
 import hashlib
 from pathlib import Path
 from threading import Event
@@ -67,6 +68,39 @@ class Registry:
 class PreviewService:
     def __init__(self) -> None:
         self.cameras: list[OrbitCamera] = []
+        self.close_calls = 0
+        self.suspended = False
+
+    def close_live(self) -> None:
+        self.close_calls += 1
+
+    def suspend_live(self) -> object:
+        self.suspended = True
+        self.close_live()
+        return object()
+
+    def resume_live(self, token: object) -> None:
+        del token
+        self.suspended = False
+
+    def render_live(
+        self,
+        project_root: Path,
+        scene_path: str,
+        scene_summary: SceneSummary,
+        request_id: int,
+        camera: OrbitCamera,
+        width: int,
+        height: int,
+    ) -> bytes:
+        del project_root, scene_path, scene_summary, request_id
+        self.cameras.append(camera)
+        image = Image.new("RGB", (width, height), (40, 80, 120))
+        from io import BytesIO
+
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=85)
+        return output.getvalue()
 
     def render_pick(
         self,
@@ -321,6 +355,53 @@ def test_preview_and_pick_are_persisted_with_revision_guards(
         "/api/v1/projects/current", headers=auth_headers
     ).json()
     assert project["workflow"]["foot_point"] == picked.json()
+
+
+def test_live_preview_returns_jpeg_without_changing_project_authority(
+    workflow_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    repository = workflow_client.app.state.services.project_repository
+    before = repository.path.read_bytes()
+
+    response = workflow_client.post(
+        "/api/v1/projects/current/preview/live",
+        json={
+            "request_id": 41,
+            "width": 16,
+            "height": 9,
+            "camera": {
+                "target": [0.0, 0.0, 0.0],
+                "distance": 4.0,
+                "yaw": 12.0,
+                "pitch": -3.0,
+                "fov_y_degrees": 60.0,
+            },
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-preview-request-id"] == "41"
+    assert response.content.startswith(b"\xff\xd8")
+    assert repository.path.read_bytes() == before
+    assert repository.load().workflow.preview is None
+
+
+def test_live_preview_release_closes_the_resident_session(
+    workflow_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    service = workflow_client.app.state.preview_service
+
+    response = workflow_client.delete(
+        "/api/v1/projects/current/preview/live", headers=auth_headers
+    )
+
+    assert response.status_code == 204
+    assert response.content == b""
+    assert service.close_calls == 1
 
 
 def test_pick_rejects_preview_artifact_aba_before_transaction_commit(
@@ -719,6 +800,38 @@ def test_replacing_source_video_clears_all_source_derived_authority(
         assert project.stages[name].input_generation == 1
 
 
+def test_completing_scene_upload_closes_resident_preview_before_replacement(
+    workflow_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    payload = b"replacement-scene"
+    preview = workflow_client.app.state.preview_service
+    created = workflow_client.post(
+        "/api/v1/uploads",
+        json={
+            "kind": "scene_ply",
+            "filename": "replacement.ply",
+            "mime_type": "application/octet-stream",
+            "total_size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        },
+        headers=auth_headers,
+    ).json()
+    assert workflow_client.put(
+        f"/api/v1/uploads/{created['id']}/chunks/0",
+        content=payload,
+        headers=auth_headers,
+    ).status_code == 204
+
+    response = workflow_client.post(
+        f"/api/v1/uploads/{created['id']}/complete",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 201
+    assert preview.close_calls == 1
+    assert preview.suspended is False
+
+
 def test_started_task_id_is_recoverable_from_project_snapshot(
     workflow_client: TestClient, auth_headers: dict[str, str]
 ) -> None:
@@ -731,6 +844,52 @@ def test_started_task_id_is_recoverable_from_project_snapshot(
 
     assert created.status_code == 202
     assert project["workflow"]["active_task_id"] == created.json()["id"]
+    assert workflow_client.app.state.preview_service.close_calls == 1
+
+
+def test_task_environment_probe_runs_after_preview_is_suspended(
+    workflow_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    preview = workflow_client.app.state.preview_service
+
+    class OrderingDoctor:
+        def check(self) -> EnvironmentReport:
+            assert preview.suspended is True
+            return EnvironmentReport(ready=True, vram_mb=8192, issues=[])
+
+    workflow_client.app.state.services = replace(
+        workflow_client.app.state.services,
+        environment_doctor=OrderingDoctor(),
+    )
+
+    response = workflow_client.post(
+        "/api/v1/tasks", json={"target_stage": "segment"}, headers=auth_headers
+    )
+
+    assert response.status_code == 202
+    assert preview.close_calls == 1
+
+
+def test_bootstrap_environment_probe_temporarily_suspends_preview(
+    workflow_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    preview = workflow_client.app.state.preview_service
+
+    class OrderingDoctor:
+        def check(self) -> EnvironmentReport:
+            assert preview.suspended is True
+            return EnvironmentReport(ready=True, vram_mb=8192, issues=[])
+
+    workflow_client.app.state.services = replace(
+        workflow_client.app.state.services,
+        environment_doctor=OrderingDoctor(),
+    )
+
+    response = workflow_client.get("/api/v1/bootstrap", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert preview.close_calls == 1
+    assert preview.suspended is False
 
 
 def test_export_result_is_ffprobe_verified_persisted_and_opaque(

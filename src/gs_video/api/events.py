@@ -158,7 +158,12 @@ class TaskService:
         async with self._transition_lock:
             self._started = True
 
-    async def create(self, target_stage: StageName) -> TaskSnapshot:
+    async def create(
+        self,
+        target_stage: StageName,
+        *,
+        on_terminal: Callable[[], None] | None = None,
+    ) -> TaskSnapshot:
         task_id = uuid4().hex
         token = CancellationToken()
         committed: TaskSnapshot | None = None
@@ -218,7 +223,14 @@ class TaskService:
         )
         assert event is not None
         assert committed is not None
-        job = asyncio.create_task(self._run(task_id, target_stage))
+        async def run_and_finalize() -> None:
+            try:
+                await self._run(task_id, target_stage)
+            finally:
+                if on_terminal is not None:
+                    on_terminal()
+
+        job = asyncio.create_task(run_and_finalize())
         self._jobs.add(job)
         job.add_done_callback(self._jobs.discard)
         return committed

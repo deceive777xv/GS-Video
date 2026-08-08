@@ -8,7 +8,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from threading import RLock
+from threading import Condition, RLock
 from typing import Any, Literal, Protocol, TypeVar, cast
 from uuid import uuid4
 
@@ -30,6 +30,12 @@ from gs_video.pipeline.artifacts import validate_cache_key
 from gs_video.scene.camera import OrbitCamera
 from gs_video.scene.gsplat_renderer import GsplatRenderer
 from gs_video.scene.ply import load_gaussian_ply
+from gs_video.scene.preview_session import (
+    PreviewRequestSuperseded,
+    PreviewResourceError,
+    PreviewSceneChangedError,
+    PreviewSceneUnavailableError,
+)
 from gs_video.scene.worker_client import RendererWorkerClient
 from gs_video.scene.worker_protocol import OrbitCameraPayload, RenderPickRequest
 from gs_video.pipeline.cancellation import CancellationToken
@@ -552,6 +558,17 @@ def validate_subject_prompt(
 
 
 class PreviewServiceLike(Protocol):
+    def render_live(
+        self,
+        project_root: Path,
+        scene_path: str,
+        scene_summary: SceneSummary,
+        request_id: int,
+        camera: OrbitCamera,
+        width: int,
+        height: int,
+    ) -> bytes: ...
+
     def render_pick(
         self,
         project_root: Path,
@@ -562,6 +579,37 @@ class PreviewServiceLike(Protocol):
         height: int,
     ) -> PickBuffer: ...
 
+    def close_live(self) -> None: ...
+
+    def suspend_live(self) -> object: ...
+
+    def resume_live(self, token: object) -> None: ...
+
+
+class LivePreviewSessionLike(Protocol):
+    def render_live(
+        self,
+        project_root: Path,
+        scene_path: str,
+        scene_summary: SceneSummary,
+        request_id: int,
+        camera: OrbitCamera,
+        width: int,
+        height: int,
+    ) -> bytes: ...
+
+    def render_preview_pick(
+        self,
+        project_root: Path,
+        scene_path: str,
+        scene_summary: SceneSummary,
+        camera: OrbitCamera,
+        width: int,
+        height: int,
+    ) -> PickBuffer: ...
+
+    def close(self) -> None: ...
+
 
 class GsplatPreviewService:
     def __init__(self, renderer: GsplatRenderer | None = None) -> None:
@@ -569,6 +617,11 @@ class GsplatPreviewService:
         self._lock = RLock()
         self._cached_scene_key: tuple[object, ...] | None = None
         self._cached_scene: object | None = None
+
+    def close_live(self) -> None:
+        with self._lock:
+            self._cached_scene = None
+            self._cached_scene_key = None
 
     def render_pick(
         self,
@@ -682,6 +735,7 @@ class WorkerPreviewService:
         worker: RendererWorkerClient,
         *,
         available_vram_limit_mb: int = 8192,
+        live_session: LivePreviewSessionLike | None = None,
     ) -> None:
         if (
             type(available_vram_limit_mb) is not int
@@ -690,19 +744,48 @@ class WorkerPreviewService:
             raise ValueError("available_vram_limit_mb must be between 1024 and 8192")
         self._worker = worker
         self._available_vram_limit_mb = available_vram_limit_mb
+        self._live_session = live_session
+        self._admission = Condition()
+        self._active_calls = 0
+        self._suspensions: set[object] = set()
 
-    def render_pick(
-        self,
-        project_root: Path,
-        scene_path: str,
-        scene_summary: SceneSummary,
-        camera: OrbitCamera,
-        width: int,
-        height: int,
-    ) -> PickBuffer:
-        extra_framebuffer_bytes = (
-            max(0, width * height - 1920 * 1080) * 24
-        )
+    def close_live(self) -> None:
+        if self._live_session is not None:
+            self._live_session.close()
+
+    def suspend_live(self) -> object:
+        token = object()
+        with self._admission:
+            self._suspensions.add(token)
+            while self._active_calls:
+                self._admission.wait()
+        self.close_live()
+        return token
+
+    def resume_live(self, token: object) -> None:
+        with self._admission:
+            self._suspensions.discard(token)
+            self._admission.notify_all()
+
+    def _begin_preview(self) -> None:
+        with self._admission:
+            if self._suspensions:
+                raise ApiError(
+                    409,
+                    code="preview_suspended",
+                    category="conflict",
+                    message="Preview rendering is suspended while another workflow task runs.",
+                    retryable=True,
+                )
+            self._active_calls += 1
+
+    def _finish_preview(self) -> None:
+        with self._admission:
+            self._active_calls -= 1
+            self._admission.notify_all()
+
+    def _admit(self, scene_summary: SceneSummary, width: int, height: int) -> None:
+        extra_framebuffer_bytes = max(0, width * height - 1920 * 1080) * 24
         estimated_vram_mb = scene_summary.estimated_vram_mb + (
             extra_framebuffer_bytes + 1024**2 - 1
         ) // 1024**2
@@ -713,6 +796,179 @@ class WorkerPreviewService:
                 category="resource",
                 message="The Gaussian scene exceeds the configured VRAM admission limit.",
             )
+
+    def render_live(
+        self,
+        project_root: Path,
+        scene_path: str,
+        scene_summary: SceneSummary,
+        request_id: int,
+        camera: OrbitCamera,
+        width: int,
+        height: int,
+    ) -> bytes:
+        self._begin_preview()
+        try:
+            return self._render_live(
+                project_root,
+                scene_path,
+                scene_summary,
+                request_id,
+                camera,
+                width,
+                height,
+            )
+        finally:
+            self._finish_preview()
+
+    def _render_live(
+        self,
+        project_root: Path,
+        scene_path: str,
+        scene_summary: SceneSummary,
+        request_id: int,
+        camera: OrbitCamera,
+        width: int,
+        height: int,
+    ) -> bytes:
+        self._admit(scene_summary, width, height)
+        if self._live_session is None:
+            raise ApiError(
+                503,
+                code="live_preview_unavailable",
+                category="render",
+                message="The realtime preview renderer is unavailable.",
+                retryable=True,
+            )
+        try:
+            return self._live_session.render_live(
+                project_root,
+                scene_path,
+                scene_summary,
+                request_id,
+                camera,
+                width,
+                height,
+            )
+        except PreviewRequestSuperseded as error:
+            raise ApiError(
+                409,
+                code="live_preview_superseded",
+                category="conflict",
+                message="A newer realtime preview replaced this request.",
+                retryable=True,
+            ) from error
+        except PreviewSceneUnavailableError as error:
+            raise ApiError(
+                409,
+                code="scene_unavailable",
+                category="project",
+                message="The Gaussian scene is unavailable.",
+            ) from error
+        except PreviewSceneChangedError as error:
+            raise ApiError(
+                409,
+                code="scene_changed",
+                category="conflict",
+                message="The Gaussian scene no longer matches its imported summary.",
+                retryable=True,
+            ) from error
+        except PreviewResourceError as error:
+            raise ApiError(
+                422,
+                code="scene_vram_limit_exceeded",
+                category="resource",
+                message="The Gaussian scene exceeds the available renderer memory.",
+            ) from error
+        except (GsVideoError, OSError) as error:
+            raise ApiError(
+                500,
+                code="preview_worker_failed",
+                category="render",
+                message="The isolated preview renderer failed.",
+                retryable=True,
+            ) from error
+
+    def render_pick(
+        self,
+        project_root: Path,
+        scene_path: str,
+        scene_summary: SceneSummary,
+        camera: OrbitCamera,
+        width: int,
+        height: int,
+    ) -> PickBuffer:
+        self._begin_preview()
+        try:
+            return self._render_pick(
+                project_root,
+                scene_path,
+                scene_summary,
+                camera,
+                width,
+                height,
+            )
+        finally:
+            self._finish_preview()
+
+    def _render_pick(
+        self,
+        project_root: Path,
+        scene_path: str,
+        scene_summary: SceneSummary,
+        camera: OrbitCamera,
+        width: int,
+        height: int,
+    ) -> PickBuffer:
+        self._admit(scene_summary, width, height)
+        if self._live_session is not None:
+            try:
+                return self._live_session.render_preview_pick(
+                    project_root,
+                    scene_path,
+                    scene_summary,
+                    camera,
+                    width,
+                    height,
+                )
+            except PreviewRequestSuperseded as error:
+                raise ApiError(
+                    409,
+                    code="preview_session_closed",
+                    category="conflict",
+                    message="The preview session closed before rendering completed.",
+                    retryable=True,
+                ) from error
+            except PreviewSceneUnavailableError as error:
+                raise ApiError(
+                    409,
+                    code="scene_unavailable",
+                    category="project",
+                    message="The Gaussian scene is unavailable.",
+                ) from error
+            except PreviewSceneChangedError as error:
+                raise ApiError(
+                    409,
+                    code="scene_changed",
+                    category="conflict",
+                    message="The Gaussian scene no longer matches its imported summary.",
+                    retryable=True,
+                ) from error
+            except PreviewResourceError as error:
+                raise ApiError(
+                    422,
+                    code="scene_vram_limit_exceeded",
+                    category="resource",
+                    message="The Gaussian scene exceeds the available renderer memory.",
+                ) from error
+            except (GsVideoError, OSError) as error:
+                raise ApiError(
+                    500,
+                    code="preview_worker_failed",
+                    category="render",
+                    message="The isolated preview renderer failed.",
+                    retryable=True,
+                ) from error
         try:
             root = project_root.resolve(strict=True)
             scene = (root / scene_path).resolve(strict=True)

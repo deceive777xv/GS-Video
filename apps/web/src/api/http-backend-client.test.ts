@@ -36,6 +36,8 @@ const fakeBackendClient = (currentTask = task()): BackendClient => ({
   getProject: vi.fn(),
   updateProject: vi.fn(),
   renderPreview: vi.fn(),
+  renderLivePreview: vi.fn().mockResolvedValue(new Blob()),
+  closeLivePreview: vi.fn().mockResolvedValue(undefined),
   fetchPreviewArtifact: vi.fn(),
   pickFootPoint: vi.fn(),
   confirmCamera: vi.fn(),
@@ -323,6 +325,53 @@ describe('HttpBackendClient', () => {
     )
     expect(authorization).toEqual(['Bearer secret', 'Bearer secret'])
     expect(String(fetchImpl.mock.calls[1]?.[0])).not.toContain('secret')
+  })
+
+  it('returns a realtime JPEG preview as a blob', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(new Blob(['jpeg'], { type: 'image/jpeg' }), {
+        status: 200,
+        headers: { 'Content-Type': 'image/jpeg', 'X-Preview-Request-Id': '7' },
+      }),
+    )
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152', token: 'secret', fetchImpl,
+    })
+
+    const frame = await client.renderLivePreview({
+      request_id: 7,
+      width: 960,
+      height: 540,
+      camera: {
+        target: [0, 0, 0], distance: 4, yaw: 5, pitch: 0, fov_y_degrees: 55,
+      },
+    })
+
+    expect(frame.type).toBe('image/jpeg')
+    expect(String(fetchImpl.mock.calls[0]?.[0])).toContain('/projects/current/preview/live')
+    expect(fetchImpl.mock.calls[0]?.[1]?.body).toBe(JSON.stringify({
+      request_id: 7,
+      width: 960,
+      height: 540,
+      camera: {
+        target: [0, 0, 0], distance: 4, yaw: 5, pitch: 0, fov_y_degrees: 55,
+      },
+    }))
+  })
+
+  it('releases the resident realtime preview session', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(null, { status: 204 }),
+    )
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152', token: 'secret', fetchImpl,
+    })
+
+    await expect(client.closeLivePreview()).resolves.toBeUndefined()
+    expect(fetchImpl).toHaveBeenCalledWith(
+      expect.stringContaining('/projects/current/preview/live'),
+      expect.objectContaining({ method: 'DELETE' }),
+    )
   })
 
   it('binds a foot-point pick to the exact opaque preview artifact', async () => {

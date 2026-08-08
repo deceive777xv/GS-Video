@@ -29,6 +29,7 @@ from gs_video.api.schemas import (
     CameraInput,
     EnvironmentRepairSnapshot,
     HealthResponse,
+    LivePreviewRequest,
     PickRequest,
     PickResponse,
     PreviewFrameRequest,
@@ -153,6 +154,34 @@ def _environment_repair(request: Request) -> EnvironmentRepairLike:
 
 def _preview_service(request: Request) -> PreviewServiceLike:
     return cast(PreviewServiceLike, request.app.state.preview_service)
+
+
+def _close_live_preview_if_supported(service: object | None) -> None:
+    if service is None:
+        return
+    close_live = getattr(service, "close_live", None)
+    if callable(close_live):
+        close_live()
+
+
+def _suspend_live_preview_if_supported(service: object | None) -> object | None:
+    if service is None:
+        return None
+    suspend_live = getattr(service, "suspend_live", None)
+    if callable(suspend_live):
+        return cast(object, suspend_live())
+    _close_live_preview_if_supported(service)
+    return None
+
+
+def _resume_live_preview_if_supported(
+    service: object | None, token: object | None
+) -> None:
+    if service is None or token is None:
+        return
+    resume_live = getattr(service, "resume_live", None)
+    if callable(resume_live):
+        resume_live(token)
 
 
 def _preview_artifacts(request: Request) -> PreviewArtifactStore:
@@ -281,43 +310,53 @@ def _import_asset_sync(
             category="filesystem",
             message="The selected asset is unavailable.",
         )
-    destination = _confined_destination(
-        services.project_repository.root, "source", source.name
+    suspension = (
+        _suspend_live_preview_if_supported(services.preview_service)
+        if asset.kind == AssetKind.SCENE_PLY.value
+        else None
     )
-    size, sha256 = _copy_bounded(source, destination, settings.max_upload_size)
-    relative = destination.relative_to(
-        services.project_repository.root.resolve()
-    ).as_posix()
-    summary = None
-    if services.asset_inspector is not None:
-        try:
-            summary = services.asset_inspector.inspect(
-                asset.kind, destination, size=size, sha256=sha256
-            )
-        except Exception as error:
-            destination.unlink(missing_ok=True)
-            raise ApiError(
-                422,
-                code="unsupported_asset",
-                category="validation",
-                message="The selected asset is outside the supported MVP limits.",
-            ) from error
+    try:
+        destination = _confined_destination(
+            services.project_repository.root, "source", source.name
+        )
+        size, sha256 = _copy_bounded(
+            source, destination, settings.max_upload_size
+        )
+        relative = destination.relative_to(
+            services.project_repository.root.resolve()
+        ).as_posix()
+        summary = None
+        if services.asset_inspector is not None:
+            try:
+                summary = services.asset_inspector.inspect(
+                    asset.kind, destination, size=size, sha256=sha256
+                )
+            except Exception as error:
+                destination.unlink(missing_ok=True)
+                raise ApiError(
+                    422,
+                    code="unsupported_asset",
+                    category="validation",
+                    message="The selected asset is outside the supported MVP limits.",
+                ) from error
 
-    def persist(project: Project) -> None:
-        if asset.kind == AssetKind.SOURCE_VIDEO.value:
-            _replace_source_video(project, relative, cast(Any, summary))
-        else:
-            project.scene_ply = relative
-            project.workflow.scene_summary = cast(Any, summary)
-            invalidate_for_change(project, ChangeKind.TARGET_CAMERA)
-            project.workflow.target_camera = None
-            _clear_preview_authority(project)
-        project.workflow.export_result = None
+        def persist(project: Project) -> None:
+            if asset.kind == AssetKind.SOURCE_VIDEO.value:
+                _replace_source_video(project, relative, cast(Any, summary))
+            else:
+                project.scene_ply = relative
+                project.workflow.scene_summary = cast(Any, summary)
+                invalidate_for_change(project, ChangeKind.TARGET_CAMERA)
+                project.workflow.target_camera = None
+                _clear_preview_authority(project)
+            project.workflow.export_result = None
 
-    services.project_repository.update(persist)
-    return AssetResponse(
-        kind=asset.kind, path=relative, size=size, sha256=sha256
-    )
+        services.project_repository.update(persist)
+        return AssetResponse(
+            kind=asset.kind, path=relative, size=size, sha256=sha256
+        )
+    finally:
+        _resume_live_preview_if_supported(services.preview_service, suspension)
 
 
 def _replace_source_video(project: Project, relative: str, summary: Any) -> None:
@@ -362,7 +401,20 @@ def build_router() -> APIRouter:
     @protected.get("/api/v1/bootstrap", response_model=BootstrapResponse)
     async def bootstrap(request: Request) -> BootstrapResponse:
         services = _services(request)
-        environment = await asyncio.to_thread(services.environment_doctor.check)
+        suspension = await asyncio.to_thread(
+            _suspend_live_preview_if_supported,
+            services.preview_service,
+        )
+        try:
+            environment = await asyncio.to_thread(
+                services.environment_doctor.check
+            )
+        finally:
+            await asyncio.to_thread(
+                _resume_live_preview_if_supported,
+                services.preview_service,
+                suspension,
+            )
         capabilities: tuple[str, ...] = (
             "projects",
             "assets",
@@ -448,6 +500,52 @@ def build_router() -> APIRouter:
                 project.workflow.export_result = None
 
         return await asyncio.to_thread(repository.update, mutate)
+
+    @protected.post(
+        "/api/v1/projects/current/preview/live",
+        response_class=Response,
+    )
+    async def render_live_preview(
+        request: Request, preview: LivePreviewRequest
+    ) -> Response:
+        services = _services(request)
+        repository = services.project_repository
+        project = _load_project(repository)
+        scene_summary = project.workflow.scene_summary
+        if project.scene_ply is None or scene_summary is None:
+            raise ApiError(
+                409,
+                code="scene_required",
+                category="project",
+                message="Import a Gaussian scene before rendering a preview.",
+            )
+        payload = await asyncio.to_thread(
+            _preview_service(request).render_live,
+            repository.root,
+            project.scene_ply,
+            scene_summary.model_copy(deep=True),
+            preview.request_id,
+            _camera(preview.camera),
+            preview.width,
+            preview.height,
+        )
+        return Response(
+            content=payload,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "X-Preview-Request-Id": str(preview.request_id),
+            },
+        )
+
+    @protected.delete(
+        "/api/v1/projects/current/preview/live",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def close_live_preview(request: Request) -> Response:
+        await asyncio.to_thread(_preview_service(request).close_live)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @protected.post(
         "/api/v1/projects/current/preview",
@@ -781,35 +879,53 @@ def build_router() -> APIRouter:
                 message="The requested workflow stage is not assembled in this build.",
                 retryable=False,
             )
-        if stage in {
-            StageName.SEGMENT,
-            StageName.RENDER,
-            StageName.COMPOSITE,
-            StageName.EXPORT,
-        }:
-            repair = services.environment_repair
-            if repair is not None and repair.is_busy():
-                raise ApiError(
-                    503,
-                    code="environment_repair_in_progress",
-                    category="environment",
-                    message="Wait for environment repair to finish before starting this stage.",
-                    retryable=True,
-                )
-            report = await asyncio.to_thread(services.environment_doctor.check)
-            if not report.ready:
-                issue_codes = ", ".join(issue.code for issue in report.issues[:8])
-                raise ApiError(
-                    503,
-                    code="environment_not_ready",
-                    category="environment",
-                    message=(
-                        "Repair the local runtime before starting this stage"
-                        + (f": {issue_codes}" if issue_codes else ".")
-                    ),
-                    retryable=True,
-                )
-        snapshot = await _task_service(request).create(stage)
+        suspension = await asyncio.to_thread(
+            _suspend_live_preview_if_supported,
+            services.preview_service,
+        )
+
+        def release_suspension() -> None:
+            _resume_live_preview_if_supported(
+                services.preview_service, suspension
+            )
+        try:
+            if stage in {
+                StageName.SEGMENT,
+                StageName.RENDER,
+                StageName.COMPOSITE,
+                StageName.EXPORT,
+            }:
+                repair = services.environment_repair
+                if repair is not None and repair.is_busy():
+                    raise ApiError(
+                        503,
+                        code="environment_repair_in_progress",
+                        category="environment",
+                        message="Wait for environment repair to finish before starting this stage.",
+                        retryable=True,
+                    )
+                report = await asyncio.to_thread(services.environment_doctor.check)
+                if not report.ready:
+                    issue_codes = ", ".join(
+                        report_issue.code for report_issue in report.issues[:8]
+                    )
+                    raise ApiError(
+                        503,
+                        code="environment_not_ready",
+                        category="environment",
+                        message=(
+                            "Repair the local runtime before starting this stage"
+                            + (f": {issue_codes}" if issue_codes else ".")
+                        ),
+                        retryable=True,
+                    )
+            snapshot = await _task_service(request).create(
+                stage,
+                on_terminal=release_suspension,
+            )
+        except BaseException:
+            release_suspension()
+            raise
         repository = _services(request).project_repository
         await asyncio.to_thread(
             repository.update,
@@ -913,7 +1029,17 @@ def build_router() -> APIRouter:
                     _clear_preview_authority(project)
                 project.workflow.export_result = None
 
-            services.project_repository.update(update_project)
+            suspension = (
+                _suspend_live_preview_if_supported(services.preview_service)
+                if completed.kind == AssetKind.SCENE_PLY.value
+                else None
+            )
+            try:
+                services.project_repository.update(update_project)
+            finally:
+                _resume_live_preview_if_supported(
+                    services.preview_service, suspension
+                )
 
         return await asyncio.to_thread(
             _upload_manager(request).complete, upload_id, persist

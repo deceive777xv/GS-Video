@@ -165,6 +165,20 @@ class RendererWorkerClient:
             worker_path(startup_gate, self.worker_prefix),
         ]
 
+    def _popen_options(self) -> dict[str, object]:
+        options: dict[str, object] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "shell": False,
+        }
+        if os.name == "nt":
+            options["creationflags"] = (
+                subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            options["start_new_session"] = True
+        return options
+
     @staticmethod
     def _reap_direct_best_effort(process: Any) -> None:
         try:
@@ -189,17 +203,7 @@ class RendererWorkerClient:
     def _start_worker(
         self, request_path: Path, startup_gate: Path
     ) -> tuple[Any, ProcessTreeGuard]:
-        options: dict[str, object] = {
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-            "shell": False,
-        }
-        if os.name == "nt":
-            options["creationflags"] = (
-                subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-            )
-        else:
-            options["start_new_session"] = True
+        options = self._popen_options()
         process = self._process_factory(self._command(request_path, startup_gate), **options)
         try:
             guard = self._tree_guard_factory(process)

@@ -5,6 +5,7 @@ import type {
   ProjectDto,
   ProjectPatch,
   PreviewFrameDto,
+  LivePreviewRequest,
   PreviewRequest,
   PickRequest,
   FootPointDto,
@@ -43,6 +44,8 @@ export interface BackendClient {
     input: PreviewRequest,
     signal?: AbortSignal,
   ): Promise<PreviewFrameDto>
+  renderLivePreview(input: LivePreviewRequest, signal?: AbortSignal): Promise<Blob>
+  closeLivePreview(): Promise<void>
   fetchPreviewArtifact(id: string, signal?: AbortSignal): Promise<Blob>
   pickFootPoint(input: PickRequest): Promise<FootPointDto>
   confirmCamera(cameraRevision: number): Promise<ProjectDto>

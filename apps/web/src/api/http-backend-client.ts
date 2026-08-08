@@ -7,6 +7,7 @@ import type {
   ProjectDto,
   ProjectPatch,
   PreviewFrameDto,
+  LivePreviewRequest,
   PreviewRequest,
   PickRequest,
   FootPointDto,
@@ -256,6 +257,16 @@ export class HttpBackendClient implements BackendClient {
     const options: RequestOptions = { method: 'POST', json: input }
     if (signal !== undefined) options.signal = signal
     return this.#request('/projects/current/preview', options)
+  }
+
+  renderLivePreview(input: LivePreviewRequest, signal?: AbortSignal): Promise<Blob> {
+    const options: RequestOptions = { method: 'POST', json: input, response: 'blob' }
+    if (signal !== undefined) options.signal = signal
+    return this.#request('/projects/current/preview/live', options)
+  }
+
+  closeLivePreview(): Promise<void> {
+    return this.#request('/projects/current/preview/live', { method: 'DELETE' })
   }
 
   fetchPreviewArtifact(id: string, signal?: AbortSignal): Promise<Blob> {

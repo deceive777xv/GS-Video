@@ -1,9 +1,10 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { StrictMode } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { BackendClient } from '../../api/backend-client'
-import type { CameraDto, PreviewFrameDto, PreviewRequest } from '../../api/types'
+import type { CameraDto, LivePreviewRequest, PreviewFrameDto, PreviewRequest } from '../../api/types'
 import { SceneViewport, toImagePoint } from './scene-viewport'
 
 afterEach(() => vi.useRealTimers())
@@ -27,6 +28,96 @@ describe('toImagePoint', () => {
 })
 
 describe('SceneViewport', () => {
+  it('survives StrictMode effect replay and releases only after the final unmount', async () => {
+    const backend = {
+      renderLivePreview: vi.fn((_input, signal?: AbortSignal) => new Promise<Blob>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), {
+          once: true,
+        })
+      })),
+      closeLivePreview: vi.fn().mockResolvedValue(undefined),
+      renderPreview: vi.fn(() => new Promise<PreviewFrameDto>(() => undefined)),
+    } as unknown as BackendClient
+
+    const view = render(
+      <StrictMode>
+        <SceneViewport
+          backend={backend}
+          camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+          onError={vi.fn()}
+          onPreview={vi.fn()}
+        />
+      </StrictMode>,
+    )
+
+    await waitFor(() => expect(backend.renderLivePreview).toHaveBeenCalledTimes(2))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(backend.closeLivePreview).not.toHaveBeenCalled()
+
+    view.unmount()
+    await waitFor(() => expect(backend.closeLivePreview).toHaveBeenCalledOnce())
+  })
+
+  it('keeps one realtime request in flight and then renders only the latest camera', async () => {
+    const createUrl = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:live')
+    const liveRequests: LivePreviewRequest[] = []
+    const pending: Array<{ resolve(value: Blob): void }> = []
+    const backend = {
+      renderLivePreview: vi.fn((input) => {
+        liveRequests.push(input)
+        return new Promise<Blob>((resolve) => pending.push({ resolve }))
+      }),
+      renderPreview: vi.fn(() => new Promise<PreviewFrameDto>(() => undefined)),
+    } as unknown as BackendClient
+    render(
+      <SceneViewport
+        backend={backend}
+        camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        onError={vi.fn()}
+        onPreview={vi.fn()}
+      />,
+    )
+
+    await waitFor(() => expect(backend.renderLivePreview).toHaveBeenCalledTimes(1))
+    const viewport = screen.getByLabelText('Gaussian 场景视口')
+    fireEvent.pointerDown(viewport, { clientX: 10, clientY: 10, pointerId: 1 })
+    fireEvent.pointerMove(viewport, { clientX: 30, clientY: 10, pointerId: 1 })
+    fireEvent.pointerMove(viewport, { clientX: 70, clientY: 30, pointerId: 1 })
+    expect(backend.renderLivePreview).toHaveBeenCalledTimes(1)
+
+    await act(async () => pending[0]!.resolve(new Blob(['live'], { type: 'image/jpeg' })))
+
+    await waitFor(() => expect(backend.renderLivePreview).toHaveBeenCalledTimes(2))
+    expect(createUrl).toHaveBeenCalledOnce()
+    expect(liveRequests[1]!.camera).toMatchObject({ yaw: 15, pitch: 5 })
+    expect(screen.getByRole('button', { name: '确认初始机位' })).toBeDisabled()
+  })
+
+  it('stops realtime pumping and requests authority immediately after live failure', async () => {
+    vi.useFakeTimers()
+    const onError = vi.fn()
+    const backend = {
+      renderLivePreview: vi.fn().mockRejectedValue(new Error('live failed')),
+      closeLivePreview: vi.fn().mockResolvedValue(undefined),
+      renderPreview: vi.fn(() => new Promise<PreviewFrameDto>(() => undefined)),
+    } as unknown as BackendClient
+    render(
+      <SceneViewport
+        backend={backend}
+        camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        onError={onError}
+        onPreview={vi.fn()}
+      />,
+    )
+
+    await act(async () => { await Promise.resolve() })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(backend.renderLivePreview).toHaveBeenCalledOnce()
+    expect(backend.renderPreview).toHaveBeenCalledOnce()
+    expect(onError).toHaveBeenCalledWith('实时预览暂不可用，已切换到高质量预览。')
+  })
+
   it('commits precise Yaw and Pitch inputs with camera bounds', async () => {
     vi.useFakeTimers()
     const requests: PreviewRequest[] = []

@@ -44,6 +44,7 @@ from gs_video.pipeline.gpu import GpuAdmissionGate
 from gs_video.pipeline.workflow import WorkflowServices, build_mvp_workflow
 from gs_video.project.repository import ProjectInstanceLock, ProjectRepository
 from gs_video.scene.worker_client import RendererWorkerClient
+from gs_video.scene.preview_session import PreviewSession
 from gs_video.segmentation.client import VideoSegmenterClient
 from gs_video.segmentation.paths import has_reparse_component, is_wsl_prefix
 
@@ -365,6 +366,13 @@ def assemble_api_services(
         log_path=config.project_root / "logs" / "renderer-worker.log",
         gpu_gate=gpu_gate,
     )
+    preview_session = PreviewSession(
+        worker_prefix=config.renderer_worker_prefix,
+        sh_degree=config.renderer_sh_degree,
+        available_vram_limit_mb=config.available_vram_limit_mb,
+        log_path=config.project_root / "logs" / "preview-session-worker.log",
+        gpu_gate=gpu_gate,
+    )
     paths = WorkflowPaths(config.project_root, update_project=repository.update)
     workflow_services = WorkflowServices(
         media_ingest=MediaIngestService(paths),
@@ -471,11 +479,18 @@ def assemble_api_services(
     )
     runtime_root = config._workspace_root or config.project_root.parent.parent
     runtime_path = config._runtime_path or (runtime_root / "desktop-runtime.json")
+    preview_service = WorkerPreviewService(
+        renderer,
+        available_vram_limit_mb=config.available_vram_limit_mb,
+        live_session=preview_session,
+    )
     repair = EnvironmentRepairManager(
         repo_root=runtime_root.parent,
         runtime_root=runtime_root,
         runtime_config=runtime_path,
         environment_doctor=doctor,
+        acquire_runtime=preview_service.suspend_live,
+        release_runtime=preview_service.resume_live,
     )
     settings = ApiSettings(
         bind_host="127.0.0.1",
@@ -491,13 +506,11 @@ def assemble_api_services(
         worker_registry=WorkerRegistry(
             segmentation,
             renderer,
+            preview_session,
             gpu_gate=gpu_gate,
             project_lock=project_lock,
         ),
-        preview_service=WorkerPreviewService(
-            renderer,
-            available_vram_limit_mb=config.available_vram_limit_mb,
-        ),
+        preview_service=preview_service,
         asset_inspector=AssetInspector(),
         environment_repair=repair,
     )

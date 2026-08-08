@@ -173,6 +173,13 @@ class PreviewFrameRequest(StrictModel):
     camera: CameraInput
 
 
+class LivePreviewRequest(StrictModel):
+    request_id: int = Field(ge=1)
+    width: int = Field(gt=0, le=960)
+    height: int = Field(gt=0, le=540)
+    camera: CameraInput
+
+
 class PreviewFrameResponse(StrictModel):
     artifact_id: str
     generation: int

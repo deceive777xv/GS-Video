@@ -247,6 +247,13 @@ export interface PreviewRequest {
   camera: CameraInput
 }
 
+export interface LivePreviewRequest {
+  request_id: number
+  width: number
+  height: number
+  camera: CameraInput
+}
+
 export interface PreviewFrameDto {
   artifact_id: string
   generation: number

@@ -1,6 +1,8 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+from threading import Event
 from typing import Any, cast
 
 import pytest
@@ -147,6 +149,7 @@ def test_production_assembly_registers_every_stage(tmp_path: Path) -> None:
     assert isinstance(config, WorkflowRuntimeConfig)
     assert all(services.pipeline_runner.supports(stage) for stage in StageName)
     assert services.preview_service is not None
+    assert callable(services.preview_service.render_live)
     assert settings.bind_host == "127.0.0.1"
     assert settings.port == 0
 
@@ -252,3 +255,88 @@ def test_worker_preview_applies_conservative_configured_vram_limit(
         )
 
     assert error.value.envelope.code == "scene_vram_limit_exceeded"
+
+
+def test_worker_preview_suspension_drains_inflight_render_and_blocks_admission(
+    tmp_path: Path,
+) -> None:
+    class BlockingSession:
+        def __init__(self) -> None:
+            self.started = Event()
+            self.release = Event()
+            self.close_calls = 0
+
+        def render_live(self, *_args: object) -> bytes:
+            self.started.set()
+            assert self.release.wait(1.0)
+            return b"jpeg"
+
+        def render_preview_pick(self, *_args: object) -> object:
+            raise AssertionError("not used")
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    session = BlockingSession()
+    worker = cast(RendererWorkerClient, cast(Any, object()))
+    service = WorkerPreviewService(
+        worker,
+        available_vram_limit_mb=8192,
+        live_session=cast(Any, session),
+    )
+    summary = SceneSummary(
+        filename="scene.ply",
+        size=1,
+        sha256="0" * 64,
+        gaussian_count=1,
+        estimated_vram_mb=1,
+    )
+    camera = OrbitCamera(
+        target=(0.0, 0.0, 0.0),
+        distance=4.0,
+        yaw=0.0,
+        pitch=0.0,
+        fov_y_degrees=60.0,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        render = pool.submit(
+            service.render_live,
+            tmp_path,
+            "source/scene.ply",
+            summary,
+            1,
+            camera,
+            16,
+            9,
+        )
+        assert session.started.wait(1.0)
+        suspend = pool.submit(service.suspend_live)
+        assert suspend.done() is False
+        session.release.set()
+        assert render.result(timeout=1.0) == b"jpeg"
+        token = suspend.result(timeout=1.0)
+
+    with pytest.raises(ApiError) as error:
+        service.render_live(
+            tmp_path,
+            "source/scene.ply",
+            summary,
+            2,
+            camera,
+            16,
+            9,
+        )
+
+    assert error.value.envelope.code == "preview_suspended"
+    assert session.close_calls == 1
+    service.resume_live(token)
+    assert service.render_live(
+        tmp_path,
+        "source/scene.ply",
+        summary,
+        3,
+        camera,
+        16,
+        9,
+    ) == b"jpeg"

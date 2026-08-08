@@ -365,6 +365,51 @@ def test_render_pick_returns_only_rgb_and_expected_depth_without_writing(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_prepared_preview_uploads_scene_once_for_live_rgb_and_authoritative_depth() -> None:
+    class PreparingRasterizer(RecordingRasterizer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.prepare_calls = 0
+
+        def prepare_scene(self, runtime: dict[str, object]) -> dict[str, object]:
+            self.prepare_calls += 1
+            return dict(runtime)
+
+    rasterizer = PreparingRasterizer()
+    renderer = GsplatRenderer(rasterizer=rasterizer, device="cpu")
+    prepared = renderer.prepare_preview(
+        tiny_scene(), width=64, height=36, sh_degree=1
+    )
+
+    first = renderer.render_prepared_rgb(prepared, camera(), 64, 36)
+    second = renderer.render_prepared_rgb(prepared, camera(yaw=5.0), 64, 36)
+    pick = renderer.render_prepared_pick(prepared, camera(), 64, 36)
+
+    assert rasterizer.prepare_calls == 1
+    assert [call["render_mode"] for call in rasterizer.calls] == [
+        "RGB",
+        "RGB",
+        "RGB+ED",
+    ]
+    assert first.shape == second.shape == (36, 64, 3)
+    assert pick.expected_depth.shape == (36, 64)
+    with pytest.raises(ValueError, match="admitted size"):
+        renderer.render_prepared_rgb(prepared, camera(), 65, 36)
+
+
+def test_prepared_preview_clamps_configured_sh_degree_to_scene_coefficients() -> None:
+    rasterizer = RecordingRasterizer()
+    renderer = GsplatRenderer(rasterizer=rasterizer, device="cpu")
+
+    prepared = renderer.prepare_preview(
+        tiny_scene(coefficients=1), width=64, height=36, sh_degree=3
+    )
+    renderer.render_prepared_rgb(prepared, camera(), 64, 36)
+
+    assert prepared.sh_degree == 0
+    assert rasterizer.calls[0]["sh_degree"] == 0
+
+
 @pytest.mark.parametrize(("coefficients", "degree"), [(4, 1), (9, 2), (16, 3)])
 def test_render_pick_uses_all_available_scene_sh_coefficients(
     coefficients: int, degree: int

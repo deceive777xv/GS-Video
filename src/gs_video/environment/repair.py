@@ -40,6 +40,8 @@ class EnvironmentRepairManager:
         runner_path: Path | None = None,
         manifest_path: Path | None = None,
         popen: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
+        acquire_runtime: Callable[[], object] | None = None,
+        release_runtime: Callable[[object], None] | None = None,
     ) -> None:
         self._repo_root = repo_root.resolve(strict=False)
         self._runtime_root = runtime_root.resolve(strict=False)
@@ -52,6 +54,9 @@ class EnvironmentRepairManager:
             manifest_path or self._repo_root / "tools" / "runtime-manifest.json"
         ).resolve(strict=False)
         self._popen = popen
+        self._acquire_runtime = acquire_runtime
+        self._release_runtime = release_runtime
+        self._runtime_token: object | None = None
         self._lock = RLock()
         self._process: subprocess.Popen[str] | None = None
         self._reader: Thread | None = None
@@ -94,9 +99,32 @@ class EnvironmentRepairManager:
             repair_root = self._runtime_root / "repair"
             repair_root.mkdir(parents=True, exist_ok=True)
             job_id = f"repair-{uuid4().hex}"
-            self._claim_lease(repair_root / "lease.json", job_id)
+            if self._acquire_runtime is not None:
+                try:
+                    self._runtime_token = self._acquire_runtime()
+                except Exception:
+                    self._snapshot = self._failed_snapshot(
+                        code="repair_runtime_unavailable",
+                        message="环境修复前无法释放正在使用的运行时资源。",
+                        retryable=True,
+                    )
+                    return self._snapshot.model_copy(deep=True)
             cancel_file = repair_root / f"{job_id}.cancel"
-            cancel_file.unlink(missing_ok=True)
+            try:
+                self._claim_lease(repair_root / "lease.json", job_id)
+                cancel_file.unlink(missing_ok=True)
+            except EnvironmentRepairBusyError:
+                self._release_runtime_token()
+                raise
+            except OSError:
+                self._snapshot = self._failed_snapshot(
+                    code="repair_runtime_prepare_failed",
+                    message="环境修复无法建立受控运行目录。",
+                    retryable=True,
+                )
+                self._release_lease()
+                self._release_runtime_token()
+                return self._snapshot.model_copy(deep=True)
             self._cancel_file = cancel_file
             self._snapshot = EnvironmentRepairSnapshot(
                 state=EnvironmentRepairState.RUNNING,
@@ -145,14 +173,44 @@ class EnvironmentRepairManager:
                     retryable=True,
                 )
                 self._release_lease()
+                self._release_runtime_token()
                 return self._snapshot.model_copy(deep=True)
             self._process = process
-            self._write_lease(process.pid)
-            self._heartbeat_stop.clear()
-            self._heartbeat = Thread(target=self._heartbeat_loop, name="gs-video-repair-lease", daemon=True)
-            self._heartbeat.start()
-            self._reader = Thread(target=self._read_runner, args=(job_id, process), name="gs-video-repair-reader", daemon=True)
-            self._reader.start()
+            try:
+                self._write_lease(process.pid)
+                self._heartbeat_stop.clear()
+                self._heartbeat = Thread(
+                    target=self._heartbeat_loop,
+                    name="gs-video-repair-lease",
+                    daemon=True,
+                )
+                self._heartbeat.start()
+                self._reader = Thread(
+                    target=self._read_runner,
+                    args=(job_id, process),
+                    name="gs-video-repair-reader",
+                    daemon=True,
+                )
+                self._reader.start()
+            except Exception:
+                self._heartbeat_stop.set()
+                try:
+                    process.terminate()
+                    process.wait(timeout=2.0)
+                except (OSError, subprocess.TimeoutExpired):
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                self._process = None
+                self._snapshot = self._failed_snapshot(
+                    code="repair_runner_initialize_failed",
+                    message="环境修复进程启动后无法建立受控生命周期。",
+                    retryable=True,
+                )
+                self._release_lease()
+                self._release_runtime_token()
+                return self._snapshot.model_copy(deep=True)
             return self._snapshot.model_copy(deep=True)
 
     def cancel(self) -> EnvironmentRepairSnapshot:
@@ -313,10 +371,20 @@ class EnvironmentRepairManager:
             self._heartbeat_stop.set()
             self._release_lease()
             cancel_file = self._cancel_file
+            self._release_runtime_token()
             self._cancel_file = None
         if cancel_file is not None:
             cancel_file.unlink(missing_ok=True)
         self._persist_terminal(final)
+
+    def _release_runtime_token(self) -> None:
+        token = self._runtime_token
+        self._runtime_token = None
+        if token is not None and self._release_runtime is not None:
+            try:
+                self._release_runtime(token)
+            except Exception:
+                pass
 
     def _failed_snapshot(
         self, *, code: str, message: str, retryable: bool

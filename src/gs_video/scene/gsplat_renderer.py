@@ -5,9 +5,11 @@ import re
 import shutil
 import sys
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, RLock
+from time import perf_counter
 from typing import Any, Protocol
 
 import numpy as np
@@ -24,6 +26,22 @@ from gs_video.segmentation.paths import has_reparse_component
 
 
 Rasterizer = Callable[..., tuple[object, object, object]]
+
+
+@dataclass(frozen=True)
+class PreparedPreviewScene:
+    runtime: dict[str, object]
+    rasterizer: Rasterizer
+    metrics: CudaMetrics
+    sh_degree: int
+    maximum_width: int
+    maximum_height: int
+
+
+@dataclass(frozen=True)
+class PreparedPreviewTimings:
+    gpu_raster_ms: float
+    readback_ms: float
 
 
 class CudaMetrics(Protocol):
@@ -106,6 +124,16 @@ class GsplatRasterizerAdapter:
             return self._rasterization(**kwargs)
         with self._torch.inference_mode():
             return self._rasterization(**kwargs)
+
+    def prepare_scene(self, runtime: dict[str, object]) -> dict[str, object]:
+        if self._torch is None:
+            return dict(runtime)
+        return {
+            name: self._torch.as_tensor(
+                value, dtype=self._torch.float32, device=self._device
+            )
+            for name, value in runtime.items()
+        }
 
 
 def _load_gsplat_adapter(device: str) -> tuple[GsplatRasterizerAdapter, _TorchCudaMetrics]:
@@ -358,8 +386,7 @@ class GsplatRenderer:
     def _call(
         self,
         rasterizer: Rasterizer,
-        runtime: dict[str, npt.NDArray[np.float32]],
-        scene: GaussianScene,
+        runtime: Mapping[str, object],
         camera: OrbitCamera,
         settings: RenderSettings,
         render_mode: str,
@@ -422,7 +449,7 @@ class GsplatRenderer:
                 meta: object | None = None
                 try:
                     render, alpha, meta = self._call(
-                        rasterizer, runtime, scene, cameras[source_index], settings, "RGB"
+                        rasterizer, runtime, cameras[source_index], settings, "RGB"
                     )
                     token.raise_if_cancelled()
                     render_array, _alpha_array = self._validate_outputs(
@@ -463,6 +490,160 @@ class GsplatRenderer:
         with self._operation_lock:
             return self._render_pick_locked(scene, camera, width, height)
 
+    def prepare_preview(
+        self,
+        scene: GaussianScene,
+        *,
+        width: int,
+        height: int,
+        sh_degree: int,
+    ) -> PreparedPreviewScene:
+        with self._operation_lock:
+            effective_sh_degree = min(sh_degree, self._scene_sh_degree(scene))
+            settings = RenderSettings(
+                width=width, height=height, sh_degree=effective_sh_degree
+            )
+            self._validate_scene_settings(scene, settings)
+            rasterizer, metrics = self._dependencies()
+            self._admit(scene, width, height, metrics)
+            runtime: dict[str, object] = dict(_runtime_scene(scene))
+            prepare = getattr(rasterizer, "prepare_scene", None)
+            if callable(prepare):
+                runtime = dict(prepare(runtime))
+            return PreparedPreviewScene(
+                runtime=runtime,
+                rasterizer=rasterizer,
+                metrics=metrics,
+                sh_degree=effective_sh_degree,
+                maximum_width=width,
+                maximum_height=height,
+            )
+
+    @staticmethod
+    def _validate_prepared_size(
+        prepared: PreparedPreviewScene, width: int, height: int
+    ) -> None:
+        if (
+            type(width) is not int
+            or type(height) is not int
+            or width <= 0
+            or height <= 0
+            or width > prepared.maximum_width
+            or height > prepared.maximum_height
+        ):
+            raise ValueError("prepared preview dimensions exceed the admitted size")
+
+    def render_prepared_rgb(
+        self,
+        prepared: PreparedPreviewScene,
+        camera: OrbitCamera,
+        width: int,
+        height: int,
+    ) -> npt.NDArray[np.uint8]:
+        with self._operation_lock:
+            self._validate_prepared_size(prepared, width, height)
+            render: object | None = None
+            alpha: object | None = None
+            meta: object | None = None
+            try:
+                settings = RenderSettings(
+                    width=width, height=height, sh_degree=prepared.sh_degree
+                )
+                render, alpha, meta = self._call(
+                    prepared.rasterizer,
+                    prepared.runtime,
+                    camera,
+                    settings,
+                    "RGB",
+                )
+                render_array, _alpha_array = self._validate_outputs(
+                    render, alpha, width=width, height=height, channels=3
+                )
+                return np.ascontiguousarray(self._rgb8(render_array))
+            finally:
+                del render, alpha, meta
+                prepared.metrics.release_frame()
+
+    def render_prepared_rgb_profiled(
+        self,
+        prepared: PreparedPreviewScene,
+        camera: OrbitCamera,
+        width: int,
+        height: int,
+    ) -> tuple[npt.NDArray[np.uint8], PreparedPreviewTimings]:
+        with self._operation_lock:
+            self._validate_prepared_size(prepared, width, height)
+            render: object | None = None
+            alpha: object | None = None
+            meta: object | None = None
+            released = False
+            try:
+                settings = RenderSettings(
+                    width=width, height=height, sh_degree=prepared.sh_degree
+                )
+                started = perf_counter()
+                render, alpha, meta = self._call(
+                    prepared.rasterizer,
+                    prepared.runtime,
+                    camera,
+                    settings,
+                    "RGB",
+                )
+                prepared.metrics.release_frame()
+                released = True
+                raster_done = perf_counter()
+                render_array, _alpha_array = self._validate_outputs(
+                    render, alpha, width=width, height=height, channels=3
+                )
+                rgb = np.ascontiguousarray(self._rgb8(render_array))
+                readback_done = perf_counter()
+                return rgb, PreparedPreviewTimings(
+                    gpu_raster_ms=(raster_done - started) * 1000,
+                    readback_ms=(readback_done - raster_done) * 1000,
+                )
+            finally:
+                del render, alpha, meta
+                if not released:
+                    prepared.metrics.release_frame()
+
+    def render_prepared_pick(
+        self,
+        prepared: PreparedPreviewScene,
+        camera: OrbitCamera,
+        width: int,
+        height: int,
+    ) -> PickBuffer:
+        with self._operation_lock:
+            self._validate_prepared_size(prepared, width, height)
+            settings = RenderSettings(
+                width=width, height=height, sh_degree=prepared.sh_degree
+            )
+            render: object | None = None
+            alpha: object | None = None
+            meta: object | None = None
+            try:
+                render, alpha, meta = self._call(
+                    prepared.rasterizer,
+                    prepared.runtime,
+                    camera,
+                    settings,
+                    "RGB+ED",
+                )
+                render_array, _alpha_array = self._validate_outputs(
+                    render, alpha, width=width, height=height, channels=4
+                )
+                if np.any(render_array[0, ..., 3] < 0.0):
+                    raise GsVideoError("rasterizer expected depth must be nonnegative")
+                return PickBuffer(
+                    rgb=np.ascontiguousarray(self._rgb8(render_array)),
+                    expected_depth=np.ascontiguousarray(
+                        render_array[0, ..., 3], dtype=np.float32
+                    ),
+                )
+            finally:
+                del render, alpha, meta
+                prepared.metrics.release_frame()
+
     def _render_pick_locked(
         self, scene: GaussianScene, camera: OrbitCamera, width: int, height: int
     ) -> PickBuffer:
@@ -478,7 +659,7 @@ class GsplatRenderer:
         meta: object | None = None
         try:
             render, alpha, meta = self._call(
-                rasterizer, runtime, scene, camera, settings, "RGB+ED"
+                rasterizer, runtime, camera, settings, "RGB+ED"
             )
             render_array, _alpha_array = self._validate_outputs(
                 render, alpha, width=width, height=height, channels=4
