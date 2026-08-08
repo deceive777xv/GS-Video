@@ -1,5 +1,5 @@
 import { StrictMode } from 'react'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -306,6 +306,127 @@ describe('guided workflow', () => {
     expect(await screen.findByRole('heading', { name: '放置目标镜头' })).toBeInTheDocument()
     expect(harness.client.activateProject).toHaveBeenCalledWith('project-2')
     expect(window.location.hash).toBe('#/projects/project-2/workflow/camera')
+  })
+
+  it('opens the current project without waiting for a bootstrap refresh', async () => {
+    const current = project()
+    const initial = bootstrap(current)
+    initial.projects = [{
+      project_id: current.project_id,
+      name: current.name,
+      created_at: current.created_at,
+      updated_at: current.created_at,
+      workflow_step: 'import',
+      active_task_id: null,
+    }]
+    const harness = createHarness(current)
+    vi.mocked(harness.client.bootstrap).mockImplementation(
+      () => new Promise<BootstrapDto>(() => undefined),
+    )
+    window.location.hash = '#/'
+
+    render(
+      <App
+        backend={harness.client}
+        initialBootstrap={initial}
+        platform={harness.platform}
+        startAtHome
+      />,
+    )
+
+    await userEvent.click(screen.getByRole('button', { name: '继续制作' }))
+
+    await waitFor(() => {
+      expect(window.location.hash).toBe('#/projects/project-1/workflow/import')
+    }, { timeout: 250 })
+    expect(await screen.findByRole('heading', { name: '导入素材' })).toBeInTheDocument()
+    expect(harness.client.activateProject).not.toHaveBeenCalled()
+  })
+
+  it('waits only for target activation before opening another project', async () => {
+    const current = project()
+    const target = project()
+    target.project_id = 'project-2'
+    target.name = 'Second project'
+    const initial = bootstrap(current)
+    initial.projects = [current, target].map((item) => ({
+      project_id: item.project_id,
+      name: item.name,
+      created_at: item.created_at,
+      updated_at: item.created_at,
+      workflow_step: 'import',
+      active_task_id: null,
+    }))
+    const harness = createHarness(current)
+    let resolveActivation: ((value: ProjectDto) => void) | undefined
+    vi.mocked(harness.client.bootstrap).mockImplementation(
+      () => new Promise<BootstrapDto>(() => undefined),
+    )
+    vi.mocked(harness.client.activateProject).mockImplementation(() => (
+      new Promise<ProjectDto>((resolve) => { resolveActivation = resolve })
+    ))
+    window.location.hash = '#/'
+
+    render(
+      <App
+        backend={harness.client}
+        initialBootstrap={initial}
+        platform={harness.platform}
+        startAtHome
+      />,
+    )
+
+    const targetCard = screen.getByRole('heading', { name: target.name }).closest('article')
+    expect(targetCard).not.toBeNull()
+    await userEvent.click(within(targetCard!).getByRole('button', { name: '继续制作' }))
+    expect(window.location.hash).toBe('#/')
+
+    await act(async () => { resolveActivation?.(target) })
+
+    await waitFor(() => {
+      expect(window.location.hash).toBe('#/projects/project-2/workflow/import')
+    })
+    expect(harness.client.activateProject).toHaveBeenCalledTimes(1)
+    expect(harness.client.activateProject).toHaveBeenCalledWith('project-2')
+  })
+
+  it('stays on the project home when target activation fails', async () => {
+    const current = project()
+    const target = project()
+    target.project_id = 'project-2'
+    target.name = 'Unavailable project'
+    const initial = bootstrap(current)
+    initial.projects = [current, target].map((item) => ({
+      project_id: item.project_id,
+      name: item.name,
+      created_at: item.created_at,
+      updated_at: item.created_at,
+      workflow_step: 'import',
+      active_task_id: null,
+    }))
+    const harness = createHarness(current)
+    vi.mocked(harness.client.bootstrap).mockImplementation(
+      () => new Promise<BootstrapDto>(() => undefined),
+    )
+    vi.mocked(harness.client.activateProject).mockRejectedValue(new Error('Target unavailable'))
+    window.location.hash = '#/'
+
+    render(
+      <App
+        backend={harness.client}
+        initialBootstrap={initial}
+        platform={harness.platform}
+        startAtHome
+      />,
+    )
+
+    const targetCard = screen.getByRole('heading', { name: target.name }).closest('article')
+    expect(targetCard).not.toBeNull()
+    await userEvent.click(within(targetCard!).getByRole('button', { name: '继续制作' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Target unavailable')
+    expect(window.location.hash).toBe('#/')
+    expect(screen.getByRole('heading', { name: '从一个项目继续，或开始新的合成。' })).toBeInTheDocument()
   })
 
   it('completes the happy path with exactly three authoritative creative interactions', async () => {

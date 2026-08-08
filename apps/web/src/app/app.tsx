@@ -592,7 +592,6 @@ export function App({
         : await backend.activateProject(summary.project_id)
       acceptProject(next)
       setStep(workflowStepForProject(next))
-      await refreshCatalog()
       navigateWorkflow(next.project_id, workflowStepForProject(next))
     } catch (value) {
       reportUnknownError(value)
