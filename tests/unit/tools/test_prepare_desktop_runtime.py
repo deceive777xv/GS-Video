@@ -71,6 +71,28 @@ def test_prepare_desktop_runtime_does_not_rewrite_unchanged_file(
     assert runtime_path.stat().st_mtime_ns == original_mtime
 
 
+def test_prepare_desktop_runtime_preserves_machine_vram_preference(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "repo-preference").absolute()
+    root.mkdir()
+    create_runtime_layout(root)
+    settings_path = root / ".runtime" / "user-settings.json"
+    settings_path.write_text(
+        json.dumps({"mode": "custom", "selected_vram_mb": 16_384}),
+        encoding="utf-8",
+    )
+
+    runtime_path = prepare_desktop_runtime(root, validate=False)
+
+    payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+    assert payload["available_vram_limit_mb"] == 16_384
+    assert json.loads(settings_path.read_text(encoding="utf-8")) == {
+        "mode": "custom",
+        "selected_vram_mb": 16_384,
+    }
+
+
 def test_prepare_desktop_runtime_reports_missing_project_python(tmp_path: Path) -> None:
     root = (tmp_path / "repo").absolute()
     root.mkdir()

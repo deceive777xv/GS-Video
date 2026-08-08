@@ -83,6 +83,7 @@ def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
     app.state.services = services
     app.state.event_bus = event_bus
     app.state.task_service = task_service
+    app.state.runtime_change_lock = asyncio.Lock()
     app.state.upload_manager = upload_manager
     app.state.preview_service = services.preview_service
     app.state.preview_artifacts = PreviewArtifactStore(

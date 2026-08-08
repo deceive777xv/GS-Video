@@ -20,10 +20,14 @@ import type {
   SubjectMediaDto,
   SubjectMediaRole,
   EnvironmentRepairSnapshotDto,
+  VramBudgetDto,
+  VramBudgetUpdate,
 } from './types'
 
 export interface BackendClient {
   bootstrap(signal?: AbortSignal): Promise<BootstrapDto>
+  getVramBudget(): Promise<VramBudgetDto>
+  updateVramBudget(input: VramBudgetUpdate): Promise<VramBudgetDto>
   getEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto>
   startEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto>
   cancelEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto>

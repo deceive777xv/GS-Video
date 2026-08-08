@@ -36,7 +36,7 @@ class OpenPreviewSessionRequest(_StrictModel):
     sh_degree: int = Field(strict=True, ge=0, le=3)
     maximum_width: int = Field(strict=True, gt=0, le=960)
     maximum_height: int = Field(strict=True, gt=0, le=540)
-    available_vram_limit_mb: int = Field(strict=True, ge=1024, le=8192)
+    available_vram_limit_mb: int = Field(strict=True, ge=1024)
     initial_camera: OrbitCameraPayload
 
     @field_validator("scene_path", "output_root")

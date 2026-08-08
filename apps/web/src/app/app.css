@@ -131,9 +131,37 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 .project-heading span { color: var(--muted); font-size: 0.75rem; }
 .project-heading strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.88rem; }
 .header-status { display: flex; align-items: center; gap: 0.55rem; color: var(--muted); font-size: 0.72rem; }
-.header-status strong { color: var(--acid); border: 1px solid rgba(183, 246, 61, 0.3); border-radius: 99px; padding: 0.25rem 0.55rem; }
 .connection-dot { width: 7px; height: 7px; border-radius: 50%; background: #68737a; box-shadow: 0 0 0 4px rgba(104,115,122,0.1); }
 .connection-connected { background: var(--cyan); box-shadow: 0 0 0 4px rgba(85,214,194,0.12); }
+
+.vram-budget-control { position: relative; }
+.vram-budget-trigger { min-height: 0; border-color: rgba(183, 246, 61, 0.3); border-radius: 99px; padding: 0.32rem 0.62rem; color: var(--acid); background: rgba(183, 246, 61, 0.06); font-size: 0.7rem; line-height: 1; white-space: nowrap; }
+.vram-budget-panel { position: absolute; top: calc(100% + 0.75rem); right: 0; width: min(370px, calc(100vw - 2rem)); display: grid; gap: 0.9rem; padding: 1rem; border: 1px solid #39464d; border-top: 2px solid var(--acid); border-radius: 10px; color: var(--text); background: linear-gradient(155deg, rgba(21, 28, 33, 0.99), rgba(8, 12, 15, 0.99)); box-shadow: 0 24px 70px rgba(0, 0, 0, 0.52); font-size: 0.74rem; }
+.vram-budget-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+.vram-budget-heading > span { color: var(--muted); font-size: 0.68rem; letter-spacing: 0.08em; text-transform: uppercase; }
+.vram-budget-heading strong { color: var(--acid); font-size: 1rem; }
+.vram-budget-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.55rem; margin: 0; }
+.vram-budget-stats div { padding: 0.65rem; border: 1px solid var(--line); border-radius: 7px; background: rgba(255,255,255,0.018); }
+.vram-budget-stats dt { color: var(--muted); font-size: 0.62rem; }
+.vram-budget-stats dd { margin: 0.25rem 0 0; color: var(--text); font-weight: 700; }
+.vram-budget-panel fieldset { display: grid; gap: 0.45rem; margin: 0; padding: 0; border: 0; }
+.vram-budget-panel legend { margin-bottom: 0.35rem; color: var(--muted); font-size: 0.65rem; }
+.vram-budget-panel fieldset label { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 0.65rem; padding: 0.65rem; border: 1px solid var(--line); border-radius: 7px; cursor: pointer; }
+.vram-budget-panel fieldset label:has(input:checked) { border-color: rgba(183,246,61,0.45); background: var(--acid-soft); }
+.vram-budget-panel fieldset input { accent-color: var(--acid); }
+.vram-budget-panel fieldset span { display: grid; gap: 0.12rem; }
+.vram-budget-panel fieldset small, .vram-custom-controls > small { color: var(--muted); font-size: 0.62rem; font-weight: 400; line-height: 1.4; }
+.vram-custom-controls { display: grid; gap: 0.5rem; }
+.vram-custom-controls > label { color: #c5cfca; font-size: 0.68rem; }
+.vram-custom-controls > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.5rem; }
+.vram-custom-controls input[type="number"] { width: 100%; border: 1px solid #3a464d; border-radius: 6px; padding: 0.58rem; color: var(--text); background: #090d10; }
+.vram-custom-controls input[type="range"] { width: 100%; accent-color: var(--acid); }
+.vram-custom-controls button { min-height: 0; padding: 0.48rem 0.62rem; font-size: 0.66rem; }
+.vram-budget-notice, .vram-budget-error { margin: 0; padding: 0.62rem; border-radius: 6px; line-height: 1.45; }
+.vram-budget-notice { color: #d8e4de; background: rgba(85,214,194,0.09); }
+.vram-budget-error { color: #ffd2d2; background: rgba(117,47,54,0.35); }
+.vram-budget-actions { display: flex; justify-content: flex-end; gap: 0.55rem; padding-top: 0.2rem; }
+.vram-budget-actions button { min-height: 36px; padding: 0.45rem 0.8rem; font-size: 0.7rem; }
 
 .workspace { display: grid; grid-template-columns: 230px minmax(0, 1fr); min-height: 0; }
 .workflow-rail { border-right: 1px solid var(--line); background: rgba(12, 16, 19, 0.84); padding: 1.5rem 0.9rem; }

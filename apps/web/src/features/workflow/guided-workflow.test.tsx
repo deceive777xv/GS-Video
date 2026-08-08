@@ -81,6 +81,15 @@ function bootstrap(current: ProjectDto): BootstrapDto {
       issues: [],
       renderer_versions: { renderer: 'fake' },
     },
+    vram_budget: {
+      mode: 'standard',
+      minimum_vram_mb: 1024,
+      total_vram_mb: 8192,
+      selected_vram_mb: 8192,
+      editable: true,
+      blocked_reason: null,
+      recovered_from_invalid_preference: false,
+    },
   }
 }
 
@@ -96,6 +105,12 @@ function createHarness(initial = project()) {
   })
   const client: BackendClient = {
     bootstrap: vi.fn(async () => bootstrap(current)),
+    getVramBudget: vi.fn().mockResolvedValue(bootstrap(current).vram_budget),
+    updateVramBudget: vi.fn(async (input) => ({
+      ...bootstrap(current).vram_budget,
+      mode: input.mode,
+      selected_vram_mb: input.mode === 'standard' ? 8192 : input.selected_vram_mb,
+    })),
     getEnvironmentRepair: vi.fn().mockResolvedValue({
       state: 'idle',
       job_id: null,

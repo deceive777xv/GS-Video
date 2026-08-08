@@ -162,11 +162,28 @@ export interface EnvironmentDto {
   renderer_versions: Record<string, string> | null
 }
 
+export type VramBudgetMode = 'standard' | 'custom'
+
+export interface VramBudgetDto {
+  mode: VramBudgetMode
+  minimum_vram_mb: number
+  total_vram_mb: number
+  selected_vram_mb: number
+  editable: boolean
+  blocked_reason: string | null
+  recovered_from_invalid_preference: boolean
+}
+
+export type VramBudgetUpdate =
+  | { mode: 'standard'; selected_vram_mb: null }
+  | { mode: 'custom'; selected_vram_mb: number }
+
 export interface BootstrapDto {
   api_version: string
   capabilities: string[]
   project: ProjectDto
   environment: EnvironmentDto
+  vram_budget: VramBudgetDto
 }
 
 export type EnvironmentRepairState =

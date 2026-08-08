@@ -318,7 +318,7 @@ export function ImportPage({
             <dl className="asset-stats">
               <div><dt>Gaussian</dt><dd>{scene.gaussian_count.toLocaleString()}</dd></div>
               <div><dt>预计显存</dt><dd>{scene.estimated_vram_mb.toLocaleString()} MB / {environment.vram_limit_mb.toLocaleString()} MB</dd></div>
-              <div><dt>预算</dt><dd>{scene.estimated_vram_mb <= environment.vram_mb ? '可尝试' : '建议降采样'}</dd></div>
+              <div><dt>预算</dt><dd>{scene.estimated_vram_mb <= environment.vram_limit_mb ? '可尝试' : '建议降采样'}</dd></div>
             </dl>
           )}
           <button disabled={busy || importing || cancelling} onClick={() => void importAsset('scene_ply')} type="button">选择 Gaussian 场景</button>

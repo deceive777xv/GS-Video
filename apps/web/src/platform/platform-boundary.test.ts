@@ -23,6 +23,15 @@ const bootstrap = {
     issues: [],
     renderer_versions: null,
   },
+  vram_budget: {
+    mode: 'standard',
+    minimum_vram_mb: 1024,
+    total_vram_mb: 8192,
+    selected_vram_mb: 8192,
+    editable: true,
+    blocked_reason: null,
+    recovered_from_invalid_preference: false,
+  },
   project: {
     schema_version: 3,
     project_id: 'project-1',
@@ -51,6 +60,8 @@ const bootstrap = {
 
 const fakeClient = (): BackendClient => ({
   bootstrap: vi.fn().mockResolvedValue(bootstrap),
+  getVramBudget: vi.fn().mockResolvedValue(bootstrap.vram_budget),
+  updateVramBudget: vi.fn().mockResolvedValue(bootstrap.vram_budget),
   getEnvironmentRepair: vi.fn().mockResolvedValue({
     state: 'idle',
     job_id: null,

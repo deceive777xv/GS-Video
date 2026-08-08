@@ -26,6 +26,11 @@ from gs_video.domain.models import (
     SubjectPromptState,
 )
 from gs_video.domain.errors import GsVideoError
+from gs_video.environment.vram import (
+    VramLimitProvider,
+    resolve_vram_limit_mb,
+    validated_vram_limit_mb,
+)
 from gs_video.pipeline.artifacts import validate_cache_key
 from gs_video.scene.camera import OrbitCamera
 from gs_video.scene.gsplat_renderer import GsplatRenderer
@@ -735,15 +740,13 @@ class WorkerPreviewService:
         worker: RendererWorkerClient,
         *,
         available_vram_limit_mb: int = 8192,
+        vram_limit_provider: VramLimitProvider | None = None,
         live_session: LivePreviewSessionLike | None = None,
     ) -> None:
-        if (
-            type(available_vram_limit_mb) is not int
-            or not 1024 <= available_vram_limit_mb <= 8192
-        ):
-            raise ValueError("available_vram_limit_mb must be between 1024 and 8192")
+        validated_vram_limit_mb(available_vram_limit_mb)
         self._worker = worker
         self._available_vram_limit_mb = available_vram_limit_mb
+        self._vram_limit_provider = vram_limit_provider
         self._live_session = live_session
         self._admission = Condition()
         self._active_calls = 0
@@ -789,7 +792,11 @@ class WorkerPreviewService:
         estimated_vram_mb = scene_summary.estimated_vram_mb + (
             extra_framebuffer_bytes + 1024**2 - 1
         ) // 1024**2
-        if estimated_vram_mb * 5 > self._available_vram_limit_mb * 4:
+        available_vram_limit_mb = resolve_vram_limit_mb(
+            self._available_vram_limit_mb,
+            self._vram_limit_provider,
+        )
+        if estimated_vram_mb * 5 > available_vram_limit_mb * 4:
             raise ApiError(
                 422,
                 code="scene_vram_limit_exceeded",

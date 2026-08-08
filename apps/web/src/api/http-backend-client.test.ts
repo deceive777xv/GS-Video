@@ -24,6 +24,8 @@ const task = (revision = 9): TaskDto => ({
 
 const fakeBackendClient = (currentTask = task()): BackendClient => ({
   bootstrap: vi.fn(),
+  getVramBudget: vi.fn(),
+  updateVramBudget: vi.fn(),
   getEnvironmentRepair: vi.fn(),
   startEnvironmentRepair: vi.fn(),
   cancelEnvironmentRepair: vi.fn(),
@@ -96,6 +98,42 @@ afterEach(() => {
 })
 
 describe('HttpBackendClient', () => {
+  it('updates the authenticated VRAM budget endpoint with a strict PATCH body', async () => {
+    const snapshot = {
+      mode: 'custom',
+      minimum_vram_mb: 1024,
+      total_vram_mb: 24_576,
+      selected_vram_mb: 12_288,
+      editable: true,
+      blocked_reason: null,
+      recovered_from_invalid_preference: false,
+    }
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(snapshot), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152',
+      token: 'secret',
+      fetchImpl,
+    })
+
+    await expect(client.updateVramBudget({
+      mode: 'custom',
+      selected_vram_mb: 12_288,
+    })).resolves.toEqual(snapshot)
+
+    const [url, init] = fetchImpl.mock.calls[0] ?? []
+    expect(url).toBe('http://127.0.0.1:49152/api/v1/runtime/vram-budget')
+    expect(init?.method).toBe('PATCH')
+    expect(init?.body).toBe(JSON.stringify({
+      mode: 'custom',
+      selected_vram_mb: 12_288,
+    }))
+  })
+
   it('uses the versioned endpoint and keeps the bearer token out of the URL', async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(JSON.stringify(task()), {

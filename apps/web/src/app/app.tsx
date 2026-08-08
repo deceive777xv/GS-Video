@@ -14,13 +14,14 @@ import {
   type TaskStore,
   useTaskStore,
 } from '../api/task-events'
-import type { BootstrapDto, ProjectDto, StageName, TaskDto } from '../api/types'
+import type { BootstrapDto, ProjectDto, StageName, TaskDto, VramBudgetDto } from '../api/types'
 import type { PlatformBridge } from '../platform/platform-bridge'
 import { CameraPage } from '../features/camera/camera-page'
 import { ExportPage } from '../features/export/export-page'
 import { ImportPage } from '../features/import/import-page'
 import { PreviewPage } from '../features/preview/preview-page'
 import { SubjectPage } from '../features/subject/subject-page'
+import { VramBudgetControl } from '../features/settings/vram-budget-control'
 import {
   canAdvance,
   canVisitStep,
@@ -261,6 +262,18 @@ export function App({
     setStep(workflowStepForProject(next.project))
   }, [acceptProject, backend])
 
+  const acceptVramBudget = useCallback((next: VramBudgetDto): void => {
+    setBootstrap((current) => current === null ? null : {
+      ...current,
+      environment: {
+        ...current.environment,
+        vram_mb: next.total_vram_mb,
+        vram_limit_mb: next.selected_vram_mb,
+      },
+      vram_budget: next,
+    })
+  }, [])
+
   useEffect(() => {
     const latest = taskState.latestEvent
     if (latest === null) return
@@ -469,7 +482,12 @@ export function App({
         <div className="header-status">
           <span className={`connection-dot connection-${taskState.connection}`} />
           <span>{taskState.connection === 'connected' ? '实时事件已连接' : 'REST 权威恢复可用'}</span>
-          <strong>8 GB 模式</strong>
+          <VramBudgetControl
+            backend={backend}
+            budget={bootstrap.vram_budget}
+            busy={startingStage || activeTaskRunning || unresolvedProjectOwner}
+            onBudgetChange={acceptVramBudget}
+          />
         </div>
       </header>
 

@@ -41,6 +41,7 @@ from gs_video.api.schemas import (
     UploadCreateRequest,
     UploadCreated,
     UploadStatus,
+    VramBudgetUpdate,
 )
 from gs_video.api.subject_routes import build_subject_router
 from gs_video.api.uploads import UploadManager, read_bounded_body
@@ -64,6 +65,14 @@ from gs_video.domain.models import (
 )
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.environment.repair import EnvironmentRepairBusyError
+from gs_video.environment.vram import (
+    STANDARD_VRAM_MB,
+    VramBudgetManager,
+    VramBudgetMode,
+    VramBudgetPersistenceError,
+    VramBudgetSnapshot,
+    VramBudgetUnavailableError,
+)
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter, discard_progress
 from gs_video.pipeline.workflow import ChangeKind, invalidate_for_change
@@ -121,6 +130,7 @@ class ApiServices:
     asset_inspector: AssetInspectorLike | None = None
     export_inspector: ExportInspectorLike | None = None
     environment_repair: EnvironmentRepairLike | None = None
+    vram_budget: VramBudgetManager | None = None
 
 
 def _services(request: Request) -> ApiServices:
@@ -150,6 +160,61 @@ def _environment_repair(request: Request) -> EnvironmentRepairLike:
             retryable=False,
         )
     return repair
+
+
+_VRAM_BLOCKING_STAGES = {
+    StageName.SEGMENT,
+    StageName.RENDER,
+    StageName.COMPOSITE,
+    StageName.EXPORT,
+}
+
+
+def _runtime_change_lock(request: Request) -> asyncio.Lock:
+    return cast(asyncio.Lock, request.app.state.runtime_change_lock)
+
+
+def _vram_budget(request: Request) -> VramBudgetManager:
+    budget = _services(request).vram_budget
+    if budget is None:
+        raise ApiError(
+            503,
+            code="vram_budget_unavailable",
+            category="runtime",
+            message="VRAM budget configuration is unavailable in this local service.",
+            retryable=True,
+        )
+    return budget
+
+
+def _vram_blocked_reason(
+    request: Request, *, include_update: bool = True
+) -> str | None:
+    if _task_service(request).is_busy(_VRAM_BLOCKING_STAGES):
+        return "gpu_task_active"
+    repair = _services(request).environment_repair
+    if repair is not None and repair.is_busy():
+        return "environment_repair_active"
+    if include_update and _runtime_change_lock(request).locked():
+        return "update_in_progress"
+    return None
+
+
+def _fallback_vram_snapshot(environment: EnvironmentReport) -> VramBudgetSnapshot:
+    total = max(0, environment.vram_mb)
+    selected = max(1024, environment.vram_limit_mb)
+    mode = (
+        VramBudgetMode.STANDARD
+        if total < 1024 or selected == min(STANDARD_VRAM_MB, total)
+        else VramBudgetMode.CUSTOM
+    )
+    return VramBudgetSnapshot(
+        mode=mode,
+        total_vram_mb=total,
+        selected_vram_mb=selected,
+        editable=False,
+        blocked_reason="vram_budget_unavailable",
+    )
 
 
 def _preview_service(request: Request) -> PreviewServiceLike:
@@ -424,12 +489,97 @@ def build_router() -> APIRouter:
         )
         if services.environment_repair is not None:
             capabilities = (*capabilities, "environment_repair")
+        if services.vram_budget is not None:
+            capabilities = (*capabilities, "vram_budget")
+        blocked_reason = _vram_blocked_reason(request)
+        budget = (
+            services.vram_budget.snapshot(
+                editable=blocked_reason is None,
+                blocked_reason=blocked_reason,
+            )
+            if services.vram_budget is not None
+            else _fallback_vram_snapshot(environment)
+        )
         return BootstrapResponse(
             api_version=API_VERSION,
             capabilities=capabilities,
             project=_load_project(services.project_repository),
             environment=environment,
+            vram_budget=budget,
         )
+
+    @protected.get(
+        "/api/v1/runtime/vram-budget",
+        response_model=VramBudgetSnapshot,
+    )
+    async def get_vram_budget(request: Request) -> VramBudgetSnapshot:
+        blocked_reason = _vram_blocked_reason(request)
+        return await asyncio.to_thread(
+            _vram_budget(request).snapshot,
+            editable=blocked_reason is None,
+            blocked_reason=blocked_reason,
+        )
+
+    @protected.patch(
+        "/api/v1/runtime/vram-budget",
+        response_model=VramBudgetSnapshot,
+    )
+    async def patch_vram_budget(
+        request: Request,
+        update: VramBudgetUpdate,
+    ) -> VramBudgetSnapshot:
+        async with _runtime_change_lock(request):
+            blocked_reason = _vram_blocked_reason(request, include_update=False)
+            if blocked_reason is not None:
+                raise ApiError(
+                    409,
+                    code="vram_budget_busy",
+                    category="conflict",
+                    message="Wait for the active GPU task or environment repair to finish.",
+                    retryable=True,
+                )
+            services = _services(request)
+            suspension = await asyncio.to_thread(
+                _suspend_live_preview_if_supported,
+                services.preview_service,
+            )
+            try:
+                try:
+                    return await asyncio.to_thread(
+                        _vram_budget(request).update,
+                        update.mode,
+                        update.selected_vram_mb,
+                    )
+                except ValueError as error:
+                    raise ApiError(
+                        422,
+                        code="invalid_vram_budget",
+                        category="validation",
+                        message=str(error),
+                        retryable=False,
+                    ) from error
+                except VramBudgetUnavailableError as error:
+                    raise ApiError(
+                        503,
+                        code="vram_budget_gpu_unavailable",
+                        category="runtime",
+                        message="Physical GPU memory could not be detected.",
+                        retryable=True,
+                    ) from error
+                except VramBudgetPersistenceError as error:
+                    raise ApiError(
+                        500,
+                        code="vram_budget_save_failed",
+                        category="runtime",
+                        message="The VRAM preference could not be saved.",
+                        retryable=True,
+                    ) from error
+            finally:
+                await asyncio.to_thread(
+                    _resume_live_preview_if_supported,
+                    services.preview_service,
+                    suspension,
+                )
 
     @protected.get(
         "/api/v1/environment/repair",
@@ -445,16 +595,17 @@ def build_router() -> APIRouter:
     )
     async def start_environment_repair(request: Request) -> EnvironmentRepairSnapshot:
         repair = _environment_repair(request)
-        try:
-            return await asyncio.to_thread(repair.start)
-        except EnvironmentRepairBusyError as error:
-            raise ApiError(
-                409,
-                code="environment_repair_busy",
-                category="environment",
-                message="Another environment repair is already active.",
-                retryable=True,
-            ) from error
+        async with _runtime_change_lock(request):
+            try:
+                return await asyncio.to_thread(repair.start)
+            except EnvironmentRepairBusyError as error:
+                raise ApiError(
+                    409,
+                    code="environment_repair_busy",
+                    category="environment",
+                    message="Another environment repair is already active.",
+                    retryable=True,
+                ) from error
 
     @protected.delete(
         "/api/v1/environment/repair",
@@ -879,16 +1030,20 @@ def build_router() -> APIRouter:
                 message="The requested workflow stage is not assembled in this build.",
                 retryable=False,
             )
-        suspension = await asyncio.to_thread(
-            _suspend_live_preview_if_supported,
-            services.preview_service,
-        )
+        runtime_lock = _runtime_change_lock(request)
+        await runtime_lock.acquire()
+        suspension: object | None = None
 
         def release_suspension() -> None:
-            _resume_live_preview_if_supported(
-                services.preview_service, suspension
-            )
+            if suspension is not None:
+                _resume_live_preview_if_supported(
+                    services.preview_service, suspension
+                )
         try:
+            suspension = await asyncio.to_thread(
+                _suspend_live_preview_if_supported,
+                services.preview_service,
+            )
             if stage in {
                 StageName.SEGMENT,
                 StageName.RENDER,
@@ -926,6 +1081,8 @@ def build_router() -> APIRouter:
         except BaseException:
             release_suspension()
             raise
+        finally:
+            runtime_lock.release()
         repository = _services(request).project_repository
         await asyncio.to_thread(
             repository.update,

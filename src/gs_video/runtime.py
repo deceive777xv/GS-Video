@@ -28,6 +28,7 @@ from gs_video.domain.contracts import SegmentationBackend
 from gs_video.domain.errors import GsVideoError
 from gs_video.environment.doctor import EnvironmentDoctor
 from gs_video.environment.repair import EnvironmentRepairManager
+from gs_video.environment.vram import VramBudgetManager
 from gs_video.media.toolchain import executable_name
 from gs_video.pipeline.services import (
     CameraSolveWorkflowService,
@@ -112,7 +113,7 @@ class WorkflowRuntimeConfig(BaseModel):
     segmentation_checkpoint: Path
     renderer_worker_prefix: tuple[str, ...]
     renderer_sh_degree: int = Field(default=3, ge=0, le=3)
-    available_vram_limit_mb: int = Field(default=8192, ge=1024, le=8192)
+    available_vram_limit_mb: int = Field(default=8192, ge=1024)
 
     _workspace_root: Path | None = PrivateAttr(default=None)
     _runtime_path: Path | None = PrivateAttr(default=None)
@@ -366,37 +367,6 @@ def assemble_api_services(
         log_path=config.project_root / "logs" / "renderer-worker.log",
         gpu_gate=gpu_gate,
     )
-    preview_session = PreviewSession(
-        worker_prefix=config.renderer_worker_prefix,
-        sh_degree=config.renderer_sh_degree,
-        available_vram_limit_mb=config.available_vram_limit_mb,
-        log_path=config.project_root / "logs" / "preview-session-worker.log",
-        gpu_gate=gpu_gate,
-    )
-    paths = WorkflowPaths(config.project_root, update_project=repository.update)
-    workflow_services = WorkflowServices(
-        media_ingest=MediaIngestService(paths),
-        segmenter=SegmentWorkflowService(paths, segmentation),
-        camera_solver=CameraSolveWorkflowService(paths),
-        trajectory_mapper=TrajectoryMapWorkflowService(paths),
-        renderer=RendererWorkflowService(
-            paths,
-            renderer,
-            sh_degree=config.renderer_sh_degree,
-            available_vram_limit_mb=config.available_vram_limit_mb,
-        ),
-        compositor=CompositeWorkflowService(paths),
-        exporter=ExportWorkflowService(paths),
-    )
-    runner = build_mvp_workflow(
-        workflow_services,
-        project,
-        save=repository.save,
-        persist_stage=repository.update_stage,
-        compare_and_set_stage=repository.compare_and_set_stage,
-        claim_stage=repository.claim_stage,
-    )
-
     identity_lock = Lock()
     identity_attempted = False
     renderer_identity: object | None = None
@@ -412,19 +382,56 @@ def assemble_api_services(
                 identity_attempted = True
             return renderer_identity
 
+    def total_vram_probe() -> int:
+        identity = probe_identity()
+        return int(getattr(identity, "total_vram_mb", 0))
+
+    runtime_root = config._workspace_root or config.project_root.parent.parent
+    vram_budget = VramBudgetManager(
+        runtime_root / "user-settings.json",
+        total_vram_probe=total_vram_probe,
+        initial_limit_mb=config.available_vram_limit_mb,
+    )
+    preview_session = PreviewSession(
+        worker_prefix=config.renderer_worker_prefix,
+        sh_degree=config.renderer_sh_degree,
+        available_vram_limit_mb=config.available_vram_limit_mb,
+        vram_limit_provider=vram_budget.current_limit_mb,
+        log_path=config.project_root / "logs" / "preview-session-worker.log",
+        gpu_gate=gpu_gate,
+    )
+    paths = WorkflowPaths(config.project_root, update_project=repository.update)
+    workflow_services = WorkflowServices(
+        media_ingest=MediaIngestService(paths),
+        segmenter=SegmentWorkflowService(paths, segmentation),
+        camera_solver=CameraSolveWorkflowService(paths),
+        trajectory_mapper=TrajectoryMapWorkflowService(paths),
+        renderer=RendererWorkflowService(
+            paths,
+            renderer,
+            sh_degree=config.renderer_sh_degree,
+            available_vram_limit_mb=config.available_vram_limit_mb,
+            vram_limit_provider=vram_budget.current_limit_mb,
+        ),
+        compositor=CompositeWorkflowService(paths),
+        exporter=ExportWorkflowService(paths),
+    )
+    runner = build_mvp_workflow(
+        workflow_services,
+        project,
+        save=repository.save,
+        persist_stage=repository.update_stage,
+        compare_and_set_stage=repository.compare_and_set_stage,
+        claim_stage=repository.claim_stage,
+    )
+
     def external_cuda_probe() -> tuple[bool, int]:
         identity = probe_identity()
         device = getattr(identity, "device", "")
         available = isinstance(device, str) and device.lower().startswith("cuda")
         return (
             available,
-            min(
-                int(getattr(identity, "free_vram_mb", 0)),
-                int(getattr(identity, "total_vram_mb", 0)),
-                config.available_vram_limit_mb,
-            )
-            if available
-            else 0,
+            int(getattr(identity, "total_vram_mb", 0)) if available else 0,
         )
 
     def external_renderer_probe() -> tuple[str | None, str | None]:
@@ -476,12 +483,13 @@ def assemble_api_services(
         renderer_probe=external_renderer_probe,
         process_runner=admitted_process_run,
         vram_limit_mb=config.available_vram_limit_mb,
+        vram_limit_provider=vram_budget.current_limit_mb,
     )
-    runtime_root = config._workspace_root or config.project_root.parent.parent
     runtime_path = config._runtime_path or (runtime_root / "desktop-runtime.json")
     preview_service = WorkerPreviewService(
         renderer,
         available_vram_limit_mb=config.available_vram_limit_mb,
+        vram_limit_provider=vram_budget.current_limit_mb,
         live_session=preview_session,
     )
     repair = EnvironmentRepairManager(
@@ -513,6 +521,7 @@ def assemble_api_services(
         preview_service=preview_service,
         asset_inspector=AssetInspector(),
         environment_repair=repair,
+        vram_budget=vram_budget,
     )
     return settings, services
 

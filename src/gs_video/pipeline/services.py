@@ -34,6 +34,11 @@ from gs_video.domain.contracts import (
     StageResult,
 )
 from gs_video.domain.errors import RepairableError
+from gs_video.environment.vram import (
+    VramLimitProvider,
+    resolve_vram_limit_mb,
+    validated_vram_limit_mb,
+)
 from gs_video.domain.models import (
     ArtifactRole,
     Project,
@@ -1178,18 +1183,16 @@ class RendererWorkflowService:
         *,
         sh_degree: int = 3,
         available_vram_limit_mb: int = 8192,
+        vram_limit_provider: VramLimitProvider | None = None,
     ) -> None:
         if type(sh_degree) is not int or not 0 <= sh_degree <= 3:
             raise ValueError("sh_degree must be an integer between 0 and 3")
-        if (
-            type(available_vram_limit_mb) is not int
-            or not 1024 <= available_vram_limit_mb <= 8192
-        ):
-            raise ValueError("available_vram_limit_mb must be between 1024 and 8192")
+        validated_vram_limit_mb(available_vram_limit_mb)
         self.paths = paths
         self.worker = worker
         self.sh_degree = sh_degree
         self.available_vram_limit_mb = available_vram_limit_mb
+        self._vram_limit_provider = vram_limit_provider
 
     def run(
         self,
@@ -1242,7 +1245,11 @@ class RendererWorkflowService:
         estimated_vram_mb = scene_summary.estimated_vram_mb + (
             extra_framebuffer_bytes + 1024**2 - 1
         ) // 1024**2
-        if estimated_vram_mb * 5 > self.available_vram_limit_mb * 4:
+        available_vram_limit_mb = resolve_vram_limit_mb(
+            self.available_vram_limit_mb,
+            self._vram_limit_provider,
+        )
+        if estimated_vram_mb * 5 > available_vram_limit_mb * 4:
             raise RepairableError("Gaussian 场景超过配置的保守显存预算")
         identity = self.worker.probe(token=token)
         expected_implementation = f"gsplat-{identity.gsplat}"

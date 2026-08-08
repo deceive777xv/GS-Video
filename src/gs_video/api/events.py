@@ -246,6 +246,13 @@ class TaskService:
                 message="The requested task was not found.",
             ) from error
 
+    def is_busy(self, stages: set[StageName] | None = None) -> bool:
+        return any(
+            snapshot.status in {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
+            and (stages is None or StageName(snapshot.target_stage) in stages)
+            for snapshot in self._snapshots.values()
+        )
+
     async def _update(
         self,
         task_id: str,

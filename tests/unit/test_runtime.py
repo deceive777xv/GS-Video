@@ -86,6 +86,19 @@ def test_runtime_config_accepts_wsl_segmentation_worker_prefix(
     )
 
 
+def test_runtime_config_accepts_vram_budget_above_legacy_eight_gib(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-large-vram"
+    workspace.mkdir()
+    payload = runtime_payload(workspace)
+    payload["available_vram_limit_mb"] = 24_576
+
+    config = load_runtime_config(write_runtime(workspace, payload))
+
+    assert config.available_vram_limit_mb == 24_576
+
+
 @pytest.mark.parametrize("field", ["token", "port", "origin", "allowed_origins"])
 def test_runtime_config_rejects_launcher_or_secret_fields(
     tmp_path: Path, field: str
@@ -253,6 +266,32 @@ def test_worker_preview_applies_conservative_configured_vram_limit(
             960,
             540,
         )
+
+    assert error.value.envelope.code == "scene_vram_limit_exceeded"
+
+
+def test_worker_preview_reads_dynamic_vram_budget_for_each_admission(
+    tmp_path: Path,
+) -> None:
+    selected = [10_000]
+    worker = cast(RendererWorkerClient, cast(Any, object()))
+    service = WorkerPreviewService(
+        worker,
+        available_vram_limit_mb=8192,
+        vram_limit_provider=lambda: selected[0],
+    )
+    summary = SceneSummary(
+        filename="scene.ply",
+        size=1,
+        sha256="0" * 64,
+        gaussian_count=1,
+        estimated_vram_mb=7_000,
+    )
+
+    service._admit(summary, 960, 540)
+    selected[0] = 8_192
+    with pytest.raises(ApiError) as error:
+        service._admit(summary, 960, 540)
 
     assert error.value.envelope.code == "scene_vram_limit_exceeded"
 

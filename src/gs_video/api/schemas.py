@@ -17,6 +17,7 @@ from pydantic import (
 
 from gs_video.domain.models import Project, StageName
 from gs_video.environment.doctor import EnvironmentReport
+from gs_video.environment.vram import VramBudgetMode, VramBudgetSnapshot
 
 
 API_VERSION = "v1"
@@ -101,6 +102,29 @@ class BootstrapResponse(StrictModel):
     capabilities: tuple[str, ...]
     project: Project
     environment: EnvironmentReport
+    vram_budget: VramBudgetSnapshot
+
+
+class VramBudgetUpdate(StrictModel):
+    mode: VramBudgetMode
+    selected_vram_mb: int | None = Field(default=None, strict=True, ge=1024)
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def parse_mode(cls, value: object) -> VramBudgetMode:
+        if isinstance(value, VramBudgetMode):
+            return value
+        if type(value) is str:
+            return VramBudgetMode(value)
+        raise ValueError("VRAM mode must be standard or custom")
+
+    @model_validator(mode="after")
+    def validate_mode_value(self) -> VramBudgetUpdate:
+        if self.mode is VramBudgetMode.CUSTOM and self.selected_vram_mb is None:
+            raise ValueError("custom VRAM mode requires selected_vram_mb")
+        if self.mode is VramBudgetMode.STANDARD and self.selected_vram_mb is not None:
+            raise ValueError("standard VRAM mode does not accept selected_vram_mb")
+        return self
 
 
 class EnvironmentRepairState(StrEnum):

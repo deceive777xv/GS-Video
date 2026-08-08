@@ -33,6 +33,20 @@ def test_doctor_reports_ready_environment() -> None:
     assert report.issues == []
 
 
+def test_doctor_reads_current_vram_budget_without_truncating_physical_total() -> None:
+    selected = 12_288
+    doctor = EnvironmentDoctor(
+        which=lambda name: f"C:/{name}.exe",
+        cuda_probe=lambda: (True, 24_576),
+        vram_limit_provider=lambda: selected,
+    )
+
+    report = doctor.check()
+
+    assert report.vram_mb == 24_576
+    assert report.vram_limit_mb == 12_288
+
+
 def test_doctor_preserves_vram_when_only_ffprobe_is_missing() -> None:
     doctor = EnvironmentDoctor(
         which=lambda name: "C:/ffmpeg.exe" if name == "ffmpeg" else None,

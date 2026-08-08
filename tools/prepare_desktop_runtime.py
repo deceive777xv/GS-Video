@@ -53,6 +53,11 @@ def _runtime_payload(
         raise DesktopRuntimeError(
             f"repository root is unavailable: {repo_root.absolute()}"
         ) from error
+    source_root = root / "src"
+    if str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
+    from gs_video.environment.vram import load_user_vram_limit
+
     _required_file(root / ".venv" / "Scripts" / "python.exe", "project Python", root)
     runtime_root = _confined_path(root / ".runtime", "project runtime", root, strict=False)
     edgetam_root = runtime_root / "segmentation" / "EdgeTAM"
@@ -89,7 +94,9 @@ def _runtime_payload(
         "segmentation_checkpoint": str(checkpoint),
         "renderer_worker_prefix": [str(renderer_python)],
         "renderer_sh_degree": 3,
-        "available_vram_limit_mb": 8192,
+        "available_vram_limit_mb": load_user_vram_limit(
+            runtime_root / "user-settings.json"
+        ),
     }
 
 

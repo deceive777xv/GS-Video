@@ -19,6 +19,11 @@ from PIL import Image
 from gs_video.domain.contracts import PickBuffer
 from gs_video.domain.errors import GsVideoError
 from gs_video.domain.models import SceneSummary
+from gs_video.environment.vram import (
+    VramLimitProvider,
+    resolve_vram_limit_mb,
+    validated_vram_limit_mb,
+)
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.scene.camera import OrbitCamera
 from gs_video.scene.preview_protocol import (
@@ -84,6 +89,7 @@ class PreviewSession(RendererWorkerClient):
         worker_prefix: tuple[str, ...],
         sh_degree: int,
         available_vram_limit_mb: int,
+        vram_limit_provider: VramLimitProvider | None = None,
         process_factory: Any = subprocess.Popen,
         tree_guard_factory: Any = None,
         log_path: Path | None = None,
@@ -92,11 +98,7 @@ class PreviewSession(RendererWorkerClient):
     ) -> None:
         if type(sh_degree) is not int or not 0 <= sh_degree <= 3:
             raise ValueError("sh_degree must be between 0 and 3")
-        if (
-            type(available_vram_limit_mb) is not int
-            or not 1024 <= available_vram_limit_mb <= 8192
-        ):
-            raise ValueError("available_vram_limit_mb must be between 1024 and 8192")
+        validated_vram_limit_mb(available_vram_limit_mb)
         if (
             isinstance(idle_timeout_seconds, bool)
             or not isinstance(idle_timeout_seconds, (int, float))
@@ -114,6 +116,7 @@ class PreviewSession(RendererWorkerClient):
         super().__init__(**options)  # type: ignore[arg-type]
         self._sh_degree = sh_degree
         self._available_vram_limit_mb = available_vram_limit_mb
+        self._vram_limit_provider = vram_limit_provider
         self._session_lock = threading.RLock()
         self._session: _SessionProcess | None = None
         self._internal_request_id = 0
@@ -315,7 +318,10 @@ class PreviewSession(RendererWorkerClient):
                 sh_degree=self._sh_degree,
                 maximum_width=960,
                 maximum_height=540,
-                available_vram_limit_mb=self._available_vram_limit_mb,
+                available_vram_limit_mb=resolve_vram_limit_mb(
+                    self._available_vram_limit_mb,
+                    self._vram_limit_provider,
+                ),
                 initial_camera=self._camera_payload(camera),
             ),
         )

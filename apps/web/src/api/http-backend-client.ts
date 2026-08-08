@@ -23,6 +23,8 @@ import type {
   SubjectMediaDto,
   SubjectMediaRole,
   EnvironmentRepairSnapshotDto,
+  VramBudgetDto,
+  VramBudgetUpdate,
 } from './types'
 
 const API_PREFIX = '/api/v1'
@@ -187,6 +189,14 @@ export class HttpBackendClient implements BackendClient {
     return signal === undefined
       ? this.#request('/bootstrap')
       : this.#request('/bootstrap', { signal })
+  }
+
+  getVramBudget(): Promise<VramBudgetDto> {
+    return this.#request('/runtime/vram-budget')
+  }
+
+  updateVramBudget(input: VramBudgetUpdate): Promise<VramBudgetDto> {
+    return this.#request('/runtime/vram-budget', { method: 'PATCH', json: input })
   }
 
   getEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto> {

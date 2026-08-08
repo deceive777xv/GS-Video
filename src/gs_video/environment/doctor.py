@@ -12,6 +12,11 @@ from typing import Any
 from pydantic import BaseModel
 
 from gs_video.domain.contracts import SegmentationBackend
+from gs_video.environment.vram import (
+    VramLimitProvider,
+    resolve_vram_limit_mb,
+    validated_vram_limit_mb,
+)
 from gs_video.segmentation.paths import has_reparse_component, worker_path
 
 
@@ -79,6 +84,7 @@ class EnvironmentDoctor:
         check_renderer: bool = False,
         renderer_probe: Callable[[], tuple[str | None, str | None]] = probe_renderer,
         vram_limit_mb: int = 8192,
+        vram_limit_provider: VramLimitProvider | None = None,
     ) -> None:
         self._which = which
         self._cuda_probe = cuda_probe
@@ -89,7 +95,8 @@ class EnvironmentDoctor:
         self._process_runner = process_runner
         self._check_renderer = check_renderer
         self._renderer_probe = renderer_probe
-        self._vram_limit_mb = vram_limit_mb
+        self._vram_limit_mb = validated_vram_limit_mb(vram_limit_mb)
+        self._vram_limit_provider = vram_limit_provider
 
     def _renderer_versions(self, issues: list[EnvironmentIssue]) -> dict[str, str] | None:
         if not self._check_renderer:
@@ -218,7 +225,10 @@ class EnvironmentDoctor:
         return EnvironmentReport(
             ready=not issues,
             vram_mb=vram_mb,
-            vram_limit_mb=self._vram_limit_mb,
+            vram_limit_mb=resolve_vram_limit_mb(
+                self._vram_limit_mb,
+                self._vram_limit_provider,
+            ),
             issues=issues,
             renderer_versions=renderer_versions,
         )
