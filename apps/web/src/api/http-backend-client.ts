@@ -421,10 +421,10 @@ export class HttpBackendClient implements BackendClient {
     )
   }
 
-  startTask(targetStage: StageName): Promise<TaskDto> {
+  startTask(targetStage: StageName, expectedProjectId: string): Promise<TaskDto> {
     return this.#request('/tasks', {
       method: 'POST',
-      json: { target_stage: targetStage },
+      json: { expected_project_id: expectedProjectId, target_stage: targetStage },
     })
   }
 

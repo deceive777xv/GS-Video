@@ -373,6 +373,7 @@ class AssetResponse(StrictModel):
 
 
 class TaskCreateRequest(StrictModel):
+    expected_project_id: str | None = Field(default=None, min_length=1)
     target_stage: str
 
     @field_validator("target_stage")

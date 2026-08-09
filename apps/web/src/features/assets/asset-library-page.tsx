@@ -11,6 +11,7 @@ interface AssetLibraryPageProps {
   kind: LibraryAssetKind
   platform: PlatformBridge
   project: ProjectDto | null
+  selectionAuthority: number
   returnProjectId: string | null
   onError(error: unknown): void
   onProjectChange(project: ProjectDto, context: AssetSelectionContext): void | Promise<void>
@@ -18,6 +19,7 @@ interface AssetLibraryPageProps {
 
 export interface AssetSelectionContext {
   expectedProjectId: string
+  selectionAuthority: number
   returnProjectId: string | null
 }
 
@@ -32,7 +34,7 @@ function formatBytes(value: number): string {
   return `${(value / 1024 ** 3).toFixed(2)} GB`
 }
 
-export function AssetLibraryPage({ backend, busy, kind, platform, project, returnProjectId, onError, onProjectChange }: AssetLibraryPageProps) {
+export function AssetLibraryPage({ backend, busy, kind, platform, project, selectionAuthority, returnProjectId, onError, onProjectChange }: AssetLibraryPageProps) {
   const [items, setItems] = useState<AssetListItemDto[]>([])
   const [loading, setLoading] = useState(true)
   const [importing, setImporting] = useState(false)
@@ -100,7 +102,7 @@ export function AssetLibraryPage({ backend, busy, kind, platform, project, retur
   const selectAsset = async (assetId: string): Promise<void> => {
     const expectedProjectId = project?.project_id
     if (selectingId !== null || expectedProjectId === undefined) return
-    const context = { expectedProjectId, returnProjectId }
+    const context = { expectedProjectId, selectionAuthority, returnProjectId }
     setSelectingId(assetId)
     try {
       await onProjectChange(

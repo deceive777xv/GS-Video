@@ -296,6 +296,30 @@ def test_task_preflight_rechecks_environment_after_bootstrap(tmp_path: Path) -> 
     }
 
 
+def test_task_creation_rejects_a_stale_project_context(tmp_path: Path) -> None:
+    app, _ = make_app(tmp_path)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tasks",
+            json={
+                "expected_project_id": "stale-project-id",
+                "target_stage": "ingest",
+            },
+            headers=headers,
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "code": "project_context_changed",
+        "category": "conflict",
+        "message": "The active project changed before the task was created.",
+        "retryable": True,
+    }
+    assert app.state.task_service.is_busy() is False
+
+
 def test_task_preflight_rechecks_remaining_cache_capacity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

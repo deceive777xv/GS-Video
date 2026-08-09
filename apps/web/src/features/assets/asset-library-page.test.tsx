@@ -24,7 +24,7 @@ describe('AssetLibraryPage', () => {
     } as unknown as BackendClient
     const platform = { kind: 'browser', pickInputFile: vi.fn() } as unknown as PlatformBridge
 
-    render(<AssetLibraryPage backend={backend} busy={false} kind="video" onError={vi.fn()} onProjectChange={vi.fn()} platform={platform} project={null} returnProjectId="project-1" />)
+    render(<AssetLibraryPage backend={backend} busy={false} kind="video" onError={vi.fn()} onProjectChange={vi.fn()} platform={platform} project={null} returnProjectId="project-1" selectionAuthority={0} />)
 
     await waitFor(() => expect(screen.getByText('clip.mp4')).toBeInTheDocument())
     expect(screen.getByRole('link', { name: '视频' })).toHaveAttribute('href', '#/assets/video?returnProject=project-1')
@@ -51,7 +51,7 @@ describe('AssetLibraryPage', () => {
     } as unknown as ProjectDto
     const user = userEvent.setup()
 
-    render(<AssetLibraryPage backend={backend} busy={false} kind="video" onError={vi.fn()} onProjectChange={vi.fn()} platform={platform} project={project} returnProjectId="project-1" />)
+    render(<AssetLibraryPage backend={backend} busy={false} kind="video" onError={vi.fn()} onProjectChange={vi.fn()} platform={platform} project={project} returnProjectId="project-1" selectionAuthority={0} />)
 
     const select = await screen.findByRole('button', { name: '用于当前项目' })
     await user.click(select)

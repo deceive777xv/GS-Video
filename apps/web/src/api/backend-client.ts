@@ -82,7 +82,7 @@ export interface BackendClient {
     id: string,
     signal?: AbortSignal,
   ): Promise<Blob>
-  startTask(targetStage: StageName): Promise<TaskDto>
+  startTask(targetStage: StageName, expectedProjectId: string): Promise<TaskDto>
   getTask(id: string): Promise<TaskDto>
   cancelTask(id: string): Promise<TaskDto>
 }

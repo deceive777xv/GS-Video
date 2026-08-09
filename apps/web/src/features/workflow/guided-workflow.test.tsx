@@ -388,7 +388,7 @@ describe('guided workflow', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: '下一步' })).toBeEnabled())
   })
 
-  it('ignores an asset selection completion after another project becomes active', async () => {
+  it('ignores an asset selection completion after another project switch begins', async () => {
     const first = project()
     first.source_video_asset_id = 'asset-video'
     first.workflow.source_summary = {
@@ -413,7 +413,10 @@ describe('guided workflow', () => {
     vi.mocked(harness.client.bootstrap).mockImplementation(
       () => new Promise<BootstrapDto>(() => undefined),
     )
-    vi.mocked(harness.client.activateProject).mockResolvedValue(second)
+    let resolveActivation: ((value: ProjectDto) => void) | undefined
+    vi.mocked(harness.client.activateProject).mockImplementation(() => (
+      new Promise<ProjectDto>((resolve) => { resolveActivation = resolve })
+    ))
     let resolveSelection: ((value: ProjectDto) => void) | undefined
     vi.mocked(harness.client.selectProjectAsset).mockImplementation(() => (
       new Promise<ProjectDto>((resolve) => { resolveSelection = resolve })
@@ -427,17 +430,18 @@ describe('guided workflow', () => {
     await user.click(screen.getByRole('link', { name: '返回项目首页' }))
     const secondCard = (await screen.findByRole('heading', { name: second.name })).closest('article')
     expect(secondCard).not.toBeNull()
-    await user.click(within(secondCard!).getByRole('button', { name: '继续制作' }))
-    expect(await screen.findByText('Second project')).toBeVisible()
+    void user.click(within(secondCard!).getByRole('button', { name: '继续制作' }))
+    await waitFor(() => expect(harness.client.activateProject).toHaveBeenCalledWith('project-2'))
 
     const stale = structuredClone(first)
     stale.scene_ply_asset_id = 'asset-ply'
     stale.workflow.scene_summary = libraryPly().asset.scene_summary
     await act(async () => { resolveSelection?.(stale) })
 
+    expect(harness.client.startTask).not.toHaveBeenCalled()
+    await act(async () => { resolveActivation?.(second) })
     expect(screen.getByText('Second project')).toBeVisible()
     expect(window.location.hash).toBe('#/projects/project-2/workflow/import')
-    expect(harness.client.startTask).not.toHaveBeenCalled()
   })
 
   it('opens a project-aware workflow URL and restores its requested step', async () => {
@@ -692,7 +696,7 @@ describe('guided workflow', () => {
     render(<App backend={harness.client} initialBootstrap={bootstrap(gated)} platform={harness.platform} />)
 
     expect(screen.getByRole('button', { name: /机位/ })).toBeDisabled()
-    await waitFor(() => expect(harness.client.startTask).toHaveBeenCalledWith('solve_camera'))
+    await waitFor(() => expect(harness.client.startTask).toHaveBeenCalledWith('solve_camera', gated.project_id))
   })
 
   it('owns and disposes its task store once across StrictMode cleanup', async () => {

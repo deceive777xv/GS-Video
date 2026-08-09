@@ -1785,6 +1785,18 @@ def build_router() -> APIRouter:
                     services.preview_service, suspension
                 )
         try:
+            current = await asyncio.to_thread(services.project_repository.load)
+            if (
+                task.expected_project_id is not None
+                and current.project_id != task.expected_project_id
+            ):
+                raise ApiError(
+                    409,
+                    code="project_context_changed",
+                    category="conflict",
+                    message="The active project changed before the task was created.",
+                    retryable=True,
+                )
             suspension = await asyncio.to_thread(
                 _suspend_live_preview_if_supported,
                 services.preview_service,
