@@ -6,7 +6,7 @@ import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any, BinaryIO, Protocol, cast
 from uuid import uuid4
 
@@ -1784,6 +1784,22 @@ def build_router() -> APIRouter:
                 _resume_live_preview_if_supported(
                     services.preview_service, suspension
                 )
+
+        async def prepare_task() -> None:
+            nonlocal suspension
+            suspension = await asyncio.to_thread(
+                _suspend_live_preview_if_supported,
+                services.preview_service,
+            )
+
+        async def persist_task_owner(snapshot: TaskSnapshot) -> None:
+            await asyncio.to_thread(
+                services.project_repository.update,
+                lambda project: setattr(
+                    project.workflow, "active_task_id", snapshot.id
+                ),
+            )
+
         try:
             if (
                 services.project_manager is not None
@@ -1808,16 +1824,10 @@ def build_router() -> APIRouter:
                     message="The active project changed before the task was created.",
                     retryable=True,
                 )
-            suspension = await asyncio.to_thread(
-                _suspend_live_preview_if_supported,
-                services.preview_service,
-            )
-            if stage in {
-                StageName.SEGMENT,
-                StageName.RENDER,
-                StageName.COMPOSITE,
-                StageName.EXPORT,
-            }:
+            prepare: Callable[[], Awaitable[None]] | None = prepare_task
+            if stage in _VRAM_BLOCKING_STAGES:
+                await prepare_task()
+                prepare = None
                 repair = services.environment_repair
                 if repair is not None and repair.is_busy():
                     raise ApiError(
@@ -1847,13 +1857,9 @@ def build_router() -> APIRouter:
             )
             snapshot = await _task_service(request).create(
                 stage,
+                before_start=persist_task_owner,
+                prepare=prepare,
                 on_terminal=release_suspension,
-            )
-            await asyncio.to_thread(
-                services.project_repository.update,
-                lambda project: setattr(
-                    project.workflow, "active_task_id", snapshot.id
-                ),
             )
         except BaseException:
             release_suspension()

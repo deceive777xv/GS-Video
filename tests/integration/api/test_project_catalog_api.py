@@ -186,7 +186,7 @@ def test_multi_project_task_creation_requires_expected_project_id(
     assert response.json()["code"] == "project_context_required"
 
 
-def test_task_owner_is_persisted_before_project_activation_can_continue(
+def test_task_owner_is_persisted_before_project_activation_is_rejected(
     catalog_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -240,8 +240,8 @@ def test_task_owner_is_persisted_before_project_activation_can_continue(
         activation_response = activation_future.result(timeout=2)
 
     assert task_response.status_code == 202
-    assert activation_response.status_code == 200
-    assert activation_response.json()["workflow"]["active_task_id"] is None
+    assert activation_response.status_code == 409
+    assert activation_response.json()["code"] == "project_task_active"
 
 
 def test_shared_assets_are_separated_referenced_and_protected(

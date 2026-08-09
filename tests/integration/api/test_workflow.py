@@ -891,6 +891,49 @@ def test_started_task_id_is_recoverable_from_project_snapshot(
     assert workflow_client.app.state.preview_service.close_calls == 1
 
 
+def test_task_creation_returns_while_live_preview_is_draining(
+    workflow_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    class DrainingPreviewService(PreviewService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.drain_started = Event()
+            self.allow_drain = Event()
+
+        def suspend_live(self) -> object:
+            self.drain_started.set()
+            assert self.allow_drain.wait(2)
+            return super().suspend_live()
+
+    preview = DrainingPreviewService()
+    workflow_client.app.state.preview_service = preview
+    workflow_client.app.state.services = replace(
+        workflow_client.app.state.services,
+        preview_service=preview,
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(
+            workflow_client.post,
+            "/api/v1/tasks",
+            json={"target_stage": "ingest"},
+            headers=auth_headers,
+        )
+        assert preview.drain_started.wait(1)
+        response = None
+        try:
+            response = pending.result(timeout=0.5)
+        except TimeoutError:
+            pass
+        finally:
+            preview.allow_drain.set()
+        returned_while_draining = response is not None
+        if response is None:
+            response = pending.result(timeout=2)
+
+    assert returned_while_draining
+    assert response.status_code == 202
+
+
 def test_task_environment_probe_runs_after_preview_is_suspended(
     workflow_client: TestClient, auth_headers: dict[str, str]
 ) -> None:

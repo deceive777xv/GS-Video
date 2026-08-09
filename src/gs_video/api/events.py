@@ -162,6 +162,8 @@ class TaskService:
         self,
         target_stage: StageName,
         *,
+        before_start: Callable[[TaskSnapshot], Awaitable[None]] | None = None,
+        prepare: Callable[[], Awaitable[None]] | None = None,
         on_terminal: Callable[[], None] | None = None,
     ) -> TaskSnapshot:
         task_id = uuid4().hex
@@ -213,6 +215,13 @@ class TaskService:
                 )
                 self._snapshots[task_id] = committed
                 self._tokens[task_id] = token
+                if before_start is not None:
+                    try:
+                        await before_start(committed)
+                    except BaseException:
+                        self._snapshots.pop(task_id, None)
+                        self._tokens.pop(task_id, None)
+                        raise
                 return True
 
         event = await self._events.publish(
@@ -225,6 +234,30 @@ class TaskService:
         assert committed is not None
         async def run_and_finalize() -> None:
             try:
+                if prepare is not None:
+                    try:
+                        await prepare()
+                    except ApiError as error:
+                        envelope = error.envelope
+                        await self._update(
+                            task_id,
+                            target_stage,
+                            TaskStatus.FAILED,
+                            0.0,
+                            envelope.code,
+                            error_category=envelope.category,
+                            error_retryable=envelope.retryable,
+                        )
+                        return
+                    except Exception:
+                        await self._update(
+                            task_id,
+                            target_stage,
+                            TaskStatus.FAILED,
+                            0.0,
+                            "task_preflight_failed",
+                        )
+                        return
                 await self._run(task_id, target_stage)
             finally:
                 if on_terminal is not None:
@@ -283,7 +316,10 @@ class TaskService:
                 legal_sources = {
                     TaskStatus.RUNNING: {TaskStatus.QUEUED.value},
                     TaskStatus.SUCCEEDED: {TaskStatus.RUNNING.value},
-                    TaskStatus.FAILED: {TaskStatus.RUNNING.value},
+                    TaskStatus.FAILED: {
+                        TaskStatus.QUEUED.value,
+                        TaskStatus.RUNNING.value,
+                    },
                     TaskStatus.CANCELLED: {
                         TaskStatus.QUEUED.value,
                         TaskStatus.RUNNING.value,
