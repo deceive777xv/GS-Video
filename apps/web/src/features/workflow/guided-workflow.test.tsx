@@ -388,7 +388,7 @@ describe('guided workflow', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: '下一步' })).toBeEnabled())
   })
 
-  it('ignores an asset selection completion after another project switch begins', async () => {
+  it('keeps a successful asset selection when a concurrent project switch fails', async () => {
     const first = project()
     first.source_video_asset_id = 'asset-video'
     first.workflow.source_summary = {
@@ -413,9 +413,9 @@ describe('guided workflow', () => {
     vi.mocked(harness.client.bootstrap).mockImplementation(
       () => new Promise<BootstrapDto>(() => undefined),
     )
-    let resolveActivation: ((value: ProjectDto) => void) | undefined
+    let rejectActivation: ((reason: Error) => void) | undefined
     vi.mocked(harness.client.activateProject).mockImplementation(() => (
-      new Promise<ProjectDto>((resolve) => { resolveActivation = resolve })
+      new Promise<ProjectDto>((_resolve, reject) => { rejectActivation = reject })
     ))
     let resolveSelection: ((value: ProjectDto) => void) | undefined
     vi.mocked(harness.client.selectProjectAsset).mockImplementation(() => (
@@ -438,10 +438,12 @@ describe('guided workflow', () => {
     stale.workflow.scene_summary = libraryPly().asset.scene_summary
     await act(async () => { resolveSelection?.(stale) })
 
-    expect(harness.client.startTask).not.toHaveBeenCalled()
-    await act(async () => { resolveActivation?.(second) })
-    expect(screen.getByText('Second project')).toBeVisible()
-    expect(window.location.hash).toBe('#/projects/project-2/workflow/import')
+    await waitFor(() => {
+      expect(harness.client.startTask).toHaveBeenCalledWith('ingest', first.project_id)
+    })
+    await act(async () => { rejectActivation?.(new Error('Target unavailable')) })
+    expect(await screen.findByRole('alert')).toHaveTextContent('Target unavailable')
+    expect(window.location.hash).toBe(`#/projects/${first.project_id}/workflow/import`)
   })
 
   it('opens a project-aware workflow URL and restores its requested step', async () => {

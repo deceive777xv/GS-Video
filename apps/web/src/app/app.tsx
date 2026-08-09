@@ -184,7 +184,6 @@ export function App({
   const recoveredTaskId = useRef<string | null>(null)
   const autoSolveKey = useRef<string | null>(null)
   const projectAuthority = useRef(0)
-  const assetSelectionAuthority = useRef(0)
   const activeProjectId = useRef<string | null>(initialBootstrap?.project?.project_id ?? null)
   const stageAdmission = useRef(false)
 
@@ -243,7 +242,6 @@ export function App({
   }, [taskStore])
   const acceptProject = useCallback((next: ProjectDto): void => {
     if (activeProjectId.current !== next.project_id) {
-      assetSelectionAuthority.current += 1
       taskStore.reset?.(next.workflow.active_task_id)
     }
     activeProjectId.current = next.project_id
@@ -251,10 +249,7 @@ export function App({
     setProject(next)
   }, [taskStore])
   const clearProject = useCallback((): void => {
-    if (activeProjectId.current !== null) {
-      assetSelectionAuthority.current += 1
-      taskStore.reset?.(null)
-    }
+    if (activeProjectId.current !== null) taskStore.reset?.(null)
     activeProjectId.current = null
     projectAuthority.current += 1
     setProject(null)
@@ -402,7 +397,6 @@ export function App({
           else navigateWorkflow(project.project_id, reachableStep)
           return
         }
-        assetSelectionAuthority.current += 1
         const next = await backend.activateProject(workflowRoute.projectId)
         if (stopped) return
         acceptProject(next)
@@ -603,7 +597,6 @@ export function App({
 
   const createProject = async (name: string): Promise<void> => {
     try {
-      assetSelectionAuthority.current += 1
       const next = await backend.createProject(name.trim())
       acceptProject(next)
       setStep(workflowStepForProject(next))
@@ -617,9 +610,6 @@ export function App({
 
   const openProject = async (summary: ProjectSummaryDto): Promise<void> => {
     try {
-      if (activeProjectId.current !== summary.project_id) {
-        assetSelectionAuthority.current += 1
-      }
       const next = project?.project_id === summary.project_id
         ? project
         : await backend.activateProject(summary.project_id)
@@ -644,9 +634,6 @@ export function App({
 
   const deleteProject = async (summary: ProjectSummaryDto): Promise<void> => {
     try {
-      if (activeProjectId.current === summary.project_id) {
-        assetSelectionAuthority.current += 1
-      }
       await backend.deleteProject(summary.project_id)
       await refreshCatalog()
     } catch (value) {
@@ -659,8 +646,7 @@ export function App({
     next: ProjectDto,
     context: AssetSelectionContext,
   ): Promise<void> => {
-    if (assetSelectionAuthority.current !== context.selectionAuthority
-      || activeProjectId.current !== context.expectedProjectId
+    if (activeProjectId.current !== context.expectedProjectId
       || next.project_id !== context.expectedProjectId) return
     acceptProject(next)
     if (next.workflow.source_summary !== null
@@ -725,7 +711,6 @@ export function App({
             onProjectChange={acceptLibraryProject}
             platform={platform}
             project={project}
-            selectionAuthority={assetSelectionAuthority.current}
             returnProjectId={returnProjectId}
           />
         )}

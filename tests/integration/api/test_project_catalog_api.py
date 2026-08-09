@@ -1,6 +1,8 @@
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from pathlib import Path
+from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,7 +11,13 @@ from gs_video.api.routes import ApiServices
 from gs_video.api.schemas import ApiSettings
 from gs_video.api.workflow import PreviewArtifactStore
 from gs_video.app import create_app
-from gs_video.domain.models import SceneSummary, StageName, StageState, VideoSummary
+from gs_video.domain.models import (
+    Project,
+    SceneSummary,
+    StageName,
+    StageState,
+    VideoSummary,
+)
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter, discard_progress
@@ -163,6 +171,77 @@ def test_project_crud_switches_active_authority(catalog_client: TestClient) -> N
         item["name"]
         for item in catalog_client.get("/api/v1/projects", headers=HEADERS).json()
     ] == ["Initial"]
+
+
+def test_multi_project_task_creation_requires_expected_project_id(
+    catalog_client: TestClient,
+) -> None:
+    response = catalog_client.post(
+        "/api/v1/tasks",
+        json={"target_stage": "ingest"},
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "project_context_required"
+
+
+def test_task_owner_is_persisted_before_project_activation_can_continue(
+    catalog_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_id = catalog_client.get("/api/v1/projects/current", headers=HEADERS).json()[
+        "project_id"
+    ]
+    second_id = catalog_client.post(
+        "/api/v1/projects", json={"name": "Second"}, headers=HEADERS
+    ).json()["project_id"]
+    repository = catalog_client.app.state.services.project_repository
+    original_update = repository.update
+    owner_write_started = Event()
+    allow_owner_write = Event()
+    activation_entered = Event()
+    manager = catalog_client.app.state.services.project_manager
+    original_activate = manager.activate
+
+    def block_owner_write(persist: Callable[[Project], None]) -> Project:
+        owner_write_started.set()
+        assert allow_owner_write.wait(2)
+        return original_update(persist)
+
+    def record_activation(
+        project_id: str,
+        before_switch: Callable[[], None] | None = None,
+    ) -> Project:
+        activation_entered.set()
+        return original_activate(project_id, before_switch)
+
+    monkeypatch.setattr(repository, "update", block_owner_write)
+    monkeypatch.setattr(manager, "activate", record_activation)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        task_future = executor.submit(
+            catalog_client.post,
+            "/api/v1/tasks",
+            json={
+                "expected_project_id": second_id,
+                "target_stage": "ingest",
+            },
+            headers=HEADERS,
+        )
+        assert owner_write_started.wait(2)
+        activation_future = executor.submit(
+            catalog_client.post,
+            f"/api/v1/projects/{first_id}/activate",
+            headers=HEADERS,
+        )
+        assert activation_entered.wait(0.2) is False
+        allow_owner_write.set()
+        task_response = task_future.result(timeout=2)
+        activation_response = activation_future.result(timeout=2)
+
+    assert task_response.status_code == 202
+    assert activation_response.status_code == 200
+    assert activation_response.json()["workflow"]["active_task_id"] is None
 
 
 def test_shared_assets_are_separated_referenced_and_protected(

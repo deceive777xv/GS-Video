@@ -1785,6 +1785,17 @@ def build_router() -> APIRouter:
                     services.preview_service, suspension
                 )
         try:
+            if (
+                services.project_manager is not None
+                and task.expected_project_id is None
+            ):
+                raise ApiError(
+                    422,
+                    code="project_context_required",
+                    category="validation",
+                    message="Task creation requires the active project id.",
+                    retryable=False,
+                )
             current = await asyncio.to_thread(services.project_repository.load)
             if (
                 task.expected_project_id is not None
@@ -1838,18 +1849,17 @@ def build_router() -> APIRouter:
                 stage,
                 on_terminal=release_suspension,
             )
+            await asyncio.to_thread(
+                services.project_repository.update,
+                lambda project: setattr(
+                    project.workflow, "active_task_id", snapshot.id
+                ),
+            )
         except BaseException:
             release_suspension()
             raise
         finally:
             runtime_lock.release()
-        repository = _services(request).project_repository
-        await asyncio.to_thread(
-            repository.update,
-            lambda project: setattr(
-                project.workflow, "active_task_id", snapshot.id
-            ),
-        )
         return snapshot
 
     @protected.get("/api/v1/tasks/{task_id}", response_model=TaskSnapshot)
