@@ -19,6 +19,7 @@ from gs_video.api.schemas import (
 )
 from gs_video.domain.errors import GsVideoError, RepairableError
 from gs_video.domain.models import (
+    ArtifactRef,
     ArtifactRole,
     ExportResultState,
     Project,
@@ -27,6 +28,7 @@ from gs_video.domain.models import (
 )
 from gs_video.media.export import copy_verified_export
 from gs_video.segmentation.paths import has_reparse_component
+from gs_video.storage.artifacts import ArtifactStore
 
 
 class ProjectRepositoryLike(Protocol):
@@ -39,6 +41,7 @@ class ProjectRepositoryLike(Protocol):
 
 class ServicesLike(Protocol):
     project_repository: ProjectRepositoryLike
+    artifact_store: ArtifactStore
 
 
 def _services(request: Request) -> ServicesLike:
@@ -242,7 +245,7 @@ def _verified_artifact_path(
 
 def _authoritative_export_relative(
     project: Project, *, not_ready: bool = False
-) -> tuple[str, str]:
+) -> tuple[ArtifactRef, str]:
     stage = project.stages.get(StageName.EXPORT)
     registered = (
         None if stage is None else stage.artifacts.get(ArtifactRole.EXPORT_VIDEO)
@@ -317,15 +320,17 @@ def build_export_router() -> APIRouter:
     )
     async def get_verified_export(request: Request) -> VerifiedExportResponse:
         repository = _services(request).project_repository
+        artifact_store = _services(request).artifact_store
         project = _load_project(repository)
         relative, export_cache_key = _authoritative_export_relative(
             project, not_ready=True
         )
+        artifact_root = artifact_store.lookup_project_root(project.project_id)
         artifact_limit = _settings(request).max_artifact_response_size
         path, payload, digest = await asyncio.to_thread(
             _read_verified_artifact,
-            repository.root,
-            relative,
+            artifact_root,
+            relative.relative_path(),
             directory="exports",
             expected_size=None,
             expected_sha256=None,
@@ -334,8 +339,8 @@ def build_export_router() -> APIRouter:
         metadata = await asyncio.to_thread(_export_inspector(request).probe, path)
         await asyncio.to_thread(
             _read_verified_artifact,
-            repository.root,
-            relative,
+            artifact_root,
+            relative.relative_path(),
             directory="exports",
             expected_size=len(payload),
             expected_sha256=digest,
@@ -409,11 +414,12 @@ def build_export_router() -> APIRouter:
                 message="The verified export is outside the configured size bound.",
             )
         relative, export_cache_key = _authoritative_export_relative(project)
+        artifact_root = services.artifact_store.lookup_project_root(project.project_id)
         _validate_export_descriptor_authority(export, export_cache_key)
         _path, payload, _digest = await asyncio.to_thread(
             _read_verified_artifact,
-            services.project_repository.root,
-            relative,
+            artifact_root,
+            relative.relative_path(),
             directory="exports",
             expected_size=export.size,
             expected_sha256=export.sha256,
@@ -454,11 +460,12 @@ def build_export_router() -> APIRouter:
                 message="The verified export is outside the configured size bound.",
             )
         relative, export_cache_key = _authoritative_export_relative(project)
+        artifact_root = services.artifact_store.lookup_project_root(project.project_id)
         _validate_export_descriptor_authority(export, export_cache_key)
         source = await asyncio.to_thread(
             _verified_artifact_path,
-            services.project_repository.root,
-            relative,
+            artifact_root,
+            relative.relative_path(),
             directory="exports",
             expected_size=export.size,
             limit=artifact_limit,

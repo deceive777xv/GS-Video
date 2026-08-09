@@ -17,6 +17,8 @@ from gs_video.domain.contracts import (
 )
 from gs_video.domain.errors import RepairableError
 from gs_video.domain.models import (
+    ArtifactCategory,
+    ArtifactRef,
     ArtifactRole,
     CameraPose,
     FootPointState,
@@ -80,7 +82,13 @@ class RecordingService:
             raise self.failure
         if self.cancel:
             token.cancel()
-        return StageResult((Path("artifacts") / self.name,), f"{self.name}-key")
+        result_key = hashlib.sha256(self.name.encode()).hexdigest()
+        reference = ArtifactRef(
+            project_id=project.project_id,
+            category=ArtifactCategory.FRAMES,
+            cache_key=result_key,
+        )
+        return StageResult((reference,), result_key)
 
 
 class RecordingRenderer:
@@ -97,7 +105,13 @@ class RecordingRenderer:
     ) -> StageResult:
         self.calls.append("render")
         self.namespaces.append(namespace)
-        return StageResult((Path("renders") / "final",), "render-key")
+        result_key = hashlib.sha256(b"render").hexdigest()
+        reference = ArtifactRef(
+            project_id=project.project_id,
+            category=ArtifactCategory.RENDERS,
+            cache_key=result_key,
+        )
+        return StageResult((reference,), result_key)
 
 
 def fake_services(
@@ -180,7 +194,7 @@ def test_render_stage_passes_preview_cache_namespace_to_renderer() -> None:
 
     result = stage.execute(Project(name="preview"), CancellationToken(), lambda *_: None)
 
-    assert result.cache_key == "render-key"
+    assert result.cache_key == hashlib.sha256(b"render").hexdigest()
     assert calls == ["render"]
     assert namespaces == [workflow.RenderCacheNamespace.PREVIEW]
 
@@ -338,11 +352,16 @@ class _IntegrationRenderer:
                 emit(index, 2, f"render {index}")
 
         output = self.publisher.publish_tree("renders", result_key, build)
-        relative = output.relative_to(self.root)
+        assert output.relative_to(self.root) == Path("renders", result_key)
+        reference = ArtifactRef(
+            project_id=project.project_id,
+            category=ArtifactCategory.RENDERS,
+            cache_key=result_key,
+        )
         return StageResult(
-            (relative,),
+            (reference,),
             result_key,
-            {ArtifactRole.RENDER_FRAMES: relative},
+            {ArtifactRole.RENDER_FRAMES: reference},
         )
 
 
@@ -473,15 +492,17 @@ def test_concrete_cpu_services_progress_through_export_and_persist_artifacts(
     assert all(project.stages[name].status is StageStatus.SUCCEEDED for name in StageName)
     ingest = project.stages[StageName.INGEST]
     assert ingest.cache_key is not None
-    assert Path(ingest.artifacts[ArtifactRole.SOURCE_FRAMES]) == Path(
-        "frames", ingest.cache_key
+    assert ingest.artifacts[ArtifactRole.SOURCE_FRAMES].relative_path() == (
+        f"frames/{ingest.cache_key}"
     )
-    assert Path(ingest.artifacts[ArtifactRole.PROXY_FRAMES]) == Path(
-        "proxies", ingest.cache_key
+    assert ingest.artifacts[ArtifactRole.PROXY_FRAMES].relative_path() == (
+        f"proxies/{ingest.cache_key}"
     )
     export_relative = project.stages[StageName.EXPORT].artifacts[
         ArtifactRole.EXPORT_VIDEO
     ]
-    assert Path(export_relative).parts[0] == "exports"
-    assert (tmp_path / export_relative).read_bytes() == b"verified integration mp4"
+    assert export_relative.category is ArtifactCategory.EXPORTS
+    assert (tmp_path / export_relative.relative_path()).read_bytes() == (
+        b"verified integration mp4"
+    )
     assert exporter.frame_counts == [2, 2]

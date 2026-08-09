@@ -18,6 +18,8 @@ from gs_video.api.schemas import ApiSettings
 from gs_video.app import create_app
 from gs_video.domain.contracts import PickBuffer
 from gs_video.domain.models import (
+    ArtifactCategory,
+    ArtifactRef,
     ArtifactRole,
     CameraPose,
     ExportResultState,
@@ -41,6 +43,8 @@ TOKEN = "workflow-session-token"
 ORIGIN = "http://127.0.0.1:5173"
 INGEST_CACHE_KEY = "1" * 64
 SEGMENT_CACHE_KEY = "2" * 64
+COMPOSITE_CACHE_KEY = "3" * 64
+EXPORT_CACHE_KEY = "4" * 64
 
 
 class StaticDoctor:
@@ -135,6 +139,7 @@ class ExportInspector:
 def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
     repository = ProjectRepository(tmp_path / "project")
     project = repository.create("workflow")
+    (repository.root / "source").mkdir()
     project.source_video = "source/video.mp4"
     project.scene_ply = "source/scene.ply"
     (repository.root / "source" / "scene.ply").write_bytes(b"scene-one")
@@ -145,20 +150,22 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
         gaussian_count=1,
         estimated_vram_mb=1,
     )
-    (repository.root / "exports" / "final.mp4").write_bytes(b"verified-video")
-    composite_cache_key = "composite-key"
+    export_path = repository.root / "exports" / EXPORT_CACHE_KEY / "final.mp4"
+    export_path.parent.mkdir(parents=True)
+    export_path.write_bytes(b"verified-video")
+    composite_cache_key = COMPOSITE_CACHE_KEY
     preview_path = (
         repository.root
         / "previews"
         / composite_cache_key
         / "composite-preview.mp4"
     )
-    preview_path.parent.mkdir()
+    preview_path.parent.mkdir(parents=True)
     preview_path.write_bytes(b"composite-preview")
     proxy_root = repository.root / "proxies" / INGEST_CACHE_KEY
     mask_root = repository.root / "masks" / SEGMENT_CACHE_KEY
-    proxy_root.mkdir()
-    mask_root.mkdir()
+    proxy_root.mkdir(parents=True)
+    mask_root.mkdir(parents=True)
     for index in range(1, 6):
         Image.new("RGB", (16, 9), (20, 40, 60)).save(
             proxy_root / f"{index:06d}.jpg"
@@ -172,26 +179,62 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
     project.stages[StageName.INGEST] = StageState(
         status=StageStatus.SUCCEEDED,
         cache_key=INGEST_CACHE_KEY,
-        artifacts={ArtifactRole.PROXY_FRAMES: f"proxies/{INGEST_CACHE_KEY}"},
+        artifacts={
+            ArtifactRole.PROXY_FRAMES: ArtifactRef(
+                project_id=project.project_id,
+                category=ArtifactCategory.PROXIES,
+                cache_key=INGEST_CACHE_KEY,
+            )
+        },
     )
     project.stages[StageName.SEGMENT] = StageState(
         status=StageStatus.SUCCEEDED,
         cache_key=SEGMENT_CACHE_KEY,
-        artifacts={ArtifactRole.SUBJECT_MASKS: f"masks/{SEGMENT_CACHE_KEY}"},
+        artifacts={
+            ArtifactRole.SUBJECT_MASKS: ArtifactRef(
+                project_id=project.project_id,
+                category=ArtifactCategory.MASKS,
+                cache_key=SEGMENT_CACHE_KEY,
+            )
+        },
     )
     project.stages[StageName.EXPORT] = StageState(
         status=StageStatus.SUCCEEDED,
-        cache_key="export-key",
-        output_paths=["exports/final.mp4"],
-        artifacts={ArtifactRole.EXPORT_VIDEO: "exports/final.mp4"},
+        cache_key=EXPORT_CACHE_KEY,
+        output_paths=[
+            ArtifactRef(
+                project_id=project.project_id,
+                category=ArtifactCategory.EXPORTS,
+                cache_key=EXPORT_CACHE_KEY,
+                member="final.mp4",
+            )
+        ],
+        artifacts={
+            ArtifactRole.EXPORT_VIDEO: ArtifactRef(
+                project_id=project.project_id,
+                category=ArtifactCategory.EXPORTS,
+                cache_key=EXPORT_CACHE_KEY,
+                member="final.mp4",
+            )
+        },
     )
     project.stages[StageName.COMPOSITE] = StageState(
         status=StageStatus.SUCCEEDED,
         cache_key=composite_cache_key,
-        output_paths=[f"previews/{composite_cache_key}/composite-preview.mp4"],
+        output_paths=[
+            ArtifactRef(
+                project_id=project.project_id,
+                category=ArtifactCategory.PREVIEWS,
+                cache_key=composite_cache_key,
+                member="composite-preview.mp4",
+            )
+        ],
         artifacts={
-            ArtifactRole.COMPOSITE_PREVIEW: (
-                f"previews/{composite_cache_key}/composite-preview.mp4"
+            ArtifactRole.COMPOSITE_PREVIEW: ArtifactRef(
+                project_id=project.project_id,
+                category=ArtifactCategory.PREVIEWS,
+                cache_key=composite_cache_key,
+                member="composite-preview.mp4",
             )
         },
     )
@@ -541,6 +584,7 @@ def test_scene_replacement_discards_preview_rendered_from_old_scene(
     repository = ProjectRepository(tmp_path / "scene-race")
     project = repository.create("scene-race")
     project.scene_ply = "source/old.ply"
+    (repository.root / "source").mkdir()
     (repository.root / "source" / "old.ply").write_bytes(b"old")
     project.workflow.scene_summary = SceneSummary(
         filename="old.ply", size=3, sha256="a" * 64,
@@ -950,7 +994,7 @@ def test_composite_preview_is_opaque_authenticated_and_cache_bound(
     assert video.headers["content-type"] == "video/mp4"
 
 
-@pytest.mark.parametrize("mutation", ["bytes", "cache_key", "project_id"])
+@pytest.mark.parametrize("mutation", ["bytes", "cache_key"])
 def test_composite_preview_blob_rejects_stale_descriptor_identity(
     workflow_client: TestClient,
     auth_headers: dict[str, str],
@@ -960,13 +1004,13 @@ def test_composite_preview_blob_rejects_stale_descriptor_identity(
         "/api/v1/projects/current/composite-preview", headers=auth_headers
     ).json()
     repository = workflow_client.app.state.services.project_repository
-    cache_key = "composite-key"
+    cache_key = COMPOSITE_CACHE_KEY
     relative = f"previews/{cache_key}/composite-preview.mp4"
 
     if mutation == "bytes":
         (repository.root / relative).write_bytes(b"changed-composite-preview")
     elif mutation == "cache_key":
-        replacement_key = "replacement-composite-key"
+        replacement_key = "5" * 64
         replacement_relative = f"previews/{replacement_key}/composite-preview.mp4"
         replacement = repository.root / replacement_relative
         replacement.parent.mkdir()
@@ -975,15 +1019,16 @@ def test_composite_preview_blob_rejects_stale_descriptor_identity(
         def change_cache(project: object) -> None:
             stage = project.stages[StageName.COMPOSITE]  # type: ignore[attr-defined]
             stage.cache_key = replacement_key
-            stage.output_paths = [replacement_relative]
-            stage.artifacts = {ArtifactRole.COMPOSITE_PREVIEW: replacement_relative}
+            replacement_ref = ArtifactRef(
+                project_id=project.project_id,  # type: ignore[attr-defined]
+                category=ArtifactCategory.PREVIEWS,
+                cache_key=replacement_key,
+                member="composite-preview.mp4",
+            )
+            stage.output_paths = [replacement_ref]
+            stage.artifacts = {ArtifactRole.COMPOSITE_PREVIEW: replacement_ref}
 
         repository.update(change_cache)
-    else:
-        repository.update(
-            lambda project: setattr(project, "project_id", "replacement-project")
-        )
-
     stale = workflow_client.get(
         f"/api/v1/artifacts/composite-previews/{descriptor['artifact_id']}",
         headers=auth_headers,
@@ -1000,7 +1045,14 @@ def test_composite_preview_requires_exact_registered_preview_path(
 
     def mismatch_registration(project: object) -> None:
         stage = project.stages[StageName.COMPOSITE]  # type: ignore[attr-defined]
-        stage.artifacts = {ArtifactRole.COMPOSITE_PREVIEW: "source/outside.mp4"}
+        stage.artifacts = {
+            ArtifactRole.COMPOSITE_PREVIEW: ArtifactRef(
+                project_id=project.project_id,  # type: ignore[attr-defined]
+                category=ArtifactCategory.EXPORTS,
+                cache_key=COMPOSITE_CACHE_KEY,
+                member="outside.mp4",
+            )
+        }
 
     repository.update(mismatch_registration)
 
@@ -1095,7 +1147,7 @@ def test_verified_export_copy_requires_an_absolute_external_destination(
         {"cache_key": None},
         {"cache_key": "replacement-export-key"},
         {"artifacts": {}},
-        {"artifacts": {ArtifactRole.EXPORT_VIDEO: "source/video.mp4"}},
+        {"wrong_artifact_category": True},
     ],
 )
 def test_verified_export_copy_requires_the_typed_authoritative_export(
@@ -1112,7 +1164,17 @@ def test_verified_export_copy_requires_the_typed_authoritative_export(
     def mutate(project: object) -> None:
         stage = project.stages[StageName.EXPORT]  # type: ignore[attr-defined]
         for name, value in stage_mutation.items():
-            setattr(stage, name, value)
+            if name == "wrong_artifact_category":
+                stage.artifacts = {
+                    ArtifactRole.EXPORT_VIDEO: ArtifactRef(
+                        project_id=project.project_id,  # type: ignore[attr-defined]
+                        category=ArtifactCategory.PROXIES,
+                        cache_key=stage.cache_key,
+                        member="final.mp4",
+                    )
+                }
+            else:
+                setattr(stage, name, value)
 
     repository.update(mutate)
     destination = tmp_path / "typed-authority.mp4"
@@ -1192,7 +1254,7 @@ def test_subject_alpha_requires_a_successful_prompt_bound_segment(
     "stage_mutation",
     [
         {"cache_key": None},
-        {"artifacts": {ArtifactRole.PROXY_FRAMES: f"./proxies/{INGEST_CACHE_KEY}"}},
+        {"wrong_artifact": True},
     ],
 )
 def test_subject_proxy_requires_exact_typed_stage_authority(
@@ -1205,7 +1267,16 @@ def test_subject_proxy_requires_exact_typed_stage_authority(
     def mutate(project: object) -> None:
         stage = project.stages[StageName.INGEST]  # type: ignore[attr-defined]
         for name, value in stage_mutation.items():
-            setattr(stage, name, value)
+            if name == "wrong_artifact":
+                stage.artifacts = {
+                    ArtifactRole.PROXY_FRAMES: ArtifactRef(
+                        project_id=project.project_id,  # type: ignore[attr-defined]
+                        category=ArtifactCategory.MASKS,
+                        cache_key=INGEST_CACHE_KEY,
+                    )
+                }
+            else:
+                setattr(stage, name, value)
 
     repository.update(mutate)
 
@@ -1240,9 +1311,6 @@ def test_subject_proxy_rejects_noncanonical_cache_keys_even_when_target_exists(
         def mutate(project: object) -> None:
             stage = project.stages[StageName.INGEST]  # type: ignore[attr-defined]
             stage.cache_key = cache_key
-            stage.artifacts = {
-                ArtifactRole.PROXY_FRAMES: f"proxies/{cache_key}"
-            }
 
         repository.update(mutate)
         response = workflow_client.get(

@@ -1,9 +1,11 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from gs_video.domain.models import SceneSummary, VideoSummary
 from gs_video.project.assets import AssetKind, AssetLibrary
+import gs_video.project.assets as assets_module
 
 
 def video_summary(path: Path, size: int, sha256: str) -> VideoSummary:
@@ -72,6 +74,22 @@ def test_asset_library_resolves_only_expected_kind_and_deletes(tmp_path) -> None
     assert not resolved.exists()
     with pytest.raises(KeyError):
         library.get(record.asset_id)
+
+
+def test_asset_library_requires_twenty_percent_disk_headroom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video")
+    library = AssetLibrary(tmp_path / "assets")
+    monkeypatch.setattr(
+        assets_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=5),
+    )
+
+    with pytest.raises(OSError, match="20% headroom"):
+        library.import_file(AssetKind.VIDEO, source, video_summary)
 
 
 def test_asset_delete_orphan_is_retried_on_next_startup(

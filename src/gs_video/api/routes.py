@@ -27,6 +27,8 @@ from gs_video.api.schemas import (
     AssetResponse,
     BootstrapResponse,
     CameraConfirmationRequest,
+    CacheCleanupRequest,
+    CacheCleanupPlanRequest,
     CameraInput,
     EnvironmentRepairSnapshot,
     HealthResponse,
@@ -41,6 +43,7 @@ from gs_video.api.schemas import (
     ProjectRename,
     TaskCreateRequest,
     TaskSnapshot,
+    StorageLayoutUpdate,
     UploadComplete,
     UploadCreateRequest,
     UploadCreated,
@@ -63,9 +66,11 @@ from gs_video.domain.models import (
     FootPointState,
     PreviewState,
     Project,
+    SceneSummary,
     StageName,
     StageState,
     SubjectPromptState,
+    VideoSummary,
 )
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.environment.repair import EnvironmentRepairBusyError
@@ -91,6 +96,17 @@ from gs_video.project.manager import (
     ActiveProjectRequiredError,
 )
 from gs_video.scene.camera import OrbitCamera
+from gs_video.storage.artifacts import ArtifactStore
+from gs_video.storage.layout import (
+    CacheCleanupPlan,
+    CacheCleanupResult,
+    StorageLayoutManager,
+    StorageLayoutSnapshot,
+)
+from gs_video.resource_admission import (
+    fits_vram_budget,
+    project_cache_has_capacity,
+)
 
 
 _DESKTOP_ORIGINS = {
@@ -169,6 +185,8 @@ class ApiServices:
     project_manager: ActiveProjectManager | None = None
     preview_artifacts: Any | None = None
     upload_root: Path | None = None
+    artifact_store: ArtifactStore | None = None
+    storage_layout: StorageLayoutManager | None = None
 
 
 def _services(request: Request) -> ApiServices:
@@ -223,6 +241,32 @@ def _vram_budget(request: Request) -> VramBudgetManager:
             retryable=True,
         )
     return budget
+
+
+def _storage_layout(request: Request) -> StorageLayoutManager:
+    layout = _services(request).storage_layout
+    if layout is None:
+        raise ApiError(
+            503,
+            code="storage_layout_unavailable",
+            category="runtime",
+            message="Storage layout configuration is unavailable.",
+            retryable=True,
+        )
+    return layout
+
+
+def _storage_blocked_reason(
+    request: Request, *, include_update: bool = True
+) -> str | None:
+    if _task_service(request).is_busy():
+        return "task_active"
+    repair = _services(request).environment_repair
+    if repair is not None and repair.is_busy():
+        return "environment_repair_active"
+    if include_update and _runtime_change_lock(request).locked():
+        return "update_in_progress"
+    return None
 
 
 def _vram_blocked_reason(
@@ -487,6 +531,16 @@ def _import_asset_sync(
                 retryable=True,
             ) from error
         if asset.assign_to_current:
+            current = services.project_repository.load()
+            _require_combined_vram_admission(
+                services,
+                record.video_summary
+                if record.kind is LibraryAssetKind.VIDEO
+                else current.workflow.source_summary,
+                record.scene_summary
+                if record.kind is LibraryAssetKind.PLY
+                else current.workflow.scene_summary,
+            )
             suspension = (
                 _suspend_live_preview_if_supported(services.preview_service)
                 if library_kind is LibraryAssetKind.PLY
@@ -584,6 +638,50 @@ def _select_library_asset(project: Project, record: AssetRecord) -> None:
     project.workflow.export_result = None
 
 
+def _require_combined_vram_admission(
+    services: ApiServices,
+    source: VideoSummary | None,
+    scene: SceneSummary | None,
+) -> None:
+    if source is None or scene is None or services.vram_budget is None:
+        return
+    budget_mb = services.vram_budget.current_limit_mb()
+    if not fits_vram_budget(scene, source.width, source.height, budget_mb):
+        raise ApiError(
+            422,
+            code="combined_vram_limit_exceeded",
+            category="resource",
+            message=(
+                "The selected video resolution and Gaussian scene exceed 80% "
+                "of the configured VRAM budget."
+            ),
+        )
+
+
+def _require_task_cache_admission(
+    services: ApiServices, stage: StageName
+) -> None:
+    store = services.artifact_store
+    if store is None:
+        return
+    project = services.project_repository.load()
+    cache_ok, required_bytes, available_bytes = project_cache_has_capacity(
+        store.root, project, stage
+    )
+    if not cache_ok:
+        raise ApiError(
+            507,
+            code="storage_full",
+            category="storage",
+            message=(
+                "Insufficient cache storage for the requested workflow: requires "
+                f"{required_bytes} bytes with 20% headroom, but only "
+                f"{available_bytes} bytes are available."
+            ),
+            retryable=True,
+        )
+
+
 def _clear_preview_authority(project: Project) -> None:
     project.workflow.preview_epoch += 1
     project.workflow.confirmed_camera_revision = None
@@ -641,6 +739,8 @@ def build_router() -> APIRouter:
             capabilities = (*capabilities, "environment_repair")
         if services.vram_budget is not None:
             capabilities = (*capabilities, "vram_budget")
+        if services.storage_layout is not None:
+            capabilities = (*capabilities, "storage_layout")
         blocked_reason = _vram_blocked_reason(request)
         budget = (
             services.vram_budget.snapshot(
@@ -676,7 +776,151 @@ def build_router() -> APIRouter:
             asset_counts=asset_counts,
             environment=environment,
             vram_budget=budget,
+            storage_layout=(
+                services.storage_layout.snapshot(
+                    editable=_storage_blocked_reason(request) is None,
+                    blocked_reason=_storage_blocked_reason(request),
+                )
+                if services.storage_layout is not None
+                else None
+            ),
         )
+
+    @protected.get(
+        "/api/v1/runtime/storage-layout",
+        response_model=StorageLayoutSnapshot,
+    )
+    async def get_storage_layout(request: Request) -> StorageLayoutSnapshot:
+        blocked_reason = _storage_blocked_reason(request)
+        return await asyncio.to_thread(
+            _storage_layout(request).snapshot,
+            editable=blocked_reason is None,
+            blocked_reason=blocked_reason,
+        )
+
+    @protected.patch(
+        "/api/v1/runtime/storage-layout",
+        response_model=StorageLayoutSnapshot,
+    )
+    async def patch_storage_layout(
+        request: Request,
+        update: StorageLayoutUpdate,
+    ) -> StorageLayoutSnapshot:
+        async with _runtime_change_lock(request):
+            blocked_reason = _storage_blocked_reason(
+                request, include_update=False
+            )
+            if blocked_reason is not None:
+                raise ApiError(
+                    409,
+                    code="storage_layout_busy",
+                    category="conflict",
+                    message="Wait for active work to finish before changing storage.",
+                    retryable=True,
+                )
+            services = _services(request)
+            suspension = await asyncio.to_thread(
+                _suspend_live_preview_if_supported,
+                services.preview_service,
+            )
+            try:
+                return await asyncio.to_thread(
+                    _storage_layout(request).switch,
+                    Path(update.project_library_root),
+                    Path(update.cache_root),
+                    project_action=update.project_action,
+                    cache_action=update.cache_action,
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                await asyncio.to_thread(
+                    _resume_live_preview_if_supported,
+                    services.preview_service,
+                    suspension,
+                )
+                raise ApiError(
+                    422,
+                    code="storage_layout_change_failed",
+                    category="filesystem",
+                    message=str(error),
+                    retryable=False,
+                ) from error
+
+    @protected.post(
+        "/api/v1/runtime/storage-layout/cache-cleanup/plan",
+        response_model=CacheCleanupPlan,
+    )
+    async def plan_storage_cache_cleanup(
+        request: Request,
+        cleanup: CacheCleanupPlanRequest,
+    ) -> CacheCleanupPlan:
+        blocked_reason = _storage_blocked_reason(request, include_update=False)
+        if blocked_reason is not None:
+            raise ApiError(
+                409,
+                code="storage_cleanup_busy",
+                category="conflict",
+                message="Wait for active work to finish before scanning cache.",
+                retryable=True,
+            )
+        try:
+            return await asyncio.to_thread(
+                _storage_layout(request).plan_cache_cleanup,
+                cleanup.mode,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ApiError(
+                422,
+                code="storage_cleanup_plan_failed",
+                category="filesystem",
+                message=str(error),
+                retryable=False,
+            ) from error
+
+    @protected.post(
+        "/api/v1/runtime/storage-layout/cache-cleanup",
+        response_model=CacheCleanupResult,
+    )
+    async def cleanup_storage_cache(
+        request: Request,
+        cleanup: CacheCleanupRequest,
+    ) -> CacheCleanupResult:
+        async with _runtime_change_lock(request):
+            blocked_reason = _storage_blocked_reason(
+                request, include_update=False
+            )
+            if blocked_reason is not None:
+                raise ApiError(
+                    409,
+                    code="storage_cleanup_busy",
+                    category="conflict",
+                    message="Wait for active work to finish before cleaning cache.",
+                    retryable=True,
+                )
+            services = _services(request)
+            suspension = await asyncio.to_thread(
+                _suspend_live_preview_if_supported,
+                services.preview_service,
+            )
+            try:
+                return await asyncio.to_thread(
+                    _storage_layout(request).cleanup_cache,
+                    cleanup.mode,
+                    cleanup.plan_token,
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                raise ApiError(
+                    422,
+                    code="storage_cleanup_failed",
+                    category="filesystem",
+                    message=str(error),
+                    retryable=False,
+                ) from error
+            finally:
+                await asyncio.to_thread(
+                    _resume_live_preview_if_supported,
+                    services.preview_service,
+                    suspension,
+                )
 
     @protected.get(
         "/api/v1/runtime/vram-budget",
@@ -824,7 +1068,14 @@ def build_router() -> APIRouter:
                         )
                     )
                     if prompt is not None:
-                        validate_subject_prompt(project, repository.root, prompt)
+                        artifact_root = (
+                            repository.root
+                            if services.artifact_store is None
+                            else services.artifact_store.project_root(
+                                project.project_id
+                            )
+                        )
+                        validate_subject_prompt(project, artifact_root, prompt)
                     project.workflow.subject_prompt = prompt
                     invalidate_for_change(project, ChangeKind.SUBJECT_PROMPT)
                     project.workflow.export_result = None
@@ -1458,6 +1709,22 @@ def build_router() -> APIRouter:
                     category="validation",
                     message="Select at least one project asset field.",
                 )
+            current = await asyncio.to_thread(services.project_repository.load)
+            prospective_source = current.workflow.source_summary
+            prospective_scene = current.workflow.scene_summary
+            if "source_video_asset_id" in records:
+                source_record = records["source_video_asset_id"]
+                prospective_source = (
+                    None if source_record is None else source_record.video_summary
+                )
+            if "scene_ply_asset_id" in records:
+                scene_record = records["scene_ply_asset_id"]
+                prospective_scene = (
+                    None if scene_record is None else scene_record.scene_summary
+                )
+            _require_combined_vram_admission(
+                services, prospective_source, prospective_scene
+            )
 
             def persist(project: Project) -> None:
                 for field, record in records.items():
@@ -1544,6 +1811,9 @@ def build_router() -> APIRouter:
                         ),
                         retryable=True,
                     )
+            await asyncio.to_thread(
+                _require_task_cache_admission, services, stage
+            )
             snapshot = await _task_service(request).create(
                 stage,
                 on_terminal=release_suspension,
@@ -1649,6 +1919,16 @@ def build_router() -> APIRouter:
                     inspect,
                 )
                 if completed.assign_to_current:
+                    current = services.project_repository.load()
+                    _require_combined_vram_admission(
+                        services,
+                        library_record.video_summary
+                        if library_record.kind is LibraryAssetKind.VIDEO
+                        else current.workflow.source_summary,
+                        library_record.scene_summary
+                        if library_record.kind is LibraryAssetKind.PLY
+                        else current.workflow.scene_summary,
+                    )
                     suspension = (
                         _suspend_live_preview_if_supported(services.preview_service)
                         if library_kind is LibraryAssetKind.PLY

@@ -6,6 +6,8 @@ import pytest
 from pydantic import ValidationError
 
 from gs_video.domain.models import (
+    ArtifactCategory,
+    ArtifactRef,
     CameraPose,
     Project,
     StageName,
@@ -16,19 +18,7 @@ from gs_video.domain.models import (
 from gs_video.project.repository import ProjectRepository
 
 
-PROJECT_DIRECTORIES = {
-    "source",
-    "frames",
-    "proxies",
-    "masks",
-    "camera",
-    "trajectories",
-    "renders",
-    "composites",
-    "previews",
-    "exports",
-    "logs",
-}
+PROJECT_DIRECTORIES: set[str] = set()
 
 
 def test_create_makes_exact_project_directory_layout(tmp_path: Path) -> None:
@@ -44,14 +34,20 @@ def test_create_makes_exact_project_directory_layout(tmp_path: Path) -> None:
 def test_repository_round_trips_project(tmp_path: Path) -> None:
     repo = ProjectRepository(tmp_path)
     project = repo.create("demo")
-    project.stages[StageName.INGEST] = StageState(output_paths=["source/input.mp4"])
+    reference = ArtifactRef(
+        project_id=project.project_id,
+        category=ArtifactCategory.FRAMES,
+        cache_key="a" * 64,
+        member="input.mp4",
+    )
+    project.stages[StageName.INGEST] = StageState(output_paths=[reference])
 
     repo.save(project)
     loaded = repo.load()
 
     assert loaded == project
     assert loaded.project_id == project.project_id
-    assert loaded.schema_version == 4
+    assert loaded.schema_version == 5
     assert (tmp_path / "project.json").exists()
 
 
@@ -86,7 +82,7 @@ def test_repository_load_migrates_v2_pick_authority_and_round_trips_v4(
     repository.save(loaded)
     round_tripped = repository.load()
 
-    assert round_tripped.schema_version == 4
+    assert round_tripped.schema_version == 5
     assert round_tripped.workflow.confirmed_preview_artifact_id == artifact_id
     assert round_tripped.workflow.foot_point is not None
     assert round_tripped.workflow.foot_point.preview_artifact_id == artifact_id
@@ -164,6 +160,25 @@ def test_repository_round_trips_workflow_authority(tmp_path: Path) -> None:
     loaded = repo.load()
     assert loaded.workflow.subject_prompt == project.workflow.subject_prompt
     assert loaded.workflow.target_camera == project.workflow.target_camera
+
+
+def test_repository_rejects_cross_project_artifact_authority(tmp_path: Path) -> None:
+    repository = ProjectRepository(tmp_path / "project")
+    project = repository.create("authority")
+    project.stages[StageName.INGEST] = StageState(
+        status=StageStatus.SUCCEEDED,
+        cache_key="a" * 64,
+        output_paths=[
+            ArtifactRef(
+                project_id="00000000-0000-4000-8000-000000000000",
+                category=ArtifactCategory.FRAMES,
+                cache_key="a" * 64,
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="another project"):
+        repository.save(project)
 
 
 def test_reconcile_interrupted_runs_clears_owner_and_allows_retry(tmp_path: Path) -> None:

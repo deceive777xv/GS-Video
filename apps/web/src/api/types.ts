@@ -18,12 +18,19 @@ export type TaskStatus =
 
 export type ArtifactRole = 'proxy_frames' | 'subject_masks' | 'export_video'
 
+export interface ArtifactRefDto {
+  project_id: string
+  category: 'frames' | 'proxies' | 'masks' | 'camera' | 'trajectories' | 'renders' | 'composites' | 'previews' | 'exports'
+  cache_key: string
+  member: string | null
+}
+
 export interface StageStateDto {
   status: 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'stale'
   cache_key: string | null
-  output_paths: string[]
+  output_paths: ArtifactRefDto[]
   error_code: string | null
-  artifacts: Partial<Record<ArtifactRole, string>>
+  artifacts: Partial<Record<ArtifactRole, ArtifactRefDto>>
 }
 
 export interface ProjectDto {
@@ -181,6 +188,42 @@ export type VramBudgetUpdate =
   | { mode: 'standard'; selected_vram_mb: null }
   | { mode: 'custom'; selected_vram_mb: number }
 
+export interface StorageLayoutDto {
+  project_library_root: string
+  project_library_id: string
+  cache_root: string
+  cache_id: string
+  restart_required: boolean
+  editable: boolean
+  blocked_reason: string | null
+  project_library_bytes: number
+  project_library_free_bytes: number
+  cache_bytes: number
+  cache_free_bytes: number
+}
+
+export interface CacheCleanupResultDto {
+  mode: 'safe' | 'deep'
+  removed_entries: number
+  freed_bytes: number
+  storage: StorageLayoutDto
+}
+
+export interface CacheCleanupPlanDto {
+  plan_token: string
+  mode: 'safe' | 'deep'
+  removable_entries: number
+  reclaimable_bytes: number
+  expires_in_seconds: number
+}
+
+export interface StorageLayoutUpdate {
+  project_library_root: string
+  cache_root: string
+  project_action: 'migrate' | 'open_existing'
+  cache_action: 'start_fresh' | 'migrate'
+}
+
 export interface BootstrapDto {
   api_version: string
   capabilities: string[]
@@ -189,6 +232,7 @@ export interface BootstrapDto {
   asset_counts?: Partial<Record<LibraryAssetKind, number>>
   environment: EnvironmentDto
   vram_budget: VramBudgetDto
+  storage_layout?: StorageLayoutDto | null
 }
 
 export type LibraryAssetKind = 'video' | 'ply'

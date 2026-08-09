@@ -27,6 +27,8 @@ from gs_video.domain.contracts import (
 )
 from gs_video.domain.errors import CancelledError, RepairableError, UnsupportedMaterialError
 from gs_video.domain.models import (
+    ArtifactCategory,
+    ArtifactRef,
     ArtifactRole,
     CameraPose,
     FootPointState,
@@ -66,6 +68,24 @@ ProjectMutation = Callable[[Project], None]
 
 def key(character: str) -> CacheKey:
     return character * 64
+
+
+def artifact_ref(
+    project: Project,
+    category: ArtifactCategory,
+    cache_key: str,
+    member: str | None = None,
+) -> ArtifactRef:
+    return ArtifactRef(
+        project_id=project.project_id,
+        category=category,
+        cache_key=cache_key,
+        member=member,
+    )
+
+
+def artifact_path(root: Path, reference: ArtifactRef) -> Path:
+    return root / reference.relative_path()
 
 
 def write_rgb(path: Path, size: tuple[int, int], value: int) -> None:
@@ -173,13 +193,16 @@ def test_ingest_registers_proxy_and_full_resolution_frames(tmp_path: Path) -> No
 
     result = service.run(project, CancellationToken(), discard_progress)
 
-    assert result.artifacts[ArtifactRole.PROXY_FRAMES] == Path(
-        f"proxies/{result.cache_key}"
+    assert result.artifacts[ArtifactRole.PROXY_FRAMES] == artifact_ref(
+        project, ArtifactCategory.PROXIES, result.cache_key
     )
-    assert result.artifacts[ArtifactRole.SOURCE_FRAMES] == Path(
-        f"frames/{result.cache_key}"
+    assert result.artifacts[ArtifactRole.SOURCE_FRAMES] == artifact_ref(
+        project, ArtifactCategory.FRAMES, result.cache_key
     )
-    with Image.open(tmp_path / result.artifacts[ArtifactRole.SOURCE_FRAMES] / "000001.png") as image:
+    with Image.open(
+        artifact_path(tmp_path, result.artifacts[ArtifactRole.SOURCE_FRAMES])
+        / "000001.png"
+    ) as image:
         assert image.mode == "RGB"
         assert image.size == (8, 6)
     assert backend.source_calls == 1
@@ -233,7 +256,7 @@ def test_ingest_cache_hit_revalidates_proxy_dimensions(tmp_path: Path) -> None:
     backend = FakeMediaBackend()
     service = MediaIngestService(WorkflowPaths(tmp_path), backend)
     first = service.run(project, CancellationToken(), discard_progress)
-    proxy_dir = tmp_path / first.artifacts[ArtifactRole.PROXY_FRAMES]
+    proxy_dir = artifact_path(tmp_path, first.artifacts[ArtifactRole.PROXY_FRAMES])
     for index in range(1, 4):
         write_rgb(proxy_dir / f"{index:06d}.jpg", (16, 12), index)
 
@@ -338,8 +361,12 @@ def ingest_succeeded(project: Project, root: Path, cache_key: str = key("a")) ->
         status=StageStatus.SUCCEEDED,
         cache_key=cache_key,
         artifacts={
-            ArtifactRole.SOURCE_FRAMES: f"frames/{cache_key}",
-            ArtifactRole.PROXY_FRAMES: f"proxies/{cache_key}",
+            ArtifactRole.SOURCE_FRAMES: artifact_ref(
+                project, ArtifactCategory.FRAMES, cache_key
+            ),
+            ArtifactRole.PROXY_FRAMES: artifact_ref(
+                project, ArtifactCategory.PROXIES, cache_key
+            ),
         },
     )
     return project
@@ -354,8 +381,10 @@ def test_segment_uses_proxy_frames_and_publishes_flat_mask_inventory(tmp_path: P
     result = service.run(project, CancellationToken(), discard_progress)
 
     relative = result.artifacts[ArtifactRole.SUBJECT_MASKS]
-    assert relative == Path(f"masks/{result.cache_key}")
-    assert sorted(path.name for path in (tmp_path / relative).iterdir()) == [
+    assert relative == artifact_ref(
+        project, ArtifactCategory.MASKS, result.cache_key
+    )
+    assert sorted(path.name for path in artifact_path(tmp_path, relative).iterdir()) == [
         "000001.png",
         "000002.png",
         "000003.png",
@@ -368,8 +397,8 @@ def test_segment_uses_proxy_frames_and_publishes_flat_mask_inventory(tmp_path: P
 def test_segment_rejects_stale_ingest_artifact_authority(tmp_path: Path) -> None:
     project = ingest_succeeded(source_project(tmp_path), tmp_path)
     project.workflow.subject_prompt = SubjectPromptState(frame_index=0, x=1, y=1)
-    project.stages[StageName.INGEST].artifacts[ArtifactRole.PROXY_FRAMES] = (
-        f"proxies/{key('b')}"
+    project.stages[StageName.INGEST].artifacts[ArtifactRole.PROXY_FRAMES] = artifact_ref(
+        project, ArtifactCategory.PROXIES, key("b")
     )
 
     with pytest.raises(RepairableError, match="cache|缓存|artifact|产物"):
@@ -385,7 +414,7 @@ def test_segment_cache_hit_revalidates_mask_count_and_proxy_sizes(
     project.workflow.subject_prompt = SubjectPromptState(frame_index=0, x=1, y=1)
     service = SegmentWorkflowService(WorkflowPaths(tmp_path), FakeSegmenter(tmp_path))
     first = service.run(project, CancellationToken(), discard_progress)
-    mask_dir = tmp_path / first.artifacts[ArtifactRole.SUBJECT_MASKS]
+    mask_dir = artifact_path(tmp_path, first.artifacts[ArtifactRole.SUBJECT_MASKS])
     write_mask(mask_dir / "000002.png", (8, 6))
 
     with pytest.raises(RepairableError, match="尺寸|代理"):
@@ -457,8 +486,10 @@ def test_camera_solver_publishes_serialized_solution(tmp_path: Path) -> None:
     result = service.run(project, CancellationToken(), discard_progress)
 
     relative = result.artifacts[ArtifactRole.CAMERA_SOLUTION]
-    assert relative == Path(f"camera/{result.cache_key}/solution.json")
-    restored = read_camera_solution(tmp_path / relative)
+    assert relative == artifact_ref(
+        project, ArtifactCategory.CAMERA, result.cache_key, "solution.json"
+    )
+    restored = read_camera_solution(artifact_path(tmp_path, relative))
     assert len(restored.camera_to_world) == 3
     np.testing.assert_allclose(restored.camera_to_world[2][:3, 3], [2, 0, 0])
 
@@ -469,7 +500,7 @@ def test_camera_cache_hit_revalidates_pose_count(tmp_path: Path) -> None:
         WorkflowPaths(tmp_path), FakeSolver(), backend_identity="fake-opencv-1"
     )
     first = service.run(project, CancellationToken(), discard_progress)
-    path = tmp_path / first.artifacts[ArtifactRole.CAMERA_SOLUTION]
+    path = artifact_path(tmp_path, first.artifacts[ArtifactRole.CAMERA_SOLUTION])
     restored = read_camera_solution(path)
     write_camera_solution(
         path,
@@ -511,7 +542,11 @@ def camera_succeeded(project: Project, root: Path, cache_key: str = key("c")) ->
     project.stages[StageName.SOLVE_CAMERA] = StageState(
         status=StageStatus.SUCCEEDED,
         cache_key=cache_key,
-        artifacts={ArtifactRole.CAMERA_SOLUTION: f"camera/{cache_key}/solution.json"},
+        artifacts={
+            ArtifactRole.CAMERA_SOLUTION: artifact_ref(
+                project, ArtifactCategory.CAMERA, cache_key, "solution.json"
+            )
+        },
     )
     return project
 
@@ -558,8 +593,13 @@ def test_trajectory_mapper_requires_and_serializes_single_preview_authority(
     )
 
     relative = result.artifacts[ArtifactRole.MAPPED_TRAJECTORY]
-    assert relative == Path(f"trajectories/{result.cache_key}/trajectory.json")
-    mapped = read_mapped_trajectory(tmp_path / relative)
+    assert relative == artifact_ref(
+        project,
+        ArtifactCategory.TRAJECTORIES,
+        result.cache_key,
+        "trajectory.json",
+    )
+    mapped = read_mapped_trajectory(artifact_path(tmp_path, relative))
     assert mapped.fov_y_degrees == 55
     assert len(mapped.camera_to_world) == 3
     assert np.linalg.norm(
@@ -584,7 +624,9 @@ def test_trajectory_cache_hit_revalidates_fov_and_pose_count(tmp_path: Path) -> 
     authorize_mapping(project)
     service = TrajectoryMapWorkflowService(WorkflowPaths(tmp_path))
     first = service.run(project, CancellationToken(), discard_progress)
-    path = tmp_path / first.artifacts[ArtifactRole.MAPPED_TRAJECTORY]
+    path = artifact_path(
+        tmp_path, first.artifacts[ArtifactRole.MAPPED_TRAJECTORY]
+    )
     cached = read_mapped_trajectory(path)
     write_mapped_trajectory(
         path,
@@ -600,9 +642,12 @@ def test_trajectory_rejects_camera_replacement_during_mapping(
 ) -> None:
     project = camera_succeeded(source_project(tmp_path), tmp_path)
     authorize_mapping(project)
-    solution_path = tmp_path / project.stages[StageName.SOLVE_CAMERA].artifacts[
-        ArtifactRole.CAMERA_SOLUTION
-    ]
+    solution_path = artifact_path(
+        tmp_path,
+        project.stages[StageName.SOLVE_CAMERA].artifacts[
+            ArtifactRole.CAMERA_SOLUTION
+        ],
+    )
     original_map = workflow_services.map_trajectory
 
     def replacing_map(
@@ -729,10 +774,10 @@ def test_renderer_service_orchestrates_cpu_adapter_and_registers_artifacts(
 
     assert len(worker.requests) == 1
     assert worker.requests[0].scene_path == tmp_path / "source" / "scene.ply"
-    assert result.artifacts[ArtifactRole.RENDER_FRAMES] == Path(
-        f"renders/{result.cache_key}"
+    assert result.artifacts[ArtifactRole.RENDER_FRAMES] == artifact_ref(
+        project, ArtifactCategory.RENDERS, result.cache_key
     )
-    output = tmp_path / result.artifacts[ArtifactRole.RENDER_FRAMES]
+    output = artifact_path(tmp_path, result.artifacts[ArtifactRole.RENDER_FRAMES])
     assert (output / "000001.png").is_file()
     assert events == [(1, 1, "cpu fake render 1/1")]
 
@@ -759,7 +804,14 @@ def renderer_project(root: Path) -> Project:
     project.stages[StageName.MAP_TRAJECTORY] = StageState(
         status=StageStatus.SUCCEEDED,
         cache_key=mapped_key,
-        artifacts={ArtifactRole.MAPPED_TRAJECTORY: str(trajectory.relative_to(root))},
+        artifacts={
+            ArtifactRole.MAPPED_TRAJECTORY: artifact_ref(
+                project,
+                ArtifactCategory.TRAJECTORIES,
+                mapped_key,
+                "trajectory.json",
+            )
+        },
     )
     return project
 
@@ -853,12 +905,20 @@ def completed_render_project(root: Path) -> Project:
     project.stages[StageName.SEGMENT] = StageState(
         status=StageStatus.SUCCEEDED,
         cache_key=segment_key,
-        artifacts={ArtifactRole.SUBJECT_MASKS: f"masks/{segment_key}"},
+        artifacts={
+            ArtifactRole.SUBJECT_MASKS: artifact_ref(
+                project, ArtifactCategory.MASKS, segment_key
+            )
+        },
     )
     project.stages[StageName.RENDER] = StageState(
         status=StageStatus.SUCCEEDED,
         cache_key=render_key,
-        artifacts={ArtifactRole.RENDER_FRAMES: f"renders/{render_key}"},
+        artifacts={
+            ArtifactRole.RENDER_FRAMES: artifact_ref(
+                project, ArtifactCategory.RENDERS, render_key
+            )
+        },
     )
     return project
 
@@ -879,14 +939,18 @@ def test_compositor_uses_source_dimensions_and_registers_preview(
 
     result = service.run(project, CancellationToken(), discard_progress)
 
-    assert result.artifacts[ArtifactRole.COMPOSITE_FRAMES] == Path(
-        f"composites/{result.cache_key}"
+    assert result.artifacts[ArtifactRole.COMPOSITE_FRAMES] == artifact_ref(
+        project, ArtifactCategory.COMPOSITES, result.cache_key
     )
-    assert result.artifacts[ArtifactRole.COMPOSITE_PREVIEW] == Path(
-        f"previews/{result.cache_key}/composite-preview.mp4"
+    assert result.artifacts[ArtifactRole.COMPOSITE_PREVIEW] == artifact_ref(
+        project,
+        ArtifactCategory.PREVIEWS,
+        result.cache_key,
+        "composite-preview.mp4",
     )
     with Image.open(
-        tmp_path / result.artifacts[ArtifactRole.COMPOSITE_FRAMES] / "000001.png"
+        artifact_path(tmp_path, result.artifacts[ArtifactRole.COMPOSITE_FRAMES])
+        / "000001.png"
     ) as image:
         assert image.mode == "RGB"
         assert image.size == (8, 6)
@@ -907,7 +971,9 @@ def test_composite_preview_cache_hit_rejects_content_tampering(tmp_path: Path) -
         prober=prober,
     )
     first = service.run(project, CancellationToken(), discard_progress)
-    preview = tmp_path / first.artifacts[ArtifactRole.COMPOSITE_PREVIEW]
+    preview = artifact_path(
+        tmp_path, first.artifacts[ArtifactRole.COMPOSITE_PREVIEW]
+    )
     preview.write_bytes(b"tampered preview")
 
     with pytest.raises(RepairableError, match="hash|摘要|清单|manifest"):
@@ -927,7 +993,9 @@ def test_composite_preview_cache_hit_rejects_manifest_type_tampering(
         prober=RecordingProber(3),
     )
     first = service.run(project, CancellationToken(), discard_progress)
-    preview = tmp_path / first.artifacts[ArtifactRole.COMPOSITE_PREVIEW]
+    preview = artifact_path(
+        tmp_path, first.artifacts[ArtifactRole.COMPOSITE_PREVIEW]
+    )
     manifest = preview.parent / "manifest.json"
     document = json.loads(manifest.read_text(encoding="utf-8"))
     document["fps"] = 24
@@ -982,9 +1050,10 @@ def test_preview_exporter_metadata_is_validated_before_publication(
 
 def test_compositor_rejects_nonconsecutive_render_inventory(tmp_path: Path) -> None:
     project = completed_render_project(tmp_path)
-    render_path = tmp_path / project.stages[StageName.RENDER].artifacts[
-        ArtifactRole.RENDER_FRAMES
-    ]
+    render_path = artifact_path(
+        tmp_path,
+        project.stages[StageName.RENDER].artifacts[ArtifactRole.RENDER_FRAMES],
+    )
     (render_path / "000002.png").rename(render_path / "000004.png")
 
     with pytest.raises(RepairableError, match="连续|inventory|帧"):
@@ -998,9 +1067,10 @@ def test_compositor_rejects_nonconsecutive_render_inventory(tmp_path: Path) -> N
 
 def test_compositor_rejects_masks_that_are_not_proxy_resolution(tmp_path: Path) -> None:
     project = completed_render_project(tmp_path)
-    mask_path = tmp_path / project.stages[StageName.SEGMENT].artifacts[
-        ArtifactRole.SUBJECT_MASKS
-    ] / "000002.png"
+    mask_path = artifact_path(
+        tmp_path,
+        project.stages[StageName.SEGMENT].artifacts[ArtifactRole.SUBJECT_MASKS],
+    ) / "000002.png"
     write_mask(mask_path, (8, 6))
 
     with pytest.raises(RepairableError, match="尺寸|代理"):
@@ -1016,9 +1086,10 @@ def test_compositor_rejects_upstream_replacement_before_publication(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     project = completed_render_project(tmp_path)
-    source_directory = tmp_path / project.stages[StageName.INGEST].artifacts[
-        ArtifactRole.SOURCE_FRAMES
-    ]
+    source_directory = artifact_path(
+        tmp_path,
+        project.stages[StageName.INGEST].artifacts[ArtifactRole.SOURCE_FRAMES],
+    )
     original_composite = workflow_services.composite_frame
     replaced = False
 
@@ -1062,7 +1133,7 @@ def test_export_registers_full_composite_video(tmp_path: Path) -> None:
     project.stages[StageName.COMPOSITE] = StageState(
         status=StageStatus.SUCCEEDED,
         cache_key=composite.cache_key,
-        artifacts={role: str(path) for role, path in composite.artifacts.items()},
+        artifacts=dict(composite.artifacts),
     )
     final_exporter = RecordingExporter()
     final_prober = RecordingProber(3)
@@ -1074,8 +1145,8 @@ def test_export_registers_full_composite_video(tmp_path: Path) -> None:
         prober=final_prober,
     ).run(project, CancellationToken(), discard_progress)
 
-    assert result.artifacts[ArtifactRole.EXPORT_VIDEO] == Path(
-        f"exports/{result.cache_key}/final.mp4"
+    assert result.artifacts[ArtifactRole.EXPORT_VIDEO] == artifact_ref(
+        project, ArtifactCategory.EXPORTS, result.cache_key, "final.mp4"
     )
     assert len(final_exporter.calls) == 1
     assert final_exporter.calls[0][3] == 3
@@ -1094,7 +1165,7 @@ def test_final_export_cache_hit_rejects_content_tampering(tmp_path: Path) -> Non
     project.stages[StageName.COMPOSITE] = StageState(
         status=StageStatus.SUCCEEDED,
         cache_key=composite.cache_key,
-        artifacts={role: str(path) for role, path in composite.artifacts.items()},
+        artifacts=dict(composite.artifacts),
     )
     exporter = RecordingExporter()
     service = ExportWorkflowService(
@@ -1104,7 +1175,7 @@ def test_final_export_cache_hit_rejects_content_tampering(tmp_path: Path) -> Non
         prober=RecordingProber(3),
     )
     first = service.run(project, CancellationToken(), discard_progress)
-    output = tmp_path / first.artifacts[ArtifactRole.EXPORT_VIDEO]
+    output = artifact_path(tmp_path, first.artifacts[ArtifactRole.EXPORT_VIDEO])
     output.write_bytes(b"tampered final")
 
     with pytest.raises(RepairableError, match="hash|摘要|清单|manifest"):
@@ -1127,7 +1198,7 @@ def test_final_export_rejects_upstream_replacement_before_publication(
     project.stages[StageName.COMPOSITE] = StageState(
         status=StageStatus.SUCCEEDED,
         cache_key=composite.cache_key,
-        artifacts={role: str(path) for role, path in composite.artifacts.items()},
+        artifacts=dict(composite.artifacts),
     )
 
     class ReplacingExporter(RecordingExporter):

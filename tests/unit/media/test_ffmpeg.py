@@ -108,18 +108,18 @@ def test_parse_probe_rejects_missing_or_invalid_stream_fields(
         parse_probe(payload)
 
 
-@pytest.mark.parametrize("duration", [10, 30])
+@pytest.mark.parametrize("duration", [10, 120])
 def test_validate_source_accepts_inclusive_duration_boundaries(duration: float) -> None:
-    validate_source(VideoMetadata(width=1920, height=1080, duration=duration, fps="30/1"))
+    validate_source(VideoMetadata(width=3840, height=2160, duration=duration, fps="30/1"))
 
 
 @pytest.mark.parametrize(
     ("metadata", "message"),
     [
         (VideoMetadata(width=1920, height=1080, duration=9.99, fps="30/1"), "10 秒"),
-        (VideoMetadata(width=1920, height=1080, duration=30.01, fps="30/1"), "30 秒"),
-        (VideoMetadata(width=1921, height=1080, duration=10, fps="30/1"), "1920×1080"),
-        (VideoMetadata(width=1920, height=1081, duration=10, fps="30/1"), "1920×1080"),
+        (VideoMetadata(width=1920, height=1080, duration=120.01, fps="30/1"), "120 秒"),
+        (VideoMetadata(width=3841, height=2160, duration=10, fps="30/1"), "3840×2160"),
+        (VideoMetadata(width=3840, height=2161, duration=10, fps="30/1"), "3840×2160"),
     ],
 )
 def test_validate_source_rejects_out_of_range_material(

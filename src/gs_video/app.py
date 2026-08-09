@@ -8,6 +8,7 @@ from ipaddress import ip_address
 import os
 import socket
 import sys
+from dataclasses import replace
 from typing import Any, Protocol, TextIO
 
 import uvicorn
@@ -20,12 +21,17 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from gs_video.api.events import EventBus, TaskService
 from gs_video.api.assets import ExportInspector
-from gs_video.api.middleware import LocalSecurityBoundary
+from gs_video.api.middleware import (
+    LocalSecurityBoundary,
+    StorageMaintenanceBoundary,
+    StorageMaintenanceCoordinator,
+)
 from gs_video.api.routes import ApiServices, build_router
 from gs_video.api.schemas import API_VERSION, ApiError, ApiSettings, ErrorEnvelope
 from gs_video.api.uploads import UploadManager
 from gs_video.api.workflow import PreviewArtifactStore, PreviewCoordinator
 from gs_video.runtime import WorkflowRuntimeConfig, assemble_api_services
+from gs_video.storage.artifacts import ArtifactStore
 
 
 def _error_response(status_code: int, envelope: ErrorEnvelope) -> JSONResponse:
@@ -35,6 +41,14 @@ def _error_response(status_code: int, envelope: ErrorEnvelope) -> JSONResponse:
 def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
     if services.preview_service is None:
         raise ValueError("production API services require an explicit preview service")
+    if services.artifact_store is None:
+        services = replace(
+            services,
+            artifact_store=ArtifactStore(
+                services.project_repository.root,
+                project_namespace=False,
+            ),
+        )
     event_bus = EventBus(settings.event_window)
     task_service = TaskService(
         services.pipeline_runner,
@@ -91,6 +105,8 @@ def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
     )
     app.state.preview_coordinator = PreviewCoordinator()
     app.state.export_inspector = services.export_inspector or ExportInspector()
+    storage_layout = services.storage_layout
+    app.state.storage_maintenance = StorageMaintenanceCoordinator()
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.allowed_origins),
@@ -98,7 +114,25 @@ def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         allow_headers=["Authorization", "Content-Type"],
     )
-    app.add_middleware(LocalSecurityBoundary, settings=settings)
+    app.add_middleware(
+        StorageMaintenanceBoundary,
+        coordinator=app.state.storage_maintenance,
+        settings=settings,
+        mutation_blocked=(
+            None
+            if storage_layout is None
+            else lambda: storage_layout.restart_required
+        ),
+    )
+    app.add_middleware(
+        LocalSecurityBoundary,
+        settings=settings,
+        mutation_blocked=(
+            None
+            if storage_layout is None
+            else lambda: storage_layout.restart_required
+        ),
+    )
 
     @app.exception_handler(ApiError)
     async def api_error_handler(request: Request, error: ApiError) -> JSONResponse:

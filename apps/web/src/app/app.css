@@ -237,6 +237,32 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 .modal-actions { display: flex; justify-content: flex-end; gap: .55rem; }
 .hub-footer { display: grid; place-items: center; border-top: 1px solid var(--line); color: #627078; font: 700 .62rem ui-monospace, monospace; letter-spacing: .1em; }
 .asset-library-main { padding-top: 2.4rem; }
+.storage-settings-main { display: grid; gap: 1.25rem; }
+.storage-settings-heading, .storage-settings-grid, .storage-settings-actions, .storage-restart-card, .storage-settings-notice { width: min(1120px, 100%); margin-inline: auto; }
+.storage-settings-heading h1 { margin: 0.35rem 0 0.55rem; font-size: clamp(2rem, 4vw, 3.3rem); letter-spacing: -0.045em; }
+.storage-settings-heading > p:last-child { max-width: 720px; margin: 0; color: var(--muted); line-height: 1.65; }
+.storage-settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+.storage-root-card { display: grid; gap: 0.8rem; padding: 1.15rem; border: 1px solid var(--line); border-top: 2px solid var(--acid); border-radius: 10px; background: var(--panel); }
+.storage-root-card h2 { margin: 0.2rem 0 0; }
+.storage-root-card > div:first-child span, .storage-root-card > label, .storage-root-card legend { color: var(--muted); font-size: 0.68rem; }
+.storage-path-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.55rem; }
+.storage-path-row input { min-width: 0; color: var(--text); background: #080c0f; border: 1px solid #3a464d; border-radius: 7px; padding: 0.7rem; }
+.storage-root-card fieldset { display: grid; gap: 0.45rem; margin: 0; padding: 0; border: 0; }
+.storage-root-card fieldset label { display: flex; align-items: center; gap: 0.5rem; padding: 0.55rem; border: 1px solid var(--line); border-radius: 7px; font-size: 0.75rem; }
+.storage-root-card input[type="radio"] { accent-color: var(--acid); }
+.storage-capacity { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.55rem; margin: 0; }
+.storage-capacity div { padding-top: 0.55rem; border-top: 1px solid var(--line); }
+.storage-capacity dt { color: var(--muted); font-size: 0.64rem; }
+.storage-capacity dd { margin: 0.2rem 0 0; font-size: 0.76rem; font-weight: 700; }
+.storage-cleanup-actions { display: flex; gap: 0.55rem; }
+.storage-cleanup-actions button { min-height: 36px; padding: 0.45rem 0.7rem; font-size: 0.7rem; }
+.storage-cleanup-result { margin: 0; color: var(--cyan); font-size: 0.72rem; }
+.storage-settings-actions, .storage-restart-card { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem; border: 1px solid var(--line); border-radius: 9px; background: #0f1418; }
+.storage-settings-actions small, .storage-restart-card p, .storage-settings-notice { color: var(--muted); line-height: 1.5; }
+.storage-restart-card strong { color: var(--acid); }
+.storage-restart-card p { margin: 0.25rem 0 0; }
+.storage-settings-notice { padding: 0.8rem; border-radius: 7px; background: rgba(85,214,194,0.08); }
+@media (max-width: 760px) { .storage-settings-grid { grid-template-columns: 1fr; } .storage-settings-actions, .storage-restart-card { align-items: stretch; flex-direction: column; } }
 .asset-library-heading { align-items: end; }
 .asset-library-heading h1 { margin-bottom: .55rem; font-size: clamp(2rem,4vw,3.4rem); }
 .asset-tabs { display: flex; gap: .35rem; margin-top: 1.5rem; margin-bottom: 1rem; border-bottom: 1px solid var(--line); }

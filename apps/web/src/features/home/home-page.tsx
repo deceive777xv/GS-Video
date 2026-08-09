@@ -53,7 +53,7 @@ export function HomePage({
         <div>
           <p className="eyebrow">PROJECT HOME</p>
           <h1>从一个项目继续，或开始新的合成。</h1>
-          <p>项目目录只保存配置、缓存和生成结果；视频与 PLY 统一进入共享素材库。</p>
+          <p>项目库保存配置与共享素材；帧、遮罩和生成结果统一进入可迁移的缓存目录。</p>
         </div>
         <form className="project-create" onSubmit={(event) => { event.preventDefault(); void create() }}>
           <label htmlFor="new-project-name">新项目名称</label>

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
@@ -14,10 +16,117 @@ ALLOWED_CORS_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 ALLOWED_CORS_HEADERS = frozenset({"authorization", "content-type"})
 
 
+def _mutates_storage(method: str, path: str) -> bool:
+    return method not in {"GET", "HEAD", "OPTIONS"} or (
+        method == "GET" and path == "/api/v1/projects/current/export"
+    )
+
+
+class StorageMaintenanceCoordinator:
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._active_mutations = 0
+        self._exclusive = False
+
+    @asynccontextmanager
+    async def mutation(self) -> AsyncIterator[None]:
+        async with self._condition:
+            await self._condition.wait_for(lambda: not self._exclusive)
+            self._active_mutations += 1
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._active_mutations -= 1
+                self._condition.notify_all()
+
+    @asynccontextmanager
+    async def exclusive(self) -> AsyncIterator[None]:
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: not self._exclusive and self._active_mutations == 0
+            )
+            self._exclusive = True
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._exclusive = False
+                self._condition.notify_all()
+
+
+class StorageMaintenanceBoundary:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        coordinator: StorageMaintenanceCoordinator,
+        settings: ApiSettings,
+        mutation_blocked: Callable[[], bool] | None = None,
+    ) -> None:
+        self._app = app
+        self._coordinator = coordinator
+        self._settings = settings
+        self._mutation_blocked = mutation_blocked
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        method = str(scope.get("method", "")).upper()
+        path = str(scope.get("path", ""))
+        if not _mutates_storage(method, path):
+            await self._app(scope, receive, send)
+            return
+        context = (
+            self._coordinator.exclusive()
+            if (
+                method == "PATCH" and path == "/api/v1/runtime/storage-layout"
+            )
+            or path == "/api/v1/runtime/storage-layout/cache-cleanup"
+            else self._coordinator.mutation()
+        )
+        async with context:
+            if (
+                path != "/api/v1/shutdown"
+                and not path.startswith("/api/v1/runtime/storage-layout")
+                and self._mutation_blocked is not None
+                and self._mutation_blocked()
+            ):
+                origin = Headers(scope=scope).get("origin")
+                headers = (
+                    {"Access-Control-Allow-Origin": str(origin), "Vary": "Origin"}
+                    if origin in self._settings.allowed_origins
+                    else {}
+                )
+                response = JSONResponse(
+                    status_code=409,
+                    content=ErrorEnvelope(
+                        code="storage_restart_required",
+                        category="conflict",
+                        message=(
+                            "Restart the application before making further changes."
+                        ),
+                        retryable=False,
+                    ).model_dump(mode="json"),
+                    headers=headers,
+                )
+                await response(scope, receive, send)
+                return
+            await self._app(scope, receive, send)
+
+
 class LocalSecurityBoundary:
-    def __init__(self, app: ASGIApp, *, settings: ApiSettings) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        settings: ApiSettings,
+        mutation_blocked: Callable[[], bool] | None = None,
+    ) -> None:
         self._app = app
         self._settings = settings
+        self._mutation_blocked = mutation_blocked
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or not self._is_protected(scope):
@@ -69,6 +178,30 @@ class LocalSecurityBoundary:
                     code="cors_forbidden",
                     category="cors",
                     message="The request Origin is not allowed.",
+                    retryable=False,
+                ),
+            )
+            return
+
+        path = str(scope.get("path", ""))
+        if (
+            _mutates_storage(method, path)
+            and path != "/api/v1/shutdown"
+            and not path.startswith("/api/v1/runtime/storage-layout")
+            and self._mutation_blocked is not None
+            and self._mutation_blocked()
+        ):
+            await self._reject(
+                scope,
+                receive,
+                send,
+                409,
+                ErrorEnvelope(
+                    code="storage_restart_required",
+                    category="conflict",
+                    message=(
+                        "Restart the application before making further changes."
+                    ),
                     retryable=False,
                 ),
             )

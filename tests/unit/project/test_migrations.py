@@ -6,7 +6,7 @@ from gs_video.project.migrations import migrate_project_dict
 def test_migration_adds_stage_map() -> None:
     migrated = migrate_project_dict({"schema_version": 0, "name": "legacy"})
 
-    assert migrated["schema_version"] == 4
+    assert migrated["schema_version"] == 5
     assert migrated["stages"] == {}
     assert migrated["workflow"] == {}
 
@@ -18,7 +18,9 @@ def test_v0_migration_preserves_existing_stage_map() -> None:
         {"schema_version": 0, "name": "legacy", "stages": stages}
     )
 
-    assert migrated["stages"] == stages
+    assert migrated["stages"] == {
+        "ingest": {"status": "succeeded", "output_paths": [], "artifacts": {}}
+    }
 
 
 def test_v1_migration_adds_persisted_workflow_state() -> None:
@@ -32,13 +34,13 @@ def test_v1_migration_adds_persisted_workflow_state() -> None:
         }
     )
 
-    assert migrated["schema_version"] == 4
+    assert migrated["schema_version"] == 5
     assert migrated["workflow"] == {}
 
 
 def test_migration_rejects_future_schema_version() -> None:
     with pytest.raises(ValueError, match="高于应用支持版本"):
-        migrate_project_dict({"schema_version": 5, "name": "future"})
+        migrate_project_dict({"schema_version": 6, "name": "future"})
 
 
 def test_v2_migration_binds_matching_legacy_pick_authority() -> None:
@@ -64,7 +66,7 @@ def test_v2_migration_binds_matching_legacy_pick_authority() -> None:
         }
     )
 
-    assert migrated["schema_version"] == 4
+    assert migrated["schema_version"] == 5
     workflow = migrated["workflow"]
     assert workflow["confirmed_preview_artifact_id"] == artifact_id
     assert workflow["foot_point"]["preview_artifact_id"] == artifact_id

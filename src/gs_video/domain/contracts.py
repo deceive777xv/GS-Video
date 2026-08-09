@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Protocol
 import numpy as np
 import numpy.typing as npt
 
-from gs_video.domain.models import ArtifactRole, Project, StageName
+from gs_video.domain.models import ArtifactRef, ArtifactRole, Project, StageName
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
 
@@ -21,9 +21,9 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class StageResult:
-    output_paths: tuple[Path, ...]
+    output_paths: tuple[ArtifactRef, ...]
     cache_key: str
-    artifacts: dict[ArtifactRole, Path] = field(default_factory=dict)
+    artifacts: dict[ArtifactRole, ArtifactRef] = field(default_factory=dict)
 
 
 class SegmentationBackend(StrEnum):

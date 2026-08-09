@@ -437,7 +437,7 @@ class ProductionHarness:
                 },
                 headers=headers,
             )
-            assert preview.status_code == 201
+            assert preview.status_code == 201, preview.json()
             preview_descriptor = preview.json()
             confirmed = client.post(
                 "/api/v1/projects/current/camera/confirm",
@@ -517,6 +517,6 @@ def test_assembled_workflow_produces_preview_and_verified_export(
     assert project.stages[StageName.EXPORT].status is StageStatus.SUCCEEDED
     assert project.stages[StageName.COMPOSITE].artifacts[
         ArtifactRole.COMPOSITE_PREVIEW
-    ].endswith("/composite-preview.mp4")
+    ].member == "composite-preview.mp4"
     assert project.workflow.export_result is not None
     assert project.workflow.export_result.verified is True

@@ -18,7 +18,15 @@ from gs_video.api.routes import ApiServices
 from gs_video.api.schemas import ApiError, ApiSettings
 from gs_video.api.uploads import CHUNK_LIMIT
 from gs_video.app import create_app
-from gs_video.domain.models import ArtifactRole, StageName, StageState, StageStatus
+from gs_video.domain.models import (
+    ArtifactCategory,
+    ArtifactRef,
+    ArtifactRole,
+    Project,
+    StageName,
+    StageState,
+    StageStatus,
+)
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.media.ffmpeg import VideoMetadata
 from gs_video.pipeline.cancellation import CancellationToken
@@ -96,6 +104,21 @@ def assert_stable_error(response: object, *, status_code: int, code: str) -> Non
     assert body["code"] == code
 
 
+def composite_stage(project: Project, cache_key: str) -> StageState:
+    reference = ArtifactRef(
+        project_id=project.project_id,
+        category=ArtifactCategory.PREVIEWS,
+        cache_key=cache_key,
+        member="composite-preview.mp4",
+    )
+    return StageState(
+        status=StageStatus.SUCCEEDED,
+        cache_key=cache_key,
+        output_paths=[reference],
+        artifacts={ArtifactRole.COMPOSITE_PREVIEW: reference},
+    )
+
+
 @pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.2", "localhost", "example.com"])
 def test_settings_reject_non_ip_or_non_loopback_bind_hosts(host: str) -> None:
     with pytest.raises(ValidationError):
@@ -128,21 +151,16 @@ def test_composite_preview_blob_revalidates_current_stage_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # type: ignore[no-untyped-def]
     client, root = client_and_root
-    cache_key = "composite-security-key"
+    cache_key = hashlib.sha256(b"composite-security-key").hexdigest()
     relative = f"previews/{cache_key}/composite-preview.mp4"
     preview = root / relative
-    preview.parent.mkdir()
+    preview.parent.mkdir(parents=True)
     preview.write_bytes(b"composite-preview")
     repository = client.app.state.services.project_repository
     repository.update(
         lambda project: project.stages.__setitem__(
             StageName.COMPOSITE,
-            StageState(
-                status=StageStatus.SUCCEEDED,
-                cache_key=cache_key,
-                output_paths=[relative],
-                artifacts={ArtifactRole.COMPOSITE_PREVIEW: relative},
-            ),
+            composite_stage(project, cache_key),
         )
     )
 
@@ -180,21 +198,16 @@ def test_composite_preview_rejects_unsafe_registered_files(
     mutation: str,
 ) -> None:  # type: ignore[no-untyped-def]
     client, root = client_and_root
-    cache_key = f"composite-{mutation}"
+    cache_key = hashlib.sha256(f"composite-{mutation}".encode()).hexdigest()
     relative = f"previews/{cache_key}/composite-preview.mp4"
     preview = root / relative
-    preview.parent.mkdir()
+    preview.parent.mkdir(parents=True)
     preview.write_bytes(b"composite-preview")
     repository = client.app.state.services.project_repository
     repository.update(
         lambda project: project.stages.__setitem__(
             StageName.COMPOSITE,
-            StageState(
-                status=StageStatus.SUCCEEDED,
-                cache_key=cache_key,
-                output_paths=[relative],
-                artifacts={ArtifactRole.COMPOSITE_PREVIEW: relative},
-            ),
+            composite_stage(project, cache_key),
         )
     )
 
@@ -229,46 +242,21 @@ def test_composite_preview_rejects_unsafe_registered_files(
     assert_stable_error(response, status_code=409, code="composite_preview_changed")
 
 
-def test_composite_preview_rejects_cache_registered_path_outside_previews_root(
-    client_and_root,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:  # type: ignore[no-untyped-def]
-    client, root = client_and_root
-    cache_key = "../escaped-preview"
-    relative = f"previews/{cache_key}/composite-preview.mp4"
-    escaped_preview = root / "escaped-preview" / "composite-preview.mp4"
-    escaped_preview.parent.mkdir()
-    escaped_preview.write_bytes(b"outside-previews-root")
-    repository = client.app.state.services.project_repository
-    repository.update(
-        lambda project: project.stages.__setitem__(
-            StageName.COMPOSITE,
-            StageState(
-                status=StageStatus.SUCCEEDED,
-                cache_key=cache_key,
-                output_paths=[relative],
-                artifacts={ArtifactRole.COMPOSITE_PREVIEW: relative},
-            ),
+def test_composite_preview_rejects_cache_registered_path_outside_previews_root() -> None:
+    with pytest.raises(ValidationError):
+        ArtifactRef(
+            project_id="00000000-0000-4000-8000-000000000000",
+            category=ArtifactCategory.PREVIEWS,
+            cache_key="../escaped-preview",
+            member="composite-preview.mp4",
         )
-    )
-
-    class Inspector:
-        def probe(self, path: Path) -> VideoMetadata:
-            raise AssertionError(f"escaped preview reached ffprobe: {path}")
-
-    monkeypatch.setattr(client.app.state, "export_inspector", Inspector())
-    descriptor = client.get(
-        "/api/v1/projects/current/composite-preview", headers=auth_headers()
-    )
-    blob = client.get(
-        "/api/v1/artifacts/composite-previews/" + "a" * 32,
-        headers=auth_headers(),
-    )
-
-    assert_stable_error(descriptor, status_code=409, code="composite_preview_changed")
-    assert_stable_error(blob, status_code=409, code="composite_preview_changed")
-    assert descriptor.content != b"outside-previews-root"
-    assert blob.content != b"outside-previews-root"
+    with pytest.raises(ValidationError):
+        ArtifactRef(
+            project_id="00000000-0000-4000-8000-000000000000",
+            category=ArtifactCategory.PREVIEWS,
+            cache_key="a" * 64,
+            member="../escaped-preview.mp4",
+        )
 
 
 def test_composite_preview_descriptor_revalidates_authority_after_probe(
@@ -276,21 +264,16 @@ def test_composite_preview_descriptor_revalidates_authority_after_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # type: ignore[no-untyped-def]
     client, root = client_and_root
-    cache_key = "composite-race"
+    cache_key = hashlib.sha256(b"composite-race").hexdigest()
     relative = f"previews/{cache_key}/composite-preview.mp4"
     preview = root / relative
-    preview.parent.mkdir()
+    preview.parent.mkdir(parents=True)
     preview.write_bytes(b"composite-preview")
     repository = client.app.state.services.project_repository
     repository.update(
         lambda project: project.stages.__setitem__(
             StageName.COMPOSITE,
-            StageState(
-                status=StageStatus.SUCCEEDED,
-                cache_key=cache_key,
-                output_paths=[relative],
-                artifacts={ArtifactRole.COMPOSITE_PREVIEW: relative},
-            ),
+            composite_stage(project, cache_key),
         )
     )
     probe_started = Event()

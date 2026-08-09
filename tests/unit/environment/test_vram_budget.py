@@ -54,8 +54,11 @@ def test_custom_budget_persists_and_restores_exact_physical_total(tmp_path: Path
     assert updated.mode is VramBudgetMode.CUSTOM
     assert updated.selected_vram_mb == 24_321
     assert json.loads(path.read_text(encoding="utf-8")) == {
-        "mode": "custom",
-        "selected_vram_mb": 24_321,
+        "schema_version": 1,
+        "vram_budget": {
+            "mode": "custom",
+            "selected_vram_mb": 24_321,
+        },
     }
 
     restored = VramBudgetManager(

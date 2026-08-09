@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import stat
 import time
 from collections.abc import Callable
@@ -16,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from gs_video.domain.models import SceneSummary, VideoSummary
 from gs_video.segmentation.paths import has_reparse_component
+from gs_video.resource_admission import bytes_with_disk_headroom
 
 
 class AssetKind(StrEnum):
@@ -246,6 +248,9 @@ class AssetLibrary:
             raise OSError("asset stream must be a single-link ordinary file")
         if source_metadata.st_size > self.max_size:
             raise ValueError("asset exceeds the configured size limit")
+        required_free = bytes_with_disk_headroom(int(source_metadata.st_size))
+        if shutil.disk_usage(self.root).free < required_free:
+            raise OSError("asset library has insufficient space with 20% headroom")
         staging = self.staging_root / uuid4().hex
         digest = hashlib.sha256()
         size = 0

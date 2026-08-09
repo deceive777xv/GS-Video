@@ -24,5 +24,7 @@ export interface PlatformBridge {
   pickInputFile(options: PickFileOptions): Promise<PickedFile | null>
   saveExport(suggestedName: string, source: ExportSource): Promise<void>
   revealPath?(path: string): Promise<void>
+  pickDirectory?(): Promise<string | null>
+  restartApp?(): Promise<void>
   openExternal(url: string): Promise<void>
 }

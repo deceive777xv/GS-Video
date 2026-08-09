@@ -110,12 +110,12 @@ def validate_source(metadata: VideoMetadata) -> None:
         raise UnsupportedMaterialError("视频时长必须是有限数值")
     if metadata.duration < 10:
         raise UnsupportedMaterialError("视频时长不能短于 10 秒")
-    if metadata.duration > 30:
-        raise UnsupportedMaterialError("视频时长不能超过 30 秒")
+    if metadata.duration > 120:
+        raise UnsupportedMaterialError("视频时长不能超过 120 秒")
     if metadata.width <= 0 or metadata.height <= 0:
         raise UnsupportedMaterialError("视频分辨率无效")
-    if metadata.width > 1920 or metadata.height > 1080:
-        raise UnsupportedMaterialError("视频分辨率不能超过 1920×1080")
+    if metadata.width > 3840 or metadata.height > 2160:
+        raise UnsupportedMaterialError("视频分辨率不能超过 3840×2160")
     if metadata.fps <= 0:
         raise UnsupportedMaterialError("视频帧率无效")
 

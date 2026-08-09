@@ -62,6 +62,10 @@ const fakeClient = (): BackendClient => ({
   bootstrap: vi.fn().mockResolvedValue(bootstrap),
   getVramBudget: vi.fn().mockResolvedValue(bootstrap.vram_budget),
   updateVramBudget: vi.fn().mockResolvedValue(bootstrap.vram_budget),
+  getStorageLayout: vi.fn(),
+  updateStorageLayout: vi.fn(),
+  cleanupStorageCache: vi.fn(),
+  planStorageCacheCleanup: vi.fn(),
   getEnvironmentRepair: vi.fn().mockResolvedValue({
     state: 'idle',
     job_id: null,
@@ -180,6 +184,7 @@ describe('platform boundary', () => {
         save: vi.fn(),
       }),
       loadOpener: async () => ({ openUrl: vi.fn(), revealItemInDir: vi.fn() }),
+      loadCore: async () => ({ invoke: vi.fn() }),
     })
 
     const picked = await bridge.pickInputFile({

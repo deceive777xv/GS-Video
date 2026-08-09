@@ -57,6 +57,9 @@ from gs_video.scene.worker_client import RendererWorkerClient
 from gs_video.scene.preview_session import PreviewSession
 from gs_video.segmentation.client import VideoSegmenterClient
 from gs_video.segmentation.paths import has_reparse_component, is_wsl_prefix
+from gs_video.storage.artifacts import ArtifactStore
+from gs_video.storage.legacy import migrate_legacy_project_artifacts
+from gs_video.storage.layout import StorageLayoutManager
 
 
 _TAURI_ORIGINS = (
@@ -352,21 +355,41 @@ def assemble_api_services(
             allow_missing_resources=config._allow_missing_resources,
         )
     runtime_root = config._workspace_root or config.project_root.parent.parent
-    data_root = config.project_root.parent.parent
-    config.project_root.mkdir(parents=True, exist_ok=True)
-    if has_reparse_component(config.project_root):
-        raise ValueError("project_root contains a link or reparse point")
+    legacy_data_root = config.project_root.parent.parent
+    storage_layout = StorageLayoutManager(
+        legacy_data_root,
+        runtime_root / "user-settings.json",
+        protected_roots=(config.model_root,),
+    )
+    data_root = storage_layout.project_library_root
+    cache_library_root = storage_layout.cache_root
     catalog = ProjectCatalog(data_root)
     if not catalog.list():
-        legacy_root = data_root.parent / "projects" / "default"
-        adoption_root = (
-            config.project_root
-            if (config.project_root / "project.json").is_file()
-            else legacy_root
-            if (legacy_root / "project.json").is_file()
-            else None
+        try:
+            configured_relative = config.project_root.relative_to(legacy_data_root)
+        except ValueError:
+            configured_relative = Path("projects") / "default"
+        adoption_candidates = (
+            data_root / configured_relative,
+            data_root / "projects" / "default",
+            legacy_data_root.parent / "projects" / "default",
+        )
+        adoption_root = next(
+            (
+                candidate
+                for candidate in adoption_candidates
+                if (candidate / "project.json").is_file()
+            ),
+            None,
         )
         if adoption_root is not None:
+            if not adoption_root.is_relative_to(legacy_data_root):
+                staged_adoption = data_root / "projects" / "default"
+                staged_adoption.parent.mkdir(exist_ok=True)
+                if staged_adoption.exists():
+                    raise ValueError("legacy project adoption target already exists")
+                os.replace(adoption_root, staged_adoption)
+                adoption_root = staged_adoption
             catalog.adopt(adoption_root)
         else:
             try:
@@ -374,6 +397,7 @@ def assemble_api_services(
             except OSError:
                 pass
     asset_library = AssetLibrary(data_root / "assets")
+    artifact_store = ArtifactStore(cache_library_root)
     asset_inspector = AssetInspector()
 
     def migrate_legacy_assets() -> None:
@@ -451,7 +475,12 @@ def assemble_api_services(
                 path.unlink()
 
     migrate_legacy_assets()
-    log_root = data_root / "logs"
+    for summary in catalog.list():
+        legacy_repository = catalog.repository(summary.project_id)
+        migrate_legacy_project_artifacts(
+            legacy_repository.root, summary.project_id, artifact_store
+        )
+    log_root = legacy_data_root / "logs"
     log_root.mkdir(exist_ok=True)
     gpu_gate = GpuAdmissionGate()
     segmentation = VideoSegmenterClient(
@@ -515,6 +544,7 @@ def assemble_api_services(
                 repository.root,
                 update_project=repository.update,
                 resolve_asset=resolve_asset,
+                artifact_store=artifact_store,
             )
             workflow_services = WorkflowServices(
                 media_ingest=MediaIngestService(paths),
@@ -543,7 +573,9 @@ def assemble_api_services(
                 repository=repository,
                 project_lock=project_lock,
                 pipeline_runner=runner,
-                preview_artifacts=PreviewArtifactStore(repository.root),
+                preview_artifacts=PreviewArtifactStore(
+                    artifact_store.project_root(project_id)
+                ),
             )
         except BaseException:
             project_lock.close()
@@ -590,7 +622,7 @@ def assemble_api_services(
 
     def runtime_which(command: str) -> str | None:
         local = (
-            data_root
+            legacy_data_root
             / "cache"
             / "ffmpeg"
             / "bin"
@@ -654,7 +686,9 @@ def assemble_api_services(
         asset_library=asset_library,
         project_manager=project_manager,
         preview_artifacts=ActivePreviewArtifactStore(project_manager),
-        upload_root=data_root / "upload-staging",
+        upload_root=cache_library_root / "upload-staging",
+        artifact_store=artifact_store,
+        storage_layout=storage_layout,
     )
     return settings, services
 

@@ -9,8 +9,8 @@ import type {
 interface DialogApi {
   open(options: {
     multiple: false
-    directory: false
-    filters: { name: string; extensions: string[] }[]
+    directory: boolean
+    filters?: { name: string; extensions: string[] }[]
   }): Promise<string | string[] | null>
   save(options: { defaultPath: string }): Promise<string | null>
 }
@@ -23,11 +23,13 @@ interface OpenerApi {
 interface TauriPlatformLoaders {
   loadDialog(): Promise<DialogApi>
   loadOpener(): Promise<OpenerApi>
+  loadCore(): Promise<{ invoke<T>(command: string): Promise<T> }>
 }
 
 const defaultLoaders: TauriPlatformLoaders = {
   loadDialog: () => import('@tauri-apps/plugin-dialog'),
   loadOpener: () => import('@tauri-apps/plugin-opener'),
+  loadCore: () => import('@tauri-apps/api/core'),
 }
 
 export class TauriPlatformBridge implements PlatformBridge {
@@ -75,6 +77,18 @@ export class TauriPlatformBridge implements PlatformBridge {
   async revealPath(path: string): Promise<void> {
     const opener = await this.#loaders.loadOpener()
     await opener.revealItemInDir(path)
+  }
+
+  async pickDirectory(): Promise<string | null> {
+    const dialog = await this.#loaders.loadDialog()
+    const selected = await dialog.open({ multiple: false, directory: true })
+    const path = Array.isArray(selected) ? selected[0] : selected
+    return path ?? null
+  }
+
+  async restartApp(): Promise<void> {
+    const core = await this.#loaders.loadCore()
+    await core.invoke<void>('restart_app')
   }
 
   async openExternal(url: string): Promise<void> {

@@ -27,6 +27,10 @@ import type {
   EnvironmentRepairSnapshotDto,
   VramBudgetDto,
   VramBudgetUpdate,
+  StorageLayoutDto,
+  StorageLayoutUpdate,
+  CacheCleanupResultDto,
+  CacheCleanupPlanDto,
 } from './types'
 
 const API_PREFIX = '/api/v1'
@@ -199,6 +203,28 @@ export class HttpBackendClient implements BackendClient {
 
   updateVramBudget(input: VramBudgetUpdate): Promise<VramBudgetDto> {
     return this.#request('/runtime/vram-budget', { method: 'PATCH', json: input })
+  }
+
+  getStorageLayout(): Promise<StorageLayoutDto> {
+    return this.#request('/runtime/storage-layout')
+  }
+
+  updateStorageLayout(input: StorageLayoutUpdate): Promise<StorageLayoutDto> {
+    return this.#request('/runtime/storage-layout', { method: 'PATCH', json: input })
+  }
+
+  planStorageCacheCleanup(mode: 'safe' | 'deep'): Promise<CacheCleanupPlanDto> {
+    return this.#request('/runtime/storage-layout/cache-cleanup/plan', {
+      method: 'POST',
+      json: { mode },
+    })
+  }
+
+  cleanupStorageCache(mode: 'safe' | 'deep', planToken: string): Promise<CacheCleanupResultDto> {
+    return this.#request('/runtime/storage-layout/cache-cleanup', {
+      method: 'POST',
+      json: { mode, plan_token: planToken },
+    })
   }
 
   getEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto> {

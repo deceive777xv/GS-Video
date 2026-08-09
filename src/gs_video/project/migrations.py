@@ -1,8 +1,48 @@
 from copy import deepcopy
+from pathlib import PurePosixPath
 from typing import cast
+from uuid import UUID, uuid4
+
+from gs_video.domain.models import ArtifactCategory
 
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
+
+
+def _canonical_project_id(value: object) -> str:
+    if isinstance(value, str):
+        try:
+            parsed = UUID(value)
+        except ValueError:
+            parsed = None
+        if parsed is not None and str(parsed) == value:
+            return value
+    return str(uuid4())
+
+
+def _migrate_artifact_reference(project_id: str, value: object) -> object:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("项目 artifact 引用必须是字符串或对象")
+    candidate = PurePosixPath(value.replace("\\", "/"))
+    if candidate.is_absolute() or len(candidate.parts) < 2:
+        raise ValueError("项目 artifact 路径无效")
+    category_value, cache_key, *member_parts = candidate.parts
+    try:
+        category = ArtifactCategory(category_value)
+    except ValueError as exc:
+        raise ValueError("项目 artifact 类别无效") from exc
+    if len(cache_key) != 64 or any(
+        character not in "0123456789abcdef" for character in cache_key
+    ):
+        raise ValueError("项目 artifact 缓存键无效")
+    return {
+        "project_id": project_id,
+        "category": category.value,
+        "cache_key": cache_key,
+        "member": "/".join(member_parts) or None,
+    }
 
 
 def migrate_project_dict(raw: dict[str, object]) -> dict[str, object]:
@@ -75,6 +115,29 @@ def migrate_project_dict(raw: dict[str, object]) -> dict[str, object]:
             data.setdefault("scene_ply_asset_id", None)
             data["schema_version"] = 4
             version = 4
+        elif version == 4:
+            project_id = _canonical_project_id(data.get("project_id"))
+            data["project_id"] = project_id
+            stages = data.setdefault("stages", {})
+            if not isinstance(stages, dict):
+                raise ValueError("项目阶段状态必须是对象")
+            for stage in stages.values():
+                if not isinstance(stage, dict):
+                    raise ValueError("项目阶段状态必须是对象")
+                outputs = stage.setdefault("output_paths", [])
+                artifacts = stage.setdefault("artifacts", {})
+                if not isinstance(outputs, list) or not isinstance(artifacts, dict):
+                    raise ValueError("项目 artifact 状态无效")
+                stage["output_paths"] = [
+                    _migrate_artifact_reference(project_id, output)
+                    for output in outputs
+                ]
+                stage["artifacts"] = {
+                    role: _migrate_artifact_reference(project_id, artifact)
+                    for role, artifact in artifacts.items()
+                }
+            data["schema_version"] = 5
+            version = 5
         else:
             raise ValueError(f"不支持的项目版本: {version}")
 

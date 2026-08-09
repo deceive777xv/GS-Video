@@ -112,6 +112,10 @@ function createHarness(initial = project()) {
       mode: input.mode,
       selected_vram_mb: input.mode === 'standard' ? 8192 : input.selected_vram_mb,
     })),
+    getStorageLayout: vi.fn(),
+    updateStorageLayout: vi.fn(),
+    cleanupStorageCache: vi.fn(),
+    planStorageCacheCleanup: vi.fn(),
     getEnvironmentRepair: vi.fn().mockResolvedValue({
       state: 'idle',
       job_id: null,

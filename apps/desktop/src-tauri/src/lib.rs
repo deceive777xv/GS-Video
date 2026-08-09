@@ -132,7 +132,12 @@ async fn start_and_show(
     Ok(StartOutcome::Ready)
 }
 
-fn request_exit(app: &tauri::AppHandle, code: i32) {
+enum FinalAction {
+    Exit(i32),
+    Restart,
+}
+
+fn request_shutdown(app: &tauri::AppHandle, final_action: FinalAction) {
     let state = app.state::<DesktopState>();
     if state.exit_started.swap(true, Ordering::SeqCst) {
         return;
@@ -164,8 +169,20 @@ fn request_exit(app: &tauri::AppHandle, code: i32) {
                 }
             }
         }
-        exit_app.exit(code);
+        match final_action {
+            FinalAction::Exit(code) => exit_app.exit(code),
+            FinalAction::Restart => exit_app.request_restart(),
+        }
     });
+}
+
+fn request_exit(app: &tauri::AppHandle, code: i32) {
+    request_shutdown(app, FinalAction::Exit(code));
+}
+
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+    request_shutdown(&app, FinalAction::Restart);
 }
 
 fn show_fatal_error(app: &tauri::AppHandle, message: String) {
@@ -221,6 +238,7 @@ pub fn run() {
     let application = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![restart_app])
         .manage(DesktopState::default())
         .setup(|app| {
             let app = app.handle().clone();

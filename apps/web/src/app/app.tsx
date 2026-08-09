@@ -14,7 +14,7 @@ import {
   type TaskStore,
   useTaskStore,
 } from '../api/task-events'
-import type { BootstrapDto, ProjectDto, ProjectSummaryDto, StageName, TaskDto, VramBudgetDto } from '../api/types'
+import type { BootstrapDto, ProjectDto, ProjectSummaryDto, StageName, StorageLayoutDto, TaskDto, VramBudgetDto } from '../api/types'
 import type { PlatformBridge } from '../platform/platform-bridge'
 import { CameraPage } from '../features/camera/camera-page'
 import { ExportPage } from '../features/export/export-page'
@@ -24,6 +24,7 @@ import { AssetLibraryPage } from '../features/assets/asset-library-page'
 import { PreviewPage } from '../features/preview/preview-page'
 import { SubjectPage } from '../features/subject/subject-page'
 import { VramBudgetControl } from '../features/settings/vram-budget-control'
+import { StorageSettingsPage } from '../features/settings/storage-settings-page'
 import {
   canAdvance,
   canVisitStep,
@@ -103,13 +104,13 @@ function HubHeader({ project }: { project: ProjectDto | null }) {
         <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
         <span><strong>GS VIDEO</strong><small>GAUSSIAN COMPOSITOR</small></span>
       </a>
-      <nav className="hub-nav" aria-label="主导航"><a href="#/">项目</a><a href="#/assets/video">素材库</a></nav>
+      <nav className="hub-nav" aria-label="主导航"><a href="#/">项目</a><a href="#/assets/video">素材库</a><a href="#/settings">设置</a></nav>
       <div className="project-heading"><span>当前项目</span><strong>{project?.name ?? '未选择'}</strong></div>
     </header>
   )
 }
 
-type AppView = 'home' | 'workflow' | 'assets-video' | 'assets-ply'
+type AppView = 'home' | 'workflow' | 'assets-video' | 'assets-ply' | 'settings'
 
 interface WorkflowRoute {
   projectId: string
@@ -129,6 +130,7 @@ function routeFromHash(hash: string, fallback: AppView): AppView {
   if (hash === '#/' || hash === '#') return 'home'
   if (hash.startsWith('#/assets/ply')) return 'assets-ply'
   if (hash.startsWith('#/assets/video') || hash.startsWith('#/assets')) return 'assets-video'
+  if (hash.startsWith('#/settings')) return 'settings'
   if (hash.startsWith('#/workflow') || workflowRouteFromHash(hash) !== null) return 'workflow'
   return fallback
 }
@@ -572,6 +574,10 @@ export function App({
     return next
   }
 
+  const acceptStorageLayout = (value: StorageLayoutDto): void => {
+    setBootstrap((current) => current === null ? current : { ...current, storage_layout: value })
+  }
+
   const createProject = async (name: string): Promise<void> => {
     try {
       const next = await backend.createProject(name.trim())
@@ -619,7 +625,7 @@ export function App({
     }
   }
 
-  if (view === 'home' || view === 'assets-video' || view === 'assets-ply') {
+  if (view === 'home' || view === 'assets-video' || view === 'assets-ply' || view === 'settings') {
     return (
       <AppShell>
         <HubHeader project={project} />
@@ -639,6 +645,19 @@ export function App({
             onRename={renameProject}
             projects={bootstrap.projects ?? []}
           />
+        ) : view === 'settings' ? (
+          bootstrap.storage_layout === null || bootstrap.storage_layout === undefined ? (
+            <main className="hub-main"><div className="empty-state"><strong>存储设置不可用</strong><p>当前后端未提供机器级目录控制。</p></div></main>
+          ) : (
+            <StorageSettingsPage
+              backend={backend}
+              busy={shellBusy}
+              initial={bootstrap.storage_layout}
+              onChange={acceptStorageLayout}
+              onError={reportUnknownError}
+              platform={platform}
+            />
+          )
         ) : (
           <AssetLibraryPage
             backend={backend}
@@ -743,7 +762,7 @@ export function App({
           <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
           <span><strong>GS VIDEO</strong><small>GAUSSIAN COMPOSITOR</small></span>
         </a>
-        <nav className="workflow-global-nav" aria-label="主导航"><a href="#/">项目</a><a href="#/assets/video">素材库</a></nav>
+        <nav className="workflow-global-nav" aria-label="主导航"><a href="#/">项目</a><a href="#/assets/video">素材库</a><a href="#/settings">设置</a></nav>
         <div className="project-heading">
           <span>当前项目</span><strong>{project.name}</strong>
         </div>

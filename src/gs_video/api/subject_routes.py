@@ -14,6 +14,15 @@ def _repository(request: Request) -> Any:
     return request.app.state.services.project_repository
 
 
+def _artifact_root(request: Request, project: Project, repository: Any) -> Any:
+    store = request.app.state.services.artifact_store
+    return (
+        repository.root
+        if store is None
+        else store.lookup_project_root(project.project_id)
+    )
+
+
 def _load_project(repository: Any) -> Project:
     try:
         return cast(Project, repository.load())
@@ -37,10 +46,11 @@ def build_subject_router() -> APIRouter:
         request: Request, role: SubjectMediaRole
     ) -> SubjectMediaResponse:
         repository = _repository(request)
+        project = _load_project(repository)
         resolved = await asyncio.to_thread(
             resolve_subject_media,
-            _load_project(repository),
-            repository.root,
+            project,
+            _artifact_root(request, project, repository),
             role,
         )
         return SubjectMediaResponse(
@@ -60,10 +70,11 @@ def build_subject_router() -> APIRouter:
         request: Request, role: SubjectMediaRole, artifact_id: str
     ) -> Response:
         repository = _repository(request)
+        project = _load_project(repository)
         resolved = await asyncio.to_thread(
             resolve_subject_media,
-            _load_project(repository),
-            repository.root,
+            project,
+            _artifact_root(request, project, repository),
             role,
         )
         if resolved.artifact_id != artifact_id:

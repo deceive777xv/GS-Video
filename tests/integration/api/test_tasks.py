@@ -2,6 +2,7 @@ import asyncio
 import time
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 from typing import Protocol
 
 import pytest
@@ -13,13 +14,23 @@ from gs_video.api.routes import ApiServices
 from gs_video.api.schemas import ApiSettings
 from gs_video.app import create_app
 from gs_video.domain.contracts import StageResult
-from gs_video.domain.models import Project, StageName, StageState, StageStatus
+from gs_video.domain.models import (
+    ArtifactCategory,
+    ArtifactRef,
+    Project,
+    StageName,
+    StageState,
+    StageStatus,
+    VideoSummary,
+)
 from gs_video.environment.doctor import EnvironmentIssue, EnvironmentReport
 from gs_video.domain.errors import CancelledError
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter, discard_progress
 from gs_video.pipeline.runner import PipelineOutcome, PipelineRunner
 from gs_video.project.repository import ProjectRepository
+import gs_video.resource_admission as resource_admission
+from gs_video.storage.artifacts import ArtifactStore
 
 
 TOKEN = "task-session-token"
@@ -152,11 +163,21 @@ class UnexpectedThenSuccessfulStage:
         token: CancellationToken,
         emit: ProgressEmitter,
     ) -> StageResult:
-        del project, token, emit
+        del token, emit
         self.calls += 1
         if self.calls == 1:
             raise OSError("sensitive vendor path")
-        return StageResult((Path("masks"),), "segment-key")
+        result_key = "a" * 64
+        return StageResult(
+            (
+                ArtifactRef(
+                    project_id=project.project_id,
+                    category=ArtifactCategory.MASKS,
+                    cache_key=result_key,
+                ),
+            ),
+            result_key,
+        )
 
 
 class RecordingWorkerRegistry:
@@ -227,9 +248,13 @@ def make_app(
     runner: RunnerLike | None = None,
     shutdown_timeout: float = 5.0,
     doctor: object | None = None,
+    artifact_store: ArtifactStore | None = None,
+    source_summary: VideoSummary | None = None,
 ) -> tuple[object, RecordingWorkerRegistry]:
     repository = ProjectRepository(tmp_path / "project")
-    repository.save(repository.create("tasks"))
+    project = repository.create("tasks")
+    project.workflow.source_summary = source_summary
+    repository.save(project)
     registry = RecordingWorkerRegistry()
     services = ApiServices(
         project_repository=repository,
@@ -237,6 +262,7 @@ def make_app(
         pipeline_runner=runner or SucceedingRunner(),
         worker_registry=registry,
         preview_service=FakePreviewService(),
+        artifact_store=artifact_store,
     )
     settings = ApiSettings(
         bind_host="127.0.0.1",
@@ -268,6 +294,47 @@ def test_task_preflight_rechecks_environment_after_bootstrap(tmp_path: Path) -> 
         "message": "Repair the local runtime before starting this stage: cuda_unavailable",
         "retryable": True,
     }
+
+
+def test_task_preflight_rechecks_remaining_cache_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    summary = VideoSummary(
+        filename="source.mp4",
+        size=1024,
+        sha256="a" * 64,
+        width=1920,
+        height=1080,
+        duration_seconds=10,
+        fps="30/1",
+        has_audio=True,
+        frame_count=300,
+    )
+    store = ArtifactStore(tmp_path / "cache")
+    app, _ = make_app(
+        tmp_path / "api",
+        artifact_store=store,
+        source_summary=summary,
+    )
+    monkeypatch.setattr(
+        resource_admission.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=0),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/tasks",
+            json={"target_stage": "render"},
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+    assert response.status_code == 507
+    payload = response.json()
+    assert payload["code"] == "storage_full"
+    assert payload["category"] == "storage"
+    assert payload["retryable"] is True
+    assert "20% headroom" in payload["message"]
 
 
 def test_dependency_failure_is_failed_with_actual_stage_and_retryability(

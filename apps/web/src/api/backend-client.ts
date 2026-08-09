@@ -24,12 +24,20 @@ import type {
   EnvironmentRepairSnapshotDto,
   VramBudgetDto,
   VramBudgetUpdate,
+  StorageLayoutDto,
+  StorageLayoutUpdate,
+  CacheCleanupResultDto,
+  CacheCleanupPlanDto,
 } from './types'
 
 export interface BackendClient {
   bootstrap(signal?: AbortSignal): Promise<BootstrapDto>
   getVramBudget(): Promise<VramBudgetDto>
   updateVramBudget(input: VramBudgetUpdate): Promise<VramBudgetDto>
+  getStorageLayout(): Promise<StorageLayoutDto>
+  updateStorageLayout(input: StorageLayoutUpdate): Promise<StorageLayoutDto>
+  planStorageCacheCleanup(mode: 'safe' | 'deep'): Promise<CacheCleanupPlanDto>
+  cleanupStorageCache(mode: 'safe' | 'deep', planToken: string): Promise<CacheCleanupResultDto>
   getEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto>
   startEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto>
   cancelEnvironmentRepair(): Promise<EnvironmentRepairSnapshotDto>

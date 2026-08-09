@@ -2,9 +2,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from math import isfinite
-from uuid import uuid4
+from pathlib import PurePosixPath
+from typing import Self
+from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class StageName(StrEnum):
@@ -38,14 +40,74 @@ class ArtifactRole(StrEnum):
     EXPORT_VIDEO = "export_video"
 
 
+class ArtifactCategory(StrEnum):
+    FRAMES = "frames"
+    PROXIES = "proxies"
+    MASKS = "masks"
+    CAMERA = "camera"
+    TRAJECTORIES = "trajectories"
+    RENDERS = "renders"
+    COMPOSITES = "composites"
+    PREVIEWS = "previews"
+    EXPORTS = "exports"
+
+
+class ArtifactRef(BaseModel):
+    """Logical reference to one immutable project-scoped cache artifact."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    project_id: str
+    category: ArtifactCategory
+    cache_key: str
+    member: str | None = None
+
+    @field_validator("project_id")
+    @classmethod
+    def validate_project_id(cls, value: str) -> str:
+        try:
+            parsed = UUID(value)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("artifact project_id must be a canonical UUID") from exc
+        if str(parsed) != value:
+            raise ValueError("artifact project_id must be a canonical UUID")
+        return value
+
+    @field_validator("cache_key")
+    @classmethod
+    def validate_cache_key(cls, value: str) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("artifact cache_key must be 64 lowercase hexadecimal characters")
+        return value
+
+    @field_validator("member")
+    @classmethod
+    def validate_member(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value or "\\" in value or ":" in value:
+            raise ValueError("artifact member must be a safe relative POSIX path")
+        candidate = PurePosixPath(value)
+        if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+            raise ValueError("artifact member must be a safe relative POSIX path")
+        normalized = candidate.as_posix()
+        if normalized != value:
+            raise ValueError("artifact member must be normalized")
+        return value
+
+    def relative_path(self) -> str:
+        base = f"{self.category.value}/{self.cache_key}"
+        return base if self.member is None else f"{base}/{self.member}"
+
+
 class StageState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: StageStatus = StageStatus.PENDING
     cache_key: str | None = None
-    output_paths: list[str] = Field(default_factory=list)
+    output_paths: list[ArtifactRef] = Field(default_factory=list)
     error_code: str | None = None
-    artifacts: dict[ArtifactRole, str] = Field(default_factory=dict)
+    artifacts: dict[ArtifactRole, ArtifactRef] = Field(default_factory=dict)
     input_generation: int = Field(default=0, ge=0)
     run_id: str | None = None
 
@@ -179,7 +241,7 @@ class WorkflowState(BaseModel):
 class Project(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 4
+    schema_version: int = 5
     project_id: str = Field(default_factory=lambda: str(uuid4()))
     name: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -192,3 +254,14 @@ class Project(BaseModel):
     scene_ply: str | None = None
     stages: dict[StageName, StageState] = Field(default_factory=dict)
     workflow: WorkflowState = Field(default_factory=WorkflowState)
+
+    def assert_artifact_authority(self) -> None:
+        for state in self.stages.values():
+            for reference in (*state.output_paths, *state.artifacts.values()):
+                if reference.project_id != self.project_id:
+                    raise ValueError("artifact reference belongs to another project")
+
+    @model_validator(mode="after")
+    def validate_artifact_authority(self) -> Self:
+        self.assert_artifact_authority()
+        return self

@@ -1,13 +1,13 @@
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import logging
-from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
 from gs_video.domain.contracts import Stage
 from gs_video.domain.errors import CancelledError, GsVideoError
 from gs_video.domain.models import (
     Project,
+    ArtifactRef,
     StageClaimResult,
     StageName,
     StageState,
@@ -39,15 +39,14 @@ class PipelineOutcome:
     retryable: bool = False
 
 
-def _project_relative_path(path: Path) -> str:
-    candidate = PureWindowsPath(path)
-    if (
-        candidate.anchor
-        or candidate == PureWindowsPath(".")
-        or ".." in candidate.parts
-    ):
-        raise ValueError("stage outputs must be non-escaping project-relative paths")
-    return candidate.as_posix()
+def _validate_artifact_ref(
+    reference: ArtifactRef, *, project_id: str, cache_key: str
+) -> ArtifactRef:
+    if reference.project_id != project_id:
+        raise ValueError("stage artifact belongs to another project")
+    if reference.cache_key != cache_key:
+        raise ValueError("stage artifact cache key does not match the stage result")
+    return reference
 
 
 def _validated_dependencies(
@@ -208,11 +207,20 @@ class PipelineRunner:
             terminal.status = StageStatus.SUCCEEDED
             terminal.cache_key = result.cache_key
             terminal.output_paths = [
-                _project_relative_path(path) for path in result.output_paths
+                _validate_artifact_ref(
+                    reference,
+                    project_id=self.project.project_id,
+                    cache_key=result.cache_key,
+                )
+                for reference in result.output_paths
             ]
             terminal.artifacts = {
-                role: _project_relative_path(path)
-                for role, path in result.artifacts.items()
+                role: _validate_artifact_ref(
+                    reference,
+                    project_id=self.project.project_id,
+                    cache_key=result.cache_key,
+                )
+                for role, reference in result.artifacts.items()
             }
         except CancelledError:
             terminal = state.model_copy(deep=True)

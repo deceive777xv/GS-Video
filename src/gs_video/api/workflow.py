@@ -18,6 +18,8 @@ from PIL import Image
 from gs_video.api.schemas import ApiError, SubjectMediaRole
 from gs_video.domain.contracts import PickBuffer
 from gs_video.domain.models import (
+    ArtifactCategory,
+    ArtifactRef,
     ArtifactRole,
     Project,
     SceneSummary,
@@ -31,6 +33,7 @@ from gs_video.environment.vram import (
     resolve_vram_limit_mb,
     validated_vram_limit_mb,
 )
+from gs_video.resource_admission import fits_vram_budget
 from gs_video.pipeline.artifacts import validate_cache_key
 from gs_video.scene.camera import OrbitCamera
 from gs_video.scene.gsplat_renderer import GsplatRenderer
@@ -342,7 +345,15 @@ def _subject_artifact_inventory(
         cache_key = validate_cache_key(stage.cache_key or "")
     except ValueError:
         cache_key = None
-    if cache_key is None or registered != f"{definition.directory_name}/{cache_key}":
+    if cache_key is None:
+        expected = None
+    else:
+        expected = ArtifactRef(
+            project_id=project.project_id,
+            category=ArtifactCategory(definition.directory_name),
+            cache_key=cache_key,
+        )
+    if cache_key is None or registered != expected:
         raise ApiError(
             409,
             code="subject_media_contract_missing",
@@ -793,15 +804,13 @@ class WorkerPreviewService:
             self._admission.notify_all()
 
     def _admit(self, scene_summary: SceneSummary, width: int, height: int) -> None:
-        extra_framebuffer_bytes = max(0, width * height - 1920 * 1080) * 24
-        estimated_vram_mb = scene_summary.estimated_vram_mb + (
-            extra_framebuffer_bytes + 1024**2 - 1
-        ) // 1024**2
         available_vram_limit_mb = resolve_vram_limit_mb(
             self._available_vram_limit_mb,
             self._vram_limit_provider,
         )
-        if estimated_vram_mb * 5 > available_vram_limit_mb * 4:
+        if not fits_vram_budget(
+            scene_summary, width, height, available_vram_limit_mb
+        ):
             raise ApiError(
                 422,
                 code="scene_vram_limit_exceeded",
@@ -1086,6 +1095,7 @@ class PreviewArtifactStore:
     def __init__(self, project_root: Path, *, buffer_limit: int = 4) -> None:
         self._root = project_root.resolve()
         self._preview_root = (self._root / "previews").resolve()
+        self._preview_root.mkdir(parents=True, exist_ok=True)
         self._buffer_limit = buffer_limit
         self._buffers: OrderedDict[str, PickBuffer] = OrderedDict()
         self._lock = RLock()

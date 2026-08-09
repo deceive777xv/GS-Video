@@ -6,7 +6,7 @@ import os
 import re
 import stat
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Protocol, cast
@@ -40,6 +40,8 @@ from gs_video.environment.vram import (
     validated_vram_limit_mb,
 )
 from gs_video.domain.models import (
+    ArtifactCategory,
+    ArtifactRef,
     ArtifactRole,
     Project,
     SceneSummary,
@@ -50,14 +52,16 @@ from gs_video.domain.models import (
 )
 from gs_video.media.export import ExportResult, export_mp4, probe_mp4
 from gs_video.media.ingest import extract_proxy_frames, extract_source_frames
-from gs_video.pipeline.artifacts import ArtifactPublisher, validate_cache_key
+from gs_video.pipeline.artifacts import validate_cache_key
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
 from gs_video.project.cache import cache_key
+from gs_video.resource_admission import cache_has_capacity, fits_vram_budget
 from gs_video.scene.camera import OrbitCamera
 from gs_video.scene.worker_client import RendererWorkerIdentity
 from gs_video.scene.worker_protocol import RenderSequenceRequest
 from gs_video.segmentation.paths import has_reparse_component
+from gs_video.storage.artifacts import ArtifactStore
 
 
 INGEST_IMPLEMENTATION_VERSION = "media-ingest-v1"
@@ -150,19 +154,47 @@ class WorkflowPaths:
     root: Path
     update_project: ProjectUpdater | None = None
     resolve_asset: AssetResolver | None = None
-    publisher: ArtifactPublisher = field(init=False, repr=False)
+    artifact_store: ArtifactStore | None = None
 
     def __post_init__(self) -> None:
         root = Path(self.root).absolute()
         root.mkdir(parents=True, exist_ok=True)
         object.__setattr__(self, "root", root)
-        object.__setattr__(self, "publisher", ArtifactPublisher(root))
+        if self.artifact_store is None:
+            object.__setattr__(
+                self,
+                "artifact_store",
+                ArtifactStore(root, project_namespace=False),
+            )
 
-    def relative(self, path: Path) -> Path:
+    def publish(
+        self,
+        project: Project,
+        category: ArtifactCategory,
+        cache_key_value: str,
+        build: Callable[[Path], object],
+    ) -> tuple[ArtifactRef, Path]:
+        assert self.artifact_store is not None
+        reference = self.artifact_store.publish_tree(
+            project.project_id, category, cache_key_value, build
+        )
+        return reference, self.artifact_store.resolve(reference, directory=True)
+
+    def member(self, reference: ArtifactRef, member: str) -> ArtifactRef:
+        assert self.artifact_store is not None
+        return self.artifact_store.reference(
+            reference.project_id,
+            reference.category,
+            reference.cache_key,
+            member=member,
+        )
+
+    def resolve(self, reference: ArtifactRef, *, directory: bool) -> Path:
+        assert self.artifact_store is not None
         try:
-            return path.relative_to(self.root)
-        except ValueError as exc:
-            raise RepairableError("流水线产物不在项目目录内") from exc
+            return self.artifact_store.resolve(reference, directory=directory)
+        except OSError as exc:
+            raise RepairableError("流水线产物不可用") from exc
 
 
 @dataclass(frozen=True)
@@ -375,27 +407,27 @@ def _artifact_path(
     paths: WorkflowPaths,
     state: StageState,
     role: ArtifactRole,
-    category: str,
+    category: ArtifactCategory,
     *,
     filename: str | None = None,
 ) -> Path:
     if state.cache_key is None:
         raise RepairableError("上游阶段缺少缓存键")
     registered = state.artifacts.get(role)
-    expected = Path(category) / state.cache_key
-    if filename is not None:
-        expected /= filename
-    if registered is None or Path(registered) != expected:
+    if registered is None:
         raise RepairableError(f"上游 artifact {role.value} 与成功缓存不一致")
-    candidate = paths.root / expected
+    expected = ArtifactRef(
+        project_id=registered.project_id,
+        category=category,
+        cache_key=state.cache_key,
+        member=filename,
+    )
+    if registered != expected:
+        raise RepairableError(f"上游 artifact {role.value} 与成功缓存不一致")
     try:
-        resolved = candidate.resolve(strict=True)
-        root = paths.root.resolve(strict=True)
-    except OSError as exc:
+        return paths.resolve(registered, directory=filename is None)
+    except RepairableError as exc:
         raise RepairableError(f"上游 artifact {role.value} 不存在") from exc
-    if not resolved.is_relative_to(root) or has_reparse_component(candidate):
-        raise RepairableError(f"上游 artifact {role.value} 越出项目目录")
-    return candidate
 
 
 def _frame_inventory(
@@ -795,6 +827,16 @@ class MediaIngestService:
         source, summary, source_snapshot = _source_material(
             self.paths, project, token
         )
+        assert self.paths.artifact_store is not None
+        cache_ok, required_cache_bytes, available_cache_bytes = cache_has_capacity(
+            self.paths.artifact_store.root, summary
+        )
+        if not cache_ok:
+            raise RepairableError(
+                "缓存磁盘空间不足：预计需要 "
+                f"{required_cache_bytes} 字节（含 20% 余量），当前可用 "
+                f"{available_cache_bytes} 字节"
+            )
         source_identity = summary.model_dump(mode="json")
         # The decoded inventory can fill this derived probe field. Keeping it out of
         # the key makes the first unknown-count run reusable after persistence.
@@ -828,8 +870,8 @@ class MediaIngestService:
             _assert_file_snapshot(source, source_snapshot, "源视频", token)
             token.raise_if_cancelled()
 
-        source_directory = self.paths.publisher.publish_tree(
-            "frames", result_key, build_source
+        source_ref, source_directory = self.paths.publish(
+            project, ArtifactCategory.FRAMES, result_key, build_source
         )
         source_inventory = _frame_inventory(
             source_directory,
@@ -860,8 +902,8 @@ class MediaIngestService:
             _assert_file_snapshot(source, source_snapshot, "源视频", token)
             token.raise_if_cancelled()
 
-        proxy_directory = self.paths.publisher.publish_tree(
-            "proxies", result_key, build_proxies
+        proxy_ref, proxy_directory = self.paths.publish(
+            project, ArtifactCategory.PROXIES, result_key, build_proxies
         )
         published_proxies = _frame_inventory(
             proxy_directory,
@@ -877,14 +919,12 @@ class MediaIngestService:
         if summary.frame_count is None:
             self._persist_discovered_count(project, summary, discovered_count)
         emit(2, 2, "提取代理帧 2/2")
-        source_relative = self.paths.relative(source_directory)
-        proxy_relative = self.paths.relative(proxy_directory)
         return StageResult(
-            output_paths=(source_relative, proxy_relative),
+            output_paths=(source_ref, proxy_ref),
             cache_key=result_key,
             artifacts={
-                ArtifactRole.SOURCE_FRAMES: source_relative,
-                ArtifactRole.PROXY_FRAMES: proxy_relative,
+                ArtifactRole.SOURCE_FRAMES: source_ref,
+                ArtifactRole.PROXY_FRAMES: proxy_ref,
             },
         )
 
@@ -924,7 +964,7 @@ class SegmentWorkflowService:
         token.raise_if_cancelled()
         ingest = _stage_state(project, StageName.INGEST)
         proxies = _artifact_path(
-            self.paths, ingest, ArtifactRole.PROXY_FRAMES, "proxies"
+            self.paths, ingest, ArtifactRole.PROXY_FRAMES, ArtifactCategory.PROXIES
         )
         inventory = _frame_inventory(
             proxies,
@@ -1005,7 +1045,9 @@ class SegmentWorkflowService:
                 raise RepairableError("分割 backend identity 在运行期间发生变化")
             token.raise_if_cancelled()
 
-        output = self.paths.publisher.publish_tree("masks", result_key, build)
+        reference, output = self.paths.publish(
+            project, ArtifactCategory.MASKS, result_key, build
+        )
         _frame_inventory(
             output,
             suffix="png",
@@ -1016,11 +1058,10 @@ class SegmentWorkflowService:
             expected_sizes=inventory.sizes,
             token=token,
         )
-        relative = self.paths.relative(output)
         return StageResult(
-            output_paths=(relative,),
+            output_paths=(reference,),
             cache_key=result_key,
-            artifacts={ArtifactRole.SUBJECT_MASKS: relative},
+            artifacts={ArtifactRole.SUBJECT_MASKS: reference},
         )
 
 
@@ -1054,7 +1095,7 @@ class CameraSolveWorkflowService:
         token.raise_if_cancelled()
         ingest = _stage_state(project, StageName.INGEST)
         proxy_directory = _artifact_path(
-            self.paths, ingest, ArtifactRole.PROXY_FRAMES, "proxies"
+            self.paths, ingest, ArtifactRole.PROXY_FRAMES, ArtifactCategory.PROXIES
         )
         proxies = _frame_inventory(
             proxy_directory,
@@ -1091,15 +1132,17 @@ class CameraSolveWorkflowService:
             )
             token.raise_if_cancelled()
 
-        output = self.paths.publisher.publish_tree("camera", result_key, build)
-        relative = self.paths.relative(output / "solution.json")
-        restored = read_camera_solution(self.paths.root / relative)
+        directory_ref, output = self.paths.publish(
+            project, ArtifactCategory.CAMERA, result_key, build
+        )
+        reference = self.paths.member(directory_ref, "solution.json")
+        restored = read_camera_solution(self.paths.resolve(reference, directory=False))
         if len(restored.camera_to_world) != proxies.count:
             raise RepairableError("缓存相机轨迹帧数与代理帧数不一致")
         return StageResult(
-            output_paths=(relative,),
+            output_paths=(reference,),
             cache_key=result_key,
-            artifacts={ArtifactRole.CAMERA_SOLUTION: relative},
+            artifacts={ArtifactRole.CAMERA_SOLUTION: reference},
         )
 
 
@@ -1119,7 +1162,7 @@ class TrajectoryMapWorkflowService:
             self.paths,
             solve,
             ArtifactRole.CAMERA_SOLUTION,
-            "camera",
+            ArtifactCategory.CAMERA,
             filename="solution.json",
         )
         solution_snapshot = _file_snapshot(solution_path, "相机求解产物", token)
@@ -1178,9 +1221,13 @@ class TrajectoryMapWorkflowService:
             )
             token.raise_if_cancelled()
 
-        output = self.paths.publisher.publish_tree("trajectories", result_key, build)
-        relative = self.paths.relative(output / "trajectory.json")
-        restored = read_mapped_trajectory(self.paths.root / relative)
+        directory_ref, output = self.paths.publish(
+            project, ArtifactCategory.TRAJECTORIES, result_key, build
+        )
+        reference = self.paths.member(directory_ref, "trajectory.json")
+        restored = read_mapped_trajectory(
+            self.paths.resolve(reference, directory=False)
+        )
         if (
             restored.fov_y_degrees != camera.fov_y_degrees
             or len(restored.camera_to_world) != len(mapped)
@@ -1194,9 +1241,9 @@ class TrajectoryMapWorkflowService:
             raise RepairableError("缓存映射轨迹与当前相机 authority 不一致")
         emit(1, 1, "映射目标相机轨迹 1/1")
         return StageResult(
-            output_paths=(relative,),
+            output_paths=(reference,),
             cache_key=result_key,
-            artifacts={ArtifactRole.MAPPED_TRAJECTORY: relative},
+            artifacts={ArtifactRole.MAPPED_TRAJECTORY: reference},
         )
 
 
@@ -1238,7 +1285,7 @@ class RendererWorkflowService:
             self.paths,
             mapped,
             ArtifactRole.MAPPED_TRAJECTORY,
-            "trajectories",
+            ArtifactCategory.TRAJECTORIES,
             filename="trajectory.json",
         )
         trajectory_snapshot = _file_snapshot(
@@ -1264,17 +1311,13 @@ class RendererWorkflowService:
             width, height = _preview_size(
                 (summary.width, summary.height), project.workflow.preview_height
             )
-        extra_framebuffer_bytes = (
-            max(0, width * height - 1920 * 1080) * 24
-        )
-        estimated_vram_mb = scene_summary.estimated_vram_mb + (
-            extra_framebuffer_bytes + 1024**2 - 1
-        ) // 1024**2
         available_vram_limit_mb = resolve_vram_limit_mb(
             self.available_vram_limit_mb,
             self._vram_limit_provider,
         )
-        if estimated_vram_mb * 5 > available_vram_limit_mb * 4:
+        if not fits_vram_budget(
+            scene_summary, width, height, available_vram_limit_mb
+        ):
             raise RepairableError("Gaussian 场景超过配置的保守显存预算")
         identity = self.worker.probe(token=token)
         expected_implementation = f"gsplat-{identity.gsplat}"
@@ -1349,7 +1392,9 @@ class RendererWorkflowService:
             )
             token.raise_if_cancelled()
 
-        output = self.paths.publisher.publish_tree("renders", result_key, build)
+        reference, output = self.paths.publish(
+            project, ArtifactCategory.RENDERS, result_key, build
+        )
         _frame_inventory(
             output,
             suffix="png",
@@ -1364,11 +1409,10 @@ class RendererWorkflowService:
         _assert_file_snapshot(
             trajectory_path, trajectory_snapshot, "映射轨迹", token
         )
-        relative = self.paths.relative(output)
         return StageResult(
-            output_paths=(relative,),
+            output_paths=(reference,),
             cache_key=result_key,
-            artifacts={ArtifactRole.RENDER_FRAMES: relative},
+            artifacts={ArtifactRole.RENDER_FRAMES: reference},
         )
 
 
@@ -1437,16 +1481,16 @@ class CompositeWorkflowService:
         segment = _stage_state(project, StageName.SEGMENT)
         render = _stage_state(project, StageName.RENDER)
         source_directory = _artifact_path(
-            self.paths, ingest, ArtifactRole.SOURCE_FRAMES, "frames"
+            self.paths, ingest, ArtifactRole.SOURCE_FRAMES, ArtifactCategory.FRAMES
         )
         proxy_directory = _artifact_path(
-            self.paths, ingest, ArtifactRole.PROXY_FRAMES, "proxies"
+            self.paths, ingest, ArtifactRole.PROXY_FRAMES, ArtifactCategory.PROXIES
         )
         mask_directory = _artifact_path(
-            self.paths, segment, ArtifactRole.SUBJECT_MASKS, "masks"
+            self.paths, segment, ArtifactRole.SUBJECT_MASKS, ArtifactCategory.MASKS
         )
         render_directory = _artifact_path(
-            self.paths, render, ArtifactRole.RENDER_FRAMES, "renders"
+            self.paths, render, ArtifactRole.RENDER_FRAMES, ArtifactCategory.RENDERS
         )
         sources = _frame_inventory(
             source_directory,
@@ -1571,8 +1615,8 @@ class CompositeWorkflowService:
             )
             token.raise_if_cancelled()
 
-        composite_directory = self.paths.publisher.publish_tree(
-            "composites", result_key, build_composites
+        composite_ref, composite_directory = self.paths.publish(
+            project, ArtifactCategory.COMPOSITES, result_key, build_composites
         )
         composites = _frame_inventory(
             composite_directory,
@@ -1645,8 +1689,8 @@ class CompositeWorkflowService:
             preview_frames.rmdir()
             token.raise_if_cancelled()
 
-        preview_directory = self.paths.publisher.publish_tree(
-            "previews", result_key, build_preview
+        preview_directory_ref, preview_directory = self.paths.publish(
+            project, ArtifactCategory.PREVIEWS, result_key, build_preview
         )
         _validate_published_mp4(
             preview_directory,
@@ -1658,16 +1702,15 @@ class CompositeWorkflowService:
             prober=self.prober,
             token=token,
         )
-        composite_relative = self.paths.relative(composite_directory)
-        preview_relative = self.paths.relative(
-            preview_directory / "composite-preview.mp4"
+        preview_ref = self.paths.member(
+            preview_directory_ref, "composite-preview.mp4"
         )
         return StageResult(
-            output_paths=(composite_relative, preview_relative),
+            output_paths=(composite_ref, preview_ref),
             cache_key=result_key,
             artifacts={
-                ArtifactRole.COMPOSITE_FRAMES: composite_relative,
-                ArtifactRole.COMPOSITE_PREVIEW: preview_relative,
+                ArtifactRole.COMPOSITE_FRAMES: composite_ref,
+                ArtifactRole.COMPOSITE_PREVIEW: preview_ref,
             },
         )
 
@@ -1716,7 +1759,7 @@ class ExportWorkflowService:
             self.paths,
             composite,
             ArtifactRole.COMPOSITE_FRAMES,
-            "composites",
+            ArtifactCategory.COMPOSITES,
         )
         frames = _frame_inventory(
             composite_directory,
@@ -1789,8 +1832,8 @@ class ExportWorkflowService:
             )
             token.raise_if_cancelled()
 
-        output_directory = self.paths.publisher.publish_tree(
-            "exports", result_key, build
+        directory_ref, output_directory = self.paths.publish(
+            project, ArtifactCategory.EXPORTS, result_key, build
         )
         _validate_published_mp4(
             output_directory,
@@ -1802,10 +1845,10 @@ class ExportWorkflowService:
             prober=self.prober,
             token=token,
         )
-        relative = self.paths.relative(output_directory / "final.mp4")
+        reference = self.paths.member(directory_ref, "final.mp4")
         emit(1, 1, "验证并发布最终视频 1/1")
         return StageResult(
-            output_paths=(relative,),
+            output_paths=(reference,),
             cache_key=result_key,
-            artifacts={ArtifactRole.EXPORT_VIDEO: relative},
+            artifacts={ArtifactRole.EXPORT_VIDEO: reference},
         )

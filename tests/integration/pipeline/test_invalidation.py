@@ -1,21 +1,35 @@
 import pytest
+import hashlib
 
-from gs_video.domain.models import Project, StageName, StageState, StageStatus
+from gs_video.domain.models import (
+    ArtifactCategory,
+    ArtifactRef,
+    Project,
+    StageName,
+    StageState,
+    StageStatus,
+)
 import gs_video.pipeline.workflow as workflow
 
 
 def completed_project() -> Project:
-    return Project(
-        name="completed",
-        stages={
+    project = Project(name="completed")
+    project.stages = {
             name: StageState(
                 status=StageStatus.SUCCEEDED,
-                cache_key=f"{name.value}-key",
-                output_paths=[f"artifacts/{name.value}"],
+                cache_key=hashlib.sha256(name.value.encode()).hexdigest(),
+                output_paths=[
+                    ArtifactRef(
+                        project_id=project.project_id,
+                        category=ArtifactCategory.RENDERS,
+                        cache_key=hashlib.sha256(name.value.encode()).hexdigest(),
+                        member=f"{name.value}.bin",
+                    )
+                ],
             )
             for name in StageName
-        },
-    )
+        }
+    return project
 
 
 @pytest.mark.parametrize(
@@ -62,8 +76,8 @@ def test_change_invalidates_only_its_root_and_downstream_stages(
             assert state.cache_key is None
         else:
             assert state.status is StageStatus.SUCCEEDED
-            assert state.cache_key == f"{name.value}-key"
-        assert state.output_paths == [f"artifacts/{name.value}"]
+            assert state.cache_key == hashlib.sha256(name.value.encode()).hexdigest()
+        assert state.output_paths[0].member == f"{name.value}.bin"
 
 
 def test_changing_target_camera_keeps_ingest_segment_and_solver_cached() -> None:

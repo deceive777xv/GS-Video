@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import os
+import shutil
 import stat
 from collections import OrderedDict
 from collections.abc import Callable
@@ -22,6 +23,7 @@ from gs_video.api.schemas import (
     UploadCreated,
     UploadStatus,
 )
+from gs_video.resource_admission import bytes_with_disk_headroom
 
 
 CHUNK_LIMIT = 1024 * 1024
@@ -732,6 +734,17 @@ class UploadManager:
                     category="upload",
                     message="The active upload limit has been reached.",
                     retryable=True,
+                )
+            reserved = sum(record.total_size * 2 for record in self._records.values())
+            required = bytes_with_disk_headroom(
+                reserved + request.total_size * 2
+            )
+            if shutil.disk_usage(self._root).free < required:
+                raise ApiError(
+                    507,
+                    code="storage_full",
+                    category="storage",
+                    message="The cache disk lacks upload space with 20% headroom.",
                 )
             self._require_roots()
             self._require_source()

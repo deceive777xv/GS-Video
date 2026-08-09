@@ -302,7 +302,7 @@ export function ImportPage({
         <article className={`asset-drop ${video === null ? '' : 'asset-ready'}`}>
           <span className="asset-kicker">SOURCE VIDEO</span>
           <h3>{video?.filename ?? '单人短视频'}</h3>
-          {video === null ? <p>10–30 秒，最高 1080p，单镜头。</p> : (
+          {video === null ? <p>10–120 秒，最高 4K，文件不超过 4 GiB，单镜头。</p> : (
             <dl className="asset-stats">
               <div><dt>画面</dt><dd>{video.width} × {video.height}</dd></div>
               <div><dt>时长</dt><dd>{video.duration_seconds.toFixed(1)} 秒</dd></div>

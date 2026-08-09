@@ -20,6 +20,12 @@ from gs_video.environment.doctor import EnvironmentReport
 from gs_video.environment.vram import VramBudgetMode, VramBudgetSnapshot
 from gs_video.project.assets import AssetKind as LibraryAssetKind, AssetRecord
 from gs_video.project.catalog import ProjectSummary
+from gs_video.storage.layout import (
+    CacheAction,
+    CacheCleanupMode,
+    ProjectLibraryAction,
+    StorageLayoutSnapshot,
+)
 
 
 API_VERSION = "v1"
@@ -107,6 +113,7 @@ class BootstrapResponse(StrictModel):
     asset_counts: dict[LibraryAssetKind, int] = Field(default_factory=dict)
     environment: EnvironmentReport
     vram_budget: VramBudgetSnapshot
+    storage_layout: StorageLayoutSnapshot | None = None
 
 
 class VramBudgetUpdate(StrictModel):
@@ -129,6 +136,48 @@ class VramBudgetUpdate(StrictModel):
         if self.mode is VramBudgetMode.STANDARD and self.selected_vram_mb is not None:
             raise ValueError("standard VRAM mode does not accept selected_vram_mb")
         return self
+
+
+class StorageLayoutUpdate(StrictModel):
+    project_library_root: str = Field(min_length=3, max_length=32767)
+    cache_root: str = Field(min_length=3, max_length=32767)
+    project_action: ProjectLibraryAction
+    cache_action: CacheAction
+
+    @field_validator("project_action", mode="before")
+    @classmethod
+    def parse_project_action(cls, value: object) -> ProjectLibraryAction:
+        if isinstance(value, ProjectLibraryAction):
+            return value
+        if type(value) is str:
+            return ProjectLibraryAction(value)
+        raise ValueError("invalid project library action")
+
+    @field_validator("cache_action", mode="before")
+    @classmethod
+    def parse_cache_action(cls, value: object) -> CacheAction:
+        if isinstance(value, CacheAction):
+            return value
+        if type(value) is str:
+            return CacheAction(value)
+        raise ValueError("invalid cache action")
+
+
+class CacheCleanupPlanRequest(StrictModel):
+    mode: CacheCleanupMode
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def parse_mode(cls, value: object) -> CacheCleanupMode:
+        if isinstance(value, CacheCleanupMode):
+            return value
+        if type(value) is str:
+            return CacheCleanupMode(value)
+        raise ValueError("invalid cache cleanup mode")
+
+
+class CacheCleanupRequest(CacheCleanupPlanRequest):
+    plan_token: str = Field(pattern=r"^[0-9a-f]{32}$")
 
 
 class EnvironmentRepairState(StrEnum):

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import os
 from enum import StrEnum
 from pathlib import Path
 from threading import RLock
@@ -9,11 +7,10 @@ from typing import Callable
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from gs_video.segmentation.paths import has_reparse_component
+from gs_video.storage.settings import read_user_settings, write_user_settings
 
 MINIMUM_VRAM_MB = 1024
 STANDARD_VRAM_MB = 8192
-_MAX_PREFERENCE_BYTES = 16 * 1024
 VramLimitProvider = Callable[[], int]
 
 
@@ -23,7 +20,7 @@ class VramBudgetMode(StrEnum):
 
 
 class VramBudgetPreference(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid")
 
     mode: VramBudgetMode
     selected_vram_mb: int = Field(strict=True, ge=MINIMUM_VRAM_MB)
@@ -63,23 +60,20 @@ def resolve_vram_limit_mb(
 
 
 def _read_preference(path: Path) -> tuple[VramBudgetPreference | None, bool]:
-    try:
-        stat_result = path.stat()
-    except FileNotFoundError:
+    settings, invalid = read_user_settings(path)
+    if invalid:
+        return None, True
+    if not settings:
         return None, False
-    except OSError:
-        return None, True
-    if (
-        not path.is_file()
-        or has_reparse_component(path)
-        or stat_result.st_size <= 0
-        or stat_result.st_size > _MAX_PREFERENCE_BYTES
-    ):
-        return None, True
+    if "vram_budget" in settings:
+        value = settings["vram_budget"]
+    elif "mode" in settings or "selected_vram_mb" in settings:
+        value = settings
+    else:
+        return None, False
     try:
-        payload = path.read_bytes()
-        return VramBudgetPreference.model_validate_json(payload), False
-    except (OSError, ValidationError, ValueError):
+        return VramBudgetPreference.model_validate(value), False
+    except (ValidationError, ValueError):
         return None, True
 
 
@@ -178,27 +172,17 @@ class VramBudgetManager:
         return self.snapshot().selected_vram_mb
 
     def _save(self, preference: VramBudgetPreference) -> None:
-        parent = self._path.parent
-        temporary = self._path.with_name(f"{self._path.name}.tmp")
         try:
-            parent.mkdir(parents=True, exist_ok=True)
-            if has_reparse_component(parent) or (
-                self._path.exists() and has_reparse_component(self._path)
-            ) or (
-                temporary.exists() and has_reparse_component(temporary)
-            ):
-                raise OSError("preference path contains a link or reparse point")
-            serialized = json.dumps(
-                preference.model_dump(mode="json"),
-                ensure_ascii=False,
-                indent=2,
-            ) + "\n"
-            temporary.write_text(serialized, encoding="utf-8", newline="\n")
-            os.replace(temporary, self._path)
+            settings, invalid = read_user_settings(self._path)
+            if invalid:
+                settings = {}
+            settings.pop("mode", None)
+            settings.pop("selected_vram_mb", None)
+            settings["schema_version"] = 1
+            settings["vram_budget"] = preference.model_dump(mode="json")
+            write_user_settings(self._path, settings)
         except OSError as error:
             raise VramBudgetPersistenceError("failed to save VRAM preference") from error
-        finally:
-            temporary.unlink(missing_ok=True)
 
     def update(
         self,

@@ -21,19 +21,7 @@ from gs_video.domain.models import (
 from gs_video.project.migrations import migrate_project_dict
 
 
-PROJECT_DIRECTORIES = (
-    "source",
-    "frames",
-    "proxies",
-    "masks",
-    "camera",
-    "trajectories",
-    "renders",
-    "composites",
-    "previews",
-    "exports",
-    "logs",
-)
+PROJECT_DIRECTORIES: tuple[str, ...] = ()
 
 
 class ProjectInstanceLock:
@@ -192,6 +180,7 @@ class ProjectRepository:
         return Project.model_validate(migrate_project_dict(raw))
 
     def _save_unlocked(self, project: Project) -> None:
+        project.assert_artifact_authority()
         project.updated_at = datetime.now(timezone.utc)
         temporary = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
         temporary.write_text(project.model_dump_json(indent=2), encoding="utf-8")
