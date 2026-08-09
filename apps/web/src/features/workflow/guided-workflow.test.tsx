@@ -7,6 +7,7 @@ import type { BackendClient } from '../../api/backend-client'
 import type {
   BootstrapDto,
   AssetKind,
+  AssetListItemDto,
   ProjectDto,
   StageStateDto,
   StageName,
@@ -94,6 +95,22 @@ function bootstrap(current: ProjectDto): BootstrapDto {
   }
 }
 
+function libraryPly(): AssetListItemDto {
+  return {
+    asset: {
+      asset_id: 'asset-ply', kind: 'ply', original_filename: 'library.ply',
+      stored_relative_path: 'aa/library.ply', size: 2048,
+      sha256: 'b'.repeat(64), imported_at: '2026-08-09T00:00:00Z',
+      video_summary: null,
+      scene_summary: {
+        filename: 'library.ply', size: 2048, sha256: 'library-scene-sha',
+        gaussian_count: 1_250_000, estimated_vram_mb: 3072,
+      },
+    },
+    references: [],
+  }
+}
+
 function createHarness(initial = project()) {
   let current = structuredClone(initial)
   let revision = 0
@@ -140,7 +157,24 @@ function createHarness(initial = project()) {
     deleteProject: vi.fn(),
     listAssets: vi.fn(),
     deleteAsset: vi.fn(),
-    selectProjectAsset: vi.fn(),
+    selectProjectAsset: vi.fn(async (kind, assetId) => {
+      if (kind === 'source_video') {
+        current.source_video_asset_id = assetId
+        current.workflow.source_summary = assetId === null ? null : {
+          filename: 'library.mp4', size: 1024, sha256: 'library-video-sha',
+          width: 1920, height: 1080, duration_seconds: 12, fps: '30/1',
+          has_audio: true, frame_count: 360,
+        }
+      } else {
+        current.scene_ply_asset_id = assetId
+        current.workflow.scene_summary = assetId === null ? null : {
+          filename: 'library.ply', size: 2048, sha256: 'library-scene-sha',
+          gaussian_count: 1_250_000, estimated_vram_mb: 3072,
+        }
+      }
+      current.stages.ingest = stage()
+      return structuredClone(current)
+    }),
     importLocalPath: vi.fn(),
     createUpload: vi.fn(async (input) => ({ id: `upload-${input.kind}`, chunk_size: 4 })),
     putUploadChunk: vi.fn(async () => undefined),
@@ -276,6 +310,84 @@ function createHarness(initial = project()) {
 }
 
 describe('guided workflow', () => {
+  it('links each import input to its matching asset-library tab with a project return context', async () => {
+    const harness = createHarness()
+
+    render(<App backend={harness.client} platform={harness.platform} />)
+
+    const videoCard = (await screen.findByRole('heading', { name: '单人短视频' })).closest('article')
+    const sceneCard = screen.getByRole('heading', { name: '静态 Gaussian PLY' }).closest('article')
+    expect(videoCard).not.toBeNull()
+    expect(sceneCard).not.toBeNull()
+    expect(within(videoCard!).getByRole('link', { name: '从素材库选择' }))
+      .toHaveAttribute('href', '#/assets/video?returnProject=project-1')
+    expect(within(sceneCard!).getByRole('link', { name: '从素材库选择' }))
+      .toHaveAttribute('href', '#/assets/ply?returnProject=project-1')
+  })
+
+  it('returns from a contextual library selection and unlocks the next step after ingest succeeds', async () => {
+    const current = project()
+    current.source_video_asset_id = 'asset-video'
+    current.workflow.source_summary = {
+      filename: 'portrait.mp4', size: 1024, sha256: 'source-sha',
+      width: 1920, height: 1080, duration_seconds: 12, fps: '30/1',
+      has_audio: true, frame_count: 360,
+    }
+    const harness = createHarness(current)
+    vi.mocked(harness.client.listAssets).mockResolvedValue([libraryPly()])
+    window.location.hash = '#/assets/ply?returnProject=project-1'
+    const user = userEvent.setup()
+
+    render(<App backend={harness.client} initialBootstrap={bootstrap(current)} platform={harness.platform} startAtHome />)
+
+    await user.click(await screen.findByRole('button', { name: '用于当前项目' }))
+    expect(await screen.findByRole('heading', { name: '导入素材' })).toBeVisible()
+    await waitFor(() => expect(screen.getByRole('button', { name: '下一步' })).toBeEnabled())
+    expect(window.location.hash).toBe('#/projects/project-1/workflow/import')
+  })
+
+  it('returns after selecting the first input without starting ingest early', async () => {
+    const current = project()
+    const harness = createHarness(current)
+    vi.mocked(harness.client.listAssets).mockResolvedValue([libraryPly()])
+    window.location.hash = '#/assets/ply?returnProject=project-1'
+    const user = userEvent.setup()
+
+    render(<App backend={harness.client} initialBootstrap={bootstrap(current)} platform={harness.platform} startAtHome />)
+
+    await user.click(await screen.findByRole('button', { name: '用于当前项目' }))
+    expect(await screen.findByRole('heading', { name: '导入素材' })).toBeVisible()
+    expect(screen.getByRole('button', { name: '下一步' })).toBeDisabled()
+    expect(screen.getByText('准备就绪')).toBeVisible()
+  })
+
+  it.each([
+    ['global library route', '#/assets/ply'],
+    ['mismatched return project', '#/assets/ply?returnProject=project-2'],
+  ])('keeps %s in the library while preparing complete inputs', async (_case, hash) => {
+    const current = project()
+    current.source_video_asset_id = 'asset-video'
+    current.workflow.source_summary = {
+      filename: 'portrait.mp4', size: 1024, sha256: 'source-sha',
+      width: 1920, height: 1080, duration_seconds: 12, fps: '30/1',
+      has_audio: true, frame_count: 360,
+    }
+    const harness = createHarness(current)
+    vi.mocked(harness.client.listAssets).mockResolvedValue([libraryPly()])
+    window.location.hash = hash
+    const user = userEvent.setup()
+
+    render(<App backend={harness.client} initialBootstrap={bootstrap(current)} platform={harness.platform} startAtHome />)
+
+    await user.click(await screen.findByRole('button', { name: '用于当前项目' }))
+    expect(await screen.findByRole('heading', { name: '素材库' })).toBeVisible()
+    expect(window.location.hash).toBe(hash)
+
+    window.location.hash = '#/projects/project-1/workflow/import'
+    expect(await screen.findByRole('heading', { name: '导入素材' })).toBeVisible()
+    await waitFor(() => expect(screen.getByRole('button', { name: '下一步' })).toBeEnabled())
+  })
+
   it('opens a project-aware workflow URL and restores its requested step', async () => {
     const requested = project()
     requested.project_id = 'project-2'

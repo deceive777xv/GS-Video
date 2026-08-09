@@ -309,7 +309,10 @@ export function ImportPage({
               <div><dt>音轨</dt><dd>{video.has_audio ? '保留' : '无'}</dd></div>
             </dl>
           )}
-          <button disabled={busy || importing || cancelling} onClick={() => void importAsset('source_video')} type="button">选择源视频</button>
+          <div className="asset-actions">
+            <button disabled={busy || importing || cancelling} onClick={() => void importAsset('source_video')} type="button">选择源视频</button>
+            <a className="asset-library-link" href={`#/assets/video?returnProject=${encodeURIComponent(project.project_id)}`}>从素材库选择</a>
+          </div>
         </article>
         <article className={`asset-drop ${scene === null ? '' : 'asset-ready'}`}>
           <span className="asset-kicker">GAUSSIAN SCENE</span>
@@ -321,7 +324,10 @@ export function ImportPage({
               <div><dt>预算</dt><dd>{scene.estimated_vram_mb <= environment.vram_limit_mb ? '可尝试' : '建议降采样'}</dd></div>
             </dl>
           )}
-          <button disabled={busy || importing || cancelling} onClick={() => void importAsset('scene_ply')} type="button">选择 Gaussian 场景</button>
+          <div className="asset-actions">
+            <button disabled={busy || importing || cancelling} onClick={() => void importAsset('scene_ply')} type="button">选择 Gaussian 场景</button>
+            <a className="asset-library-link" href={`#/assets/ply?returnProject=${encodeURIComponent(project.project_id)}`}>从素材库选择</a>
+          </div>
         </article>
       </div>
       <aside className={`environment-card ${environment.ready ? 'is-ready' : 'has-issues'}`}>

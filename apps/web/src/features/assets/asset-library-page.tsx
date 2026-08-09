@@ -30,6 +30,7 @@ export function AssetLibraryPage({ backend, busy, kind, platform, project, onErr
   const [items, setItems] = useState<AssetListItemDto[]>([])
   const [loading, setLoading] = useState(true)
   const [importing, setImporting] = useState(false)
+  const [selectingId, setSelectingId] = useState<string | null>(null)
 
   const refresh = async (): Promise<void> => {
     setItems(await backend.listAssets(kind))
@@ -87,6 +88,18 @@ export function AssetLibraryPage({ backend, busy, kind, platform, project, onErr
 
   const selectedId = kind === 'video' ? project?.source_video_asset_id : project?.scene_ply_asset_id
 
+  const selectAsset = async (assetId: string): Promise<void> => {
+    if (selectingId !== null) return
+    setSelectingId(assetId)
+    try {
+      await onProjectChange(await backend.selectProjectAsset(apiKind(kind), assetId))
+    } catch (error) {
+      onError(error)
+    } finally {
+      setSelectingId(null)
+    }
+  }
+
   return (
     <main className="hub-main asset-library-main">
       <section className="section-heading asset-library-heading">
@@ -107,7 +120,7 @@ export function AssetLibraryPage({ backend, busy, kind, platform, project, onErr
               <td><strong>{asset.original_filename}</strong><small>{asset.sha256.slice(0, 12)}…</small></td>
               <td>{formatBytes(asset.size)}</td><td>{new Date(asset.imported_at).toLocaleString()}</td>
               <td>{references.length === 0 ? '未引用' : references.map((item) => item.name).join('、')}</td>
-              <td><div className="table-actions"><button className="button-secondary" disabled={project === null || busy || selectedId === asset.asset_id} onClick={() => void backend.selectProjectAsset(apiKind(kind), asset.asset_id).then(onProjectChange).catch(onError)} type="button">{selectedId === asset.asset_id ? '当前使用' : '用于当前项目'}</button><button className="button-quiet-danger" disabled={references.length > 0} title={references.length > 0 ? '被项目引用的素材不能删除' : undefined} onClick={() => void backend.deleteAsset(asset.asset_id).then(refresh).catch(onError)} type="button">删除</button></div></td>
+              <td><div className="table-actions"><button className="button-secondary" disabled={project === null || busy || selectingId !== null || selectedId === asset.asset_id} onClick={() => void selectAsset(asset.asset_id)} type="button">{selectedId === asset.asset_id ? '当前使用' : '用于当前项目'}</button><button className="button-quiet-danger" disabled={references.length > 0} title={references.length > 0 ? '被项目引用的素材不能删除' : undefined} onClick={() => void backend.deleteAsset(asset.asset_id).then(refresh).catch(onError)} type="button">删除</button></div></td>
             </tr>
           ))}
         </tbody></table></div>

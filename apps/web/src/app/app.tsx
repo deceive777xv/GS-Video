@@ -135,6 +135,17 @@ function routeFromHash(hash: string, fallback: AppView): AppView {
   return fallback
 }
 
+function assetReturnProjectFromHash(hash: string): string | null {
+  const match = /^#\/assets\/(?:video|ply)\?returnProject=([^&]+)$/.exec(hash)
+  if (match === null) return null
+  try {
+    const value = decodeURIComponent(match[1] ?? '')
+    return value.length > 0 ? value : null
+  } catch {
+    return null
+  }
+}
+
 export function App({
   backend,
   platform,
@@ -625,6 +636,24 @@ export function App({
     }
   }
 
+  const acceptLibraryProject = async (next: ProjectDto): Promise<void> => {
+    acceptProject(next)
+    const returnProjectId = assetReturnProjectFromHash(window.location.hash)
+    if (next.workflow.source_summary !== null
+      && next.workflow.scene_summary !== null
+      && !stageSucceeded(next, 'ingest')) {
+      try {
+        await runStage('ingest')
+      } catch {
+        // runStage already reports the authoritative task-admission error.
+      }
+    }
+    void refreshCatalog()
+    if (returnProjectId === next.project_id) {
+      navigateWorkflow(next.project_id, 'import')
+    }
+  }
+
   if (view === 'home' || view === 'assets-video' || view === 'assets-ply' || view === 'settings') {
     return (
       <AppShell>
@@ -664,7 +693,7 @@ export function App({
             busy={shellBusy}
             kind={view === 'assets-ply' ? 'ply' : 'video'}
             onError={reportUnknownError}
-            onProjectChange={(next) => { acceptProject(next); void refreshCatalog() }}
+            onProjectChange={acceptLibraryProject}
             platform={platform}
             project={project}
           />
