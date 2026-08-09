@@ -131,7 +131,8 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 .project-heading span { color: var(--muted); font-size: 0.75rem; }
 .project-heading strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.88rem; }
 .header-status { display: flex; align-items: center; gap: 0.55rem; color: var(--muted); font-size: 0.72rem; }
-.hub-topbar { grid-template-columns: 250px 1fr auto; }
+.hub-topbar { grid-template-columns: 250px auto minmax(0, 1fr) auto; }
+.hub-topbar .project-heading { grid-column: 4; justify-self: end; }
 .hub-nav { justify-self: center; display: flex; align-items: center; gap: 0.4rem; }
 .workflow-global-nav, .hub-nav { justify-self: center; display: flex; align-items: center; gap: 0.4rem; }
 .workflow-global-nav a, .hub-nav a, .asset-tabs a { border-radius: 6px; padding: 0.55rem 0.8rem; color: var(--muted); text-decoration: none; font-size: 0.76rem; font-weight: 700; }
@@ -237,8 +238,8 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 .modal-actions { display: flex; justify-content: flex-end; gap: .55rem; }
 .hub-footer { display: grid; place-items: center; border-top: 1px solid var(--line); color: #627078; font: 700 .62rem ui-monospace, monospace; letter-spacing: .1em; }
 .asset-library-main { padding-top: 2.4rem; }
-.storage-settings-main { display: grid; gap: 1.25rem; }
-.storage-settings-heading, .storage-settings-grid, .storage-settings-actions, .storage-restart-card, .storage-settings-notice { width: min(1120px, 100%); margin-inline: auto; }
+.storage-settings-main { --storage-settings-content-width: 1120px; display: grid; align-content: start; gap: 1.25rem; }
+.storage-settings-heading, .storage-settings-grid, .storage-settings-actions, .storage-restart-card, .storage-settings-notice { width: 100%; max-width: var(--storage-settings-content-width); margin-inline: auto; }
 .storage-settings-heading h1 { margin: 0.35rem 0 0.55rem; font-size: clamp(2rem, 4vw, 3.3rem); letter-spacing: -0.045em; }
 .storage-settings-heading > p:last-child { max-width: 720px; margin: 0; color: var(--muted); line-height: 1.65; }
 .storage-settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
@@ -319,7 +320,7 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 .subject-layout, .preview-layout { display: grid; grid-template-columns: minmax(0, 1.8fr) minmax(260px, 0.7fr); gap: 1rem; align-items: stretch; }
 .subject-frame, .preview-card, .viewport-frame { position: relative; overflow: hidden; min-height: 430px; border: 1px solid var(--line); border-radius: 10px; background: #050708; display: grid; place-items: center; }
 .subject-frame img, .preview-media img, .preview-media video, .viewport-frame img { width: 100%; height: 100%; object-fit: contain; user-select: none; }
-.subject-frame { height: clamp(360px, calc(100vh - 360px), 560px); min-height: 0; align-self: start; }
+.subject-frame, .preview-card { height: clamp(360px, calc(100vh - 360px), 560px); min-height: 0; align-self: start; }
 .subject-frame > img { position: absolute; inset: 0; }
 .preview-media video { min-height: 0; background: #000; }
 .alpha-overlay { position: absolute; inset: 0; opacity: 0.48; filter: sepia(1) saturate(5) hue-rotate(52deg); mix-blend-mode: screen; }
@@ -348,7 +349,7 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 .chip-ok { color: var(--acid); border-color: rgba(183,246,61,0.35); background: var(--acid-soft); }
 .technical-note, .honest-state { margin: 0; padding: 0.8rem 1rem; border-left: 2px solid var(--cyan); background: rgba(85,214,194,0.05); color: #9caaa4; font-size: 0.75rem; line-height: 1.5; }
 
-.preview-card { min-width: 0; height: clamp(320px, calc(100vh - 440px), 560px); min-height: 0; align-self: start; display: grid; grid-template-rows: minmax(0, 1fr) auto; place-items: stretch; }
+.preview-card { min-width: 0; display: grid; grid-template-rows: minmax(0, 1fr) auto; place-items: stretch; }
 .preview-media { min-width: 0; min-height: 0; overflow: hidden; display: grid; place-items: center; }
 .preview-media > img, .preview-media > video { min-width: 0; min-height: 0; max-width: 100%; max-height: 100%; }
 .preview-caption { width: 100%; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.35rem 0.75rem; padding: 0.75rem 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.7rem; background: #0d1215; }
@@ -408,8 +409,7 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
   .workflow-rail li button { grid-template-columns: 30px 1fr; }
   .viewport-layout, .subject-layout, .preview-layout { grid-template-columns: 1fr; }
   .viewport-frame { min-height: 420px; }
-  .subject-frame { height: clamp(360px, calc(100vh - 360px), 520px); min-height: 360px; }
-  .preview-card { height: clamp(320px, calc(100vh - 360px), 520px); min-height: 320px; }
+  .subject-frame, .preview-card { height: clamp(360px, calc(100vh - 360px), 520px); min-height: 360px; }
   .viewport-controls { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); }
   .viewport-controls fieldset { grid-column: 1 / -1; }
   .hub-hero { grid-template-columns: 1fr; }
@@ -439,8 +439,7 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
   .page-heading-row { display: block; }
   .authority-chips { margin-top: 0.8rem; justify-content: flex-start; }
   .viewport-frame { min-height: 320px; }
-  .subject-frame { height: clamp(280px, calc(100vh - 420px), 420px); min-height: 280px; }
-  .preview-card { height: clamp(280px, calc(100vh - 420px), 420px); min-height: 280px; }
+  .subject-frame, .preview-card { height: clamp(280px, calc(100vh - 420px), 420px); min-height: 280px; }
   .viewport-controls { display: flex; }
   .export-card { grid-template-columns: 1fr; }
   .export-orbit { width: 120px; height: 120px; justify-self: center; }
