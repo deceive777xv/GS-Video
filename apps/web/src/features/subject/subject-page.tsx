@@ -143,7 +143,7 @@ export function SubjectPage({ backend, busy, project, onError, onProjectChange, 
         <p>在代表帧的人物身体内点击。服务会验证坐标后再写入项目并启动分割。</p>
       </div>
       <div className="subject-layout">
-        <div aria-label="人物代表帧" className="subject-frame" onClick={pick} ref={frameRef} tabIndex={0}>
+        <div aria-label="人物代表帧" className="subject-frame preview-surface" onClick={pick} ref={frameRef} tabIndex={0}>
           {proxyUrl === null ? <div className="viewport-empty">载入代表帧…</div> : <img alt="人物代表帧" src={proxyUrl} />}
           {alphaUrl === null ? null : <img alt="人物 Alpha 叠加" className="alpha-overlay" src={alphaUrl} />}
         </div>

@@ -186,7 +186,7 @@ export function PreviewPage({
       </div>
       <div className="preview-layout">
         <article className="preview-card">
-          <div className="preview-media">
+          <div className="preview-media preview-surface">
             {compositeAuthority !== null ? (
               displayedComposite === null
                 ? <div className="viewport-empty">正在验证合成预览…</div>

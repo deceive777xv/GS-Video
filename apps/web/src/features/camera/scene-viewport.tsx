@@ -489,7 +489,7 @@ export function SceneViewport({
     <div className="viewport-layout">
       <div
         aria-label="Gaussian 场景视口"
-        className="viewport-frame"
+        className="viewport-frame preview-surface"
         onClick={chooseFootPoint}
         onPointerDown={pointerDown}
         onPointerMove={pointerMove}
