@@ -269,10 +269,10 @@ export class HttpBackendClient implements BackendClient {
     return this.#request(`/assets/${encodeURIComponent(id)}`, { method: 'DELETE' })
   }
 
-  selectProjectAsset(kind: AssetKind, assetId: string | null): Promise<ProjectDto> {
+  selectProjectAsset(kind: AssetKind, assetId: string | null, expectedProjectId: string): Promise<ProjectDto> {
     const key = kind === 'source_video' ? 'source_video_asset_id' : 'scene_ply_asset_id'
     return this.#request('/projects/current/assets', {
-      method: 'PATCH', json: { [key]: assetId },
+      method: 'PATCH', json: { expected_project_id: expectedProjectId, [key]: assetId },
     })
   }
 

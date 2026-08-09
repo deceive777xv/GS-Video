@@ -1674,6 +1674,15 @@ def build_router() -> APIRouter:
             )
         async with _runtime_change_lock(request):
             reject_project_change_while_busy(request)
+            current = await asyncio.to_thread(services.project_repository.load)
+            if current.project_id != selection.expected_project_id:
+                raise ApiError(
+                    409,
+                    code="project_context_changed",
+                    category="conflict",
+                    message="The active project changed before the asset selection was applied.",
+                    retryable=True,
+                )
             records: dict[str, AssetRecord | None] = {}
             for field, kind in (
                 ("source_video_asset_id", LibraryAssetKind.VIDEO),
@@ -1709,7 +1718,6 @@ def build_router() -> APIRouter:
                     category="validation",
                     message="Select at least one project asset field.",
                 )
-            current = await asyncio.to_thread(services.project_repository.load)
             prospective_source = current.workflow.source_summary
             prospective_scene = current.workflow.scene_summary
             if "source_video_asset_id" in records:

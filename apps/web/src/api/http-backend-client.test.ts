@@ -110,6 +110,28 @@ afterEach(() => {
 })
 
 describe('HttpBackendClient', () => {
+  it('binds project asset selection to the project that initiated it', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ project_id: 'project-1' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152', token: 'secret', fetchImpl,
+    })
+
+    await client.selectProjectAsset('scene_ply', 'asset-1', 'project-1')
+
+    const [url, init] = fetchImpl.mock.calls[0] ?? []
+    expect(url).toBe('http://127.0.0.1:49152/api/v1/projects/current/assets')
+    expect(init?.method).toBe('PATCH')
+    expect(init?.body).toBe(JSON.stringify({
+      expected_project_id: 'project-1',
+      scene_ply_asset_id: 'asset-1',
+    }))
+  })
+
   it('updates the authenticated VRAM budget endpoint with a strict PATCH body', async () => {
     const snapshot = {
       mode: 'custom',

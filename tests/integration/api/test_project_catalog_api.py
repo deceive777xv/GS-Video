@@ -188,9 +188,29 @@ def test_shared_assets_are_separated_referenced_and_protected(
         "/api/v1/assets?kind=ply", headers=HEADERS
     ).json() == []
 
+    current_id = catalog_client.get(
+        "/api/v1/projects/current", headers=HEADERS
+    ).json()["project_id"]
+    stale_selection = catalog_client.patch(
+        "/api/v1/projects/current/assets",
+        json={
+            "expected_project_id": "stale-project-id",
+            "source_video_asset_id": asset_id,
+        },
+        headers=HEADERS,
+    )
+    assert stale_selection.status_code == 409
+    assert stale_selection.json()["code"] == "project_context_changed"
+    assert catalog_client.get(
+        "/api/v1/projects/current", headers=HEADERS
+    ).json()["source_video_asset_id"] is None
+
     selected = catalog_client.patch(
         "/api/v1/projects/current/assets",
-        json={"source_video_asset_id": asset_id},
+        json={
+            "expected_project_id": current_id,
+            "source_video_asset_id": asset_id,
+        },
         headers=HEADERS,
     )
     assert selected.status_code == 200
@@ -202,7 +222,10 @@ def test_shared_assets_are_separated_referenced_and_protected(
 
     cleared = catalog_client.patch(
         "/api/v1/projects/current/assets",
-        json={"source_video_asset_id": None},
+        json={
+            "expected_project_id": current_id,
+            "source_video_asset_id": None,
+        },
         headers=HEADERS,
     )
     assert cleared.status_code == 200
@@ -331,7 +354,10 @@ def test_busy_task_blocks_project_changes_and_current_asset_selection(
             ),
             catalog_client.patch(
                 "/api/v1/projects/current/assets",
-                json={"source_video_asset_id": asset_id},
+                json={
+                    "expected_project_id": second_id,
+                    "source_video_asset_id": asset_id,
+                },
                 headers=HEADERS,
             ),
         )

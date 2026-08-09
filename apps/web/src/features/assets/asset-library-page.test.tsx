@@ -24,11 +24,11 @@ describe('AssetLibraryPage', () => {
     } as unknown as BackendClient
     const platform = { kind: 'browser', pickInputFile: vi.fn() } as unknown as PlatformBridge
 
-    render(<AssetLibraryPage backend={backend} busy={false} kind="video" onError={vi.fn()} onProjectChange={vi.fn()} platform={platform} project={null} />)
+    render(<AssetLibraryPage backend={backend} busy={false} kind="video" onError={vi.fn()} onProjectChange={vi.fn()} platform={platform} project={null} returnProjectId="project-1" />)
 
     await waitFor(() => expect(screen.getByText('clip.mp4')).toBeInTheDocument())
-    expect(screen.getByRole('link', { name: '视频' })).toHaveAttribute('href', '#/assets/video')
-    expect(screen.getByRole('link', { name: 'PLY' })).toHaveAttribute('href', '#/assets/ply')
+    expect(screen.getByRole('link', { name: '视频' })).toHaveAttribute('href', '#/assets/video?returnProject=project-1')
+    expect(screen.getByRole('link', { name: 'PLY' })).toHaveAttribute('href', '#/assets/ply?returnProject=project-1')
     expect(screen.getByText('夜景合成')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '删除' })).toBeDisabled()
   })
@@ -51,10 +51,11 @@ describe('AssetLibraryPage', () => {
     } as unknown as ProjectDto
     const user = userEvent.setup()
 
-    render(<AssetLibraryPage backend={backend} busy={false} kind="video" onError={vi.fn()} onProjectChange={vi.fn()} platform={platform} project={project} />)
+    render(<AssetLibraryPage backend={backend} busy={false} kind="video" onError={vi.fn()} onProjectChange={vi.fn()} platform={platform} project={project} returnProjectId="project-1" />)
 
     const select = await screen.findByRole('button', { name: '用于当前项目' })
     await user.click(select)
     expect(select).toBeDisabled()
+    expect(backend.selectProjectAsset).toHaveBeenCalledWith('source_video', 'asset-1', 'project-1')
   })
 })

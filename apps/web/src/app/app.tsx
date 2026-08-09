@@ -20,7 +20,7 @@ import { CameraPage } from '../features/camera/camera-page'
 import { ExportPage } from '../features/export/export-page'
 import { ImportPage } from '../features/import/import-page'
 import { HomePage } from '../features/home/home-page'
-import { AssetLibraryPage } from '../features/assets/asset-library-page'
+import { AssetLibraryPage, type AssetSelectionContext } from '../features/assets/asset-library-page'
 import { PreviewPage } from '../features/preview/preview-page'
 import { SubjectPage } from '../features/subject/subject-page'
 import { VramBudgetControl } from '../features/settings/vram-budget-control'
@@ -636,9 +636,13 @@ export function App({
     }
   }
 
-  const acceptLibraryProject = async (next: ProjectDto): Promise<void> => {
+  const acceptLibraryProject = async (
+    next: ProjectDto,
+    context: AssetSelectionContext,
+  ): Promise<void> => {
+    if (activeProjectId.current !== context.expectedProjectId
+      || next.project_id !== context.expectedProjectId) return
     acceptProject(next)
-    const returnProjectId = assetReturnProjectFromHash(window.location.hash)
     if (next.workflow.source_summary !== null
       && next.workflow.scene_summary !== null
       && !stageSucceeded(next, 'ingest')) {
@@ -648,11 +652,16 @@ export function App({
         // runStage already reports the authoritative task-admission error.
       }
     }
-    void refreshCatalog()
-    if (returnProjectId === next.project_id) {
+    void refreshCatalog().catch(reportUnknownError)
+    if (context.returnProjectId === next.project_id) {
       navigateWorkflow(next.project_id, 'import')
     }
   }
+
+  const requestedReturnProjectId = assetReturnProjectFromHash(window.location.hash)
+  const returnProjectId = requestedReturnProjectId === project?.project_id
+    ? requestedReturnProjectId
+    : null
 
   if (view === 'home' || view === 'assets-video' || view === 'assets-ply' || view === 'settings') {
     return (
@@ -696,6 +705,7 @@ export function App({
             onProjectChange={acceptLibraryProject}
             platform={platform}
             project={project}
+            returnProjectId={returnProjectId}
           />
         )}
         <footer className="hub-footer">GS VIDEO · 本地项目与共享素材</footer>

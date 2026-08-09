@@ -48,7 +48,7 @@ export interface BackendClient {
   deleteProject(id: string): Promise<void>
   listAssets(kind: 'video' | 'ply'): Promise<AssetListItemDto[]>
   deleteAsset(id: string): Promise<void>
-  selectProjectAsset(kind: AssetKind, assetId: string | null): Promise<ProjectDto>
+  selectProjectAsset(kind: AssetKind, assetId: string | null, expectedProjectId: string): Promise<ProjectDto>
   importLocalPath(kind: AssetKind, path: string, assignToCurrent?: boolean): Promise<AssetDto>
   createUpload(input: UploadInit): Promise<UploadSessionDto>
   putUploadChunk(

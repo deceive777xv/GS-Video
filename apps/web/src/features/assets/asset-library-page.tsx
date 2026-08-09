@@ -11,8 +11,14 @@ interface AssetLibraryPageProps {
   kind: LibraryAssetKind
   platform: PlatformBridge
   project: ProjectDto | null
+  returnProjectId: string | null
   onError(error: unknown): void
-  onProjectChange(project: ProjectDto): void
+  onProjectChange(project: ProjectDto, context: AssetSelectionContext): void | Promise<void>
+}
+
+export interface AssetSelectionContext {
+  expectedProjectId: string
+  returnProjectId: string | null
 }
 
 function apiKind(kind: LibraryAssetKind): AssetKind {
@@ -26,7 +32,7 @@ function formatBytes(value: number): string {
   return `${(value / 1024 ** 3).toFixed(2)} GB`
 }
 
-export function AssetLibraryPage({ backend, busy, kind, platform, project, onError, onProjectChange }: AssetLibraryPageProps) {
+export function AssetLibraryPage({ backend, busy, kind, platform, project, returnProjectId, onError, onProjectChange }: AssetLibraryPageProps) {
   const [items, setItems] = useState<AssetListItemDto[]>([])
   const [loading, setLoading] = useState(true)
   const [importing, setImporting] = useState(false)
@@ -87,12 +93,20 @@ export function AssetLibraryPage({ backend, busy, kind, platform, project, onErr
   }
 
   const selectedId = kind === 'video' ? project?.source_video_asset_id : project?.scene_ply_asset_id
+  const returnQuery = returnProjectId === null
+    ? ''
+    : `?returnProject=${encodeURIComponent(returnProjectId)}`
 
   const selectAsset = async (assetId: string): Promise<void> => {
-    if (selectingId !== null) return
+    const expectedProjectId = project?.project_id
+    if (selectingId !== null || expectedProjectId === undefined) return
+    const context = { expectedProjectId, returnProjectId }
     setSelectingId(assetId)
     try {
-      await onProjectChange(await backend.selectProjectAsset(apiKind(kind), assetId))
+      await onProjectChange(
+        await backend.selectProjectAsset(apiKind(kind), assetId, expectedProjectId),
+        context,
+      )
     } catch (error) {
       onError(error)
     } finally {
@@ -107,8 +121,8 @@ export function AssetLibraryPage({ backend, busy, kind, platform, project, onErr
         <button disabled={importing} onClick={() => void importAsset()} type="button">{importing ? '正在导入…' : `导入${kind === 'video' ? '视频' : ' PLY'}`}</button>
       </section>
       <nav className="asset-tabs" aria-label="素材类型">
-        <a className={kind === 'video' ? 'is-current' : ''} href="#/assets/video">视频</a>
-        <a className={kind === 'ply' ? 'is-current' : ''} href="#/assets/ply">PLY</a>
+        <a className={kind === 'video' ? 'is-current' : ''} href={`#/assets/video${returnQuery}`}>视频</a>
+        <a className={kind === 'ply' ? 'is-current' : ''} href={`#/assets/ply${returnQuery}`}>PLY</a>
       </nav>
       {project === null ? <p className="technical-note">请先打开或新建项目，再把素材用于当前项目。</p> : busy ? <p className="technical-note">当前项目任务运行中，完成或取消后才能更换素材。</p> : null}
       {loading ? <div className="empty-state">正在读取素材索引…</div> : items.length === 0 ? (

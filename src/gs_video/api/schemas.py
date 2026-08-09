@@ -233,6 +233,7 @@ class ProjectRename(StrictModel):
 
 
 class ProjectAssetSelection(StrictModel):
+    expected_project_id: str = Field(min_length=1)
     source_video_asset_id: str | None = None
     scene_ply_asset_id: str | None = None
 
