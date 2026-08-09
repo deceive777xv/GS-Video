@@ -286,7 +286,10 @@ class FakePreviewService:
         camera: object,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> PickBuffer:
+        assert preview_root is not None
         assert (project_root / scene_path).is_file()
         assert scene_summary.gaussian_count == 1
         assert camera is not None

@@ -84,4 +84,57 @@ describe('subject media readiness', () => {
     expect(screen.getByRole('img', { name: '人物代表帧' })).toBeVisible()
     expect(onError).not.toHaveBeenCalled()
   })
+
+  it('retries a transient alpha response after segmentation without remount', async () => {
+    vi.useFakeTimers()
+    const project = readyProject()
+    project.stages.segment = {
+      status: 'succeeded', cache_key: 'segment-cache', output_paths: [],
+      error_code: null, artifacts: {},
+    }
+    project.workflow.subject_prompt = { frame_index: 0, x: 120, y: 240 }
+    const notReady = new BackendClientError(409, {
+      code: 'subject_media_not_ready', category: 'project',
+      message: 'The requested subject media is not ready.', retryable: false,
+    })
+    let alphaAttempts = 0
+    const getSubjectMedia = vi.fn(async (role: 'proxy' | 'alpha') => {
+      if (role === 'alpha' && alphaAttempts++ === 0) throw notReady
+      return {
+        role, artifact_id: `${role}-1`, frame_index: 0,
+        width: 480, height: 852, size: 8,
+        mime_type: role === 'proxy' ? 'image/jpeg' : 'image/png',
+      }
+    })
+    const backend = {
+      getSubjectMedia,
+      fetchSubjectMediaArtifact: vi.fn(async (role: 'proxy' | 'alpha') => (
+        new Blob([role], { type: role === 'proxy' ? 'image/jpeg' : 'image/png' })
+      )),
+    } as unknown as BackendClient
+    const onError = vi.fn()
+
+    render(
+      <SubjectPage
+        backend={backend}
+        busy={false}
+        onError={onError}
+        onProjectChange={vi.fn()}
+        onStartStage={vi.fn()}
+        project={project}
+      />,
+    )
+
+    await act(async () => { await Promise.resolve() })
+    expect(getSubjectMedia).toHaveBeenCalledWith('alpha')
+    expect(screen.queryByRole('img', { name: '人物 Alpha 叠加' })).not.toBeInTheDocument()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250)
+    })
+
+    expect(getSubjectMedia.mock.calls.filter(([role]) => role === 'alpha')).toHaveLength(2)
+    expect(screen.getByRole('img', { name: '人物 Alpha 叠加' })).toBeVisible()
+    expect(onError).not.toHaveBeenCalled()
+  })
 })

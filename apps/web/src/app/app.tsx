@@ -14,7 +14,7 @@ import {
   type TaskStore,
   useTaskStore,
 } from '../api/task-events'
-import type { BootstrapDto, ProjectDto, ProjectSummaryDto, StageName, StorageLayoutDto, TaskDto, VramBudgetDto } from '../api/types'
+import type { BootstrapDto, ProjectDto, ProjectSummaryDto, StageName, StorageLayoutDto, TaskDto, TaskEvent, VramBudgetDto } from '../api/types'
 import type { PlatformBridge } from '../platform/platform-bridge'
 import { CameraPage } from '../features/camera/camera-page'
 import { ExportPage } from '../features/export/export-page'
@@ -77,6 +77,30 @@ function uiError(error: unknown): UiError {
     code: null,
     category: null,
     retryable: true,
+  }
+}
+
+function authoritativeSolveCameraError(
+  task: TaskDto | null,
+  event: TaskEvent | null,
+): { key: string; error: UiError } | null {
+  if (
+    task?.status !== 'failed'
+    || task.target_stage !== 'solve_camera'
+    || event?.type !== 'task_event'
+    || event.task_id !== task.id
+    || event.stage !== 'solve_camera'
+    || event.revision < task.revision
+    || event.error?.code !== 'unsupported_material'
+  ) return null
+  return {
+    key: `${event.task_id}:${event.revision}:unsupported_material`,
+    error: {
+      message: '相机运动求解失败：当前视频无法生成可信的相机轨迹。请更换镜头运动更连续、画面纹理更清晰的视频后重试。',
+      code: 'unsupported_material',
+      category: typeof event.error.category === 'string' ? event.error.category : 'subject',
+      retryable: event.error.retryable === true,
+    },
   }
 }
 
@@ -176,6 +200,7 @@ export function App({
     startAtHome ? workflowRouteFromHash(window.location.hash) : null
   ))
   const [error, setError] = useState<UiError | null>(null)
+  const [dismissedTaskErrorKey, setDismissedTaskErrorKey] = useState<string | null>(null)
   const [loading, setLoading] = useState(initialBootstrap === undefined)
   const [startingStage, setStartingStage] = useState(false)
   const [missingTaskOwnerId, setMissingTaskOwnerId] = useState<string | null>(null)
@@ -728,6 +753,9 @@ export function App({
   const previous = WORKFLOW_STEPS[currentIndex - 1]
   const next = WORKFLOW_STEPS[currentIndex + 1]
   const activeTask = taskState.task
+  const taskFailure = authoritativeSolveCameraError(activeTask, taskState.latestEvent)
+  const visibleTaskFailure = taskFailure?.key === dismissedTaskErrorKey ? null : taskFailure
+  const visibleError = visibleTaskFailure?.error ?? error
   const activeTaskRunning = activeTask !== null && ['queued', 'running'].includes(activeTask.status)
   const unresolvedProjectOwner = project.workflow.active_task_id !== null
     && missingTaskOwnerId !== project.workflow.active_task_id
@@ -849,10 +877,13 @@ export function App({
         </nav>
 
         <main className="workflow-main" id="workflow-main">
-          {error !== null ? (
+          {visibleError !== null ? (
             <div aria-atomic="true" className="error-banner" ref={errorRef} role="alert" tabIndex={-1}>
-              <div><strong>{error.category === 'repairable' ? '可以修复' : '操作未完成'}</strong><p>{error.message}</p>{error.code !== null ? <code>{error.code}</code> : null}</div>
-              <button aria-label="关闭错误提示" onClick={() => setError(null)} type="button">×</button>
+              <div><strong>{visibleError.category === 'repairable' ? '可以修复' : '操作未完成'}</strong><p>{visibleError.message}</p>{visibleError.code !== null ? <code>{visibleError.code}</code> : null}</div>
+              <button aria-label="关闭错误提示" onClick={() => {
+                setError(null)
+                if (visibleTaskFailure !== null) setDismissedTaskErrorKey(visibleTaskFailure.key)
+              }} type="button">×</button>
             </div>
           ) : null}
           {page}

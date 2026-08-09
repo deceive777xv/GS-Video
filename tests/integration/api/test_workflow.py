@@ -96,8 +96,10 @@ class PreviewService:
         camera: OrbitCamera,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> bytes:
-        del project_root, scene_path, scene_summary, request_id
+        del project_root, scene_path, scene_summary, request_id, preview_root
         self.cameras.append(camera)
         image = Image.new("RGB", (width, height), (40, 80, 120))
         from io import BytesIO
@@ -114,8 +116,10 @@ class PreviewService:
         camera: OrbitCamera,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> PickBuffer:
-        del project_root, scene_path, scene_summary
+        del project_root, scene_path, scene_summary, preview_root
         self.cameras.append(camera)
         rgb = np.full((height, width, 3), 96, dtype=np.uint8)
         depth = np.full((height, width), 2.0, dtype=np.float32)
@@ -574,11 +578,19 @@ def test_scene_replacement_discards_preview_rendered_from_old_scene(
             camera: OrbitCamera,
             width: int,
             height: int,
+            *,
+            preview_root: Path | None = None,
         ) -> PickBuffer:
             self.started.set()
             assert self.release.wait(2)
             return super().render_pick(
-                project_root, scene_path, scene_summary, camera, width, height
+                project_root,
+                scene_path,
+                scene_summary,
+                camera,
+                width,
+                height,
+                preview_root=preview_root,
             )
 
     repository = ProjectRepository(tmp_path / "scene-race")
@@ -651,11 +663,19 @@ def test_cancelled_preview_cannot_share_its_buffer_with_conflicting_request(
             camera: OrbitCamera,
             width: int,
             height: int,
+            *,
+            preview_root: Path | None = None,
         ) -> PickBuffer:
             self.started.set()
             assert self.release.wait(2)
             return super().render_pick(
-                project_root, scene_path, scene_summary, camera, width, height
+                project_root,
+                scene_path,
+                scene_summary,
+                camera,
+                width,
+                height,
+                preview_root=preview_root,
             )
 
     service = BlockingPreviewService()

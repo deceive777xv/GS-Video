@@ -327,12 +327,12 @@ def test_worker_preview_suspension_drains_inflight_render_and_blocks_admission(
             self.release = Event()
             self.close_calls = 0
 
-        def render_live(self, *_args: object) -> bytes:
+        def render_live(self, *_args: object, **_kwargs: object) -> bytes:
             self.started.set()
             assert self.release.wait(1.0)
             return b"jpeg"
 
-        def render_preview_pick(self, *_args: object) -> object:
+        def render_preview_pick(self, *_args: object, **_kwargs: object) -> object:
             raise AssertionError("not used")
 
         def close(self) -> None:

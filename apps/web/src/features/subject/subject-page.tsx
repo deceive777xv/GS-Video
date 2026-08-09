@@ -7,6 +7,11 @@ import { toImagePoint } from '../camera/scene-viewport'
 
 const SUBJECT_MEDIA_RETRY_DELAYS_MS = [250, 500, 1_000] as const
 
+function shouldRetrySubjectMedia(error: unknown): boolean {
+  return error instanceof BackendClientError
+    && (error.code === 'subject_media_not_ready' || error.retryable)
+}
+
 interface SubjectPageProps {
   backend: BackendClient
   busy: boolean
@@ -56,8 +61,7 @@ export function SubjectPage({ backend, busy, project, onError, onProjectChange, 
         if (controller.signal.aborted) return
         const delay = SUBJECT_MEDIA_RETRY_DELAYS_MS[attempt]
         if (
-          error instanceof BackendClientError
-          && error.code === 'subject_media_not_ready'
+          shouldRetrySubjectMedia(error)
           && delay !== undefined
         ) {
           attempt += 1
@@ -77,14 +81,39 @@ export function SubjectPage({ backend, busy, project, onError, onProjectChange, 
   useEffect(() => {
     if (project.stages.segment?.status !== 'succeeded' || project.workflow.subject_prompt === null) return
     const controller = new AbortController()
-    void backend.getSubjectMedia('alpha').then(async (descriptor) => {
-      const blob = await backend.fetchSubjectMediaArtifact('alpha', descriptor.artifact_id, controller.signal)
-      if (!controller.signal.aborted) replaceUrl('alpha', blob)
-    }).catch((error: unknown) => {
-      if (!controller.signal.aborted) onErrorRef.current(error instanceof Error ? error : 'Alpha 预览载入失败。')
-    })
-    return () => controller.abort()
-  }, [backend, project.stages.segment?.status, project.workflow.subject_prompt])
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let attempt = 0
+    const load = async (): Promise<void> => {
+      try {
+        const descriptor = await backend.getSubjectMedia('alpha')
+        const blob = await backend.fetchSubjectMediaArtifact(
+          'alpha', descriptor.artifact_id, controller.signal,
+        )
+        if (!controller.signal.aborted) replaceUrl('alpha', blob)
+      } catch (error) {
+        if (controller.signal.aborted) return
+        const delay = SUBJECT_MEDIA_RETRY_DELAYS_MS[attempt]
+        if (shouldRetrySubjectMedia(error) && delay !== undefined) {
+          attempt += 1
+          timer = setTimeout(() => void load(), delay)
+          return
+        }
+        onErrorRef.current(error instanceof Error ? error : 'Alpha 预览载入失败。')
+      }
+    }
+    void load()
+    return () => {
+      controller.abort()
+      if (timer !== null) clearTimeout(timer)
+    }
+  }, [
+    backend,
+    project.stages.segment?.cache_key,
+    project.stages.segment?.status,
+    project.workflow.subject_prompt?.frame_index,
+    project.workflow.subject_prompt?.x,
+    project.workflow.subject_prompt?.y,
+  ])
 
   useEffect(() => () => {
     if (proxyUrlRef.current !== null) URL.revokeObjectURL(proxyUrlRef.current)

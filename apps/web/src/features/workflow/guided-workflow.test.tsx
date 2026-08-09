@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { BackendClient } from '../../api/backend-client'
+import { BackendClientError } from '../../api/http-backend-client'
 import type {
   BootstrapDto,
   AssetKind,
@@ -310,6 +311,79 @@ function createHarness(initial = project()) {
 }
 
 describe('guided workflow', () => {
+  it('replaces an older request timeout with the authoritative camera material failure', async () => {
+    const ready = project()
+    ready.source_video = 'opaque:source'
+    ready.scene_ply = 'opaque:scene'
+    ready.workflow.source_summary = {
+      filename: 'portrait.mp4', size: 10, sha256: 's', width: 1080, height: 1920,
+      duration_seconds: 25, fps: '30/1', has_audio: false, frame_count: 758,
+    }
+    ready.workflow.scene_summary = {
+      filename: 'garden.ply', size: 20, sha256: 'g', gaussian_count: 100,
+      estimated_vram_mb: 128,
+    }
+    ready.workflow.subject_prompt = { frame_index: 0, x: 10, y: 10 }
+    ready.stages.ingest = stage('succeeded')
+    ready.stages.segment = stage('succeeded')
+    const harness = createHarness(ready)
+    vi.mocked(harness.client.startTask).mockRejectedValue(new BackendClientError(0, {
+      code: 'request_timeout', category: 'network',
+      message: 'The local service request timed out.', retryable: true,
+    }))
+    const failedTask: TaskDto = {
+      id: 'task-solve_camera', target_stage: 'solve_camera', status: 'failed',
+      revision: 7, error: 'unsupported_material',
+    }
+    vi.mocked(harness.client.getTask).mockResolvedValue(failedTask)
+    let snapshot = {
+      task: null as TaskDto | null,
+      revision: 0,
+      pendingResyncRevision: null as number | null,
+      connection: 'connected' as const,
+      latestEvent: null as import('../../api/types').TaskEvent | null,
+    }
+    const listeners = new Set<() => void>()
+    const createOwnedTaskStore = () => ({
+      subscribe: (listener: () => void) => {
+        listeners.add(listener)
+        return () => listeners.delete(listener)
+      },
+      snapshot: () => snapshot,
+      onEvent: vi.fn(), onConnectionChange: vi.fn(), replaceFromRest: vi.fn(),
+      acknowledgeResync: vi.fn(), whenIdle: async () => undefined, dispose: vi.fn(),
+    })
+
+    render(
+      <App
+        backend={harness.client}
+        createOwnedTaskStore={createOwnedTaskStore}
+        initialBootstrap={bootstrap(ready)}
+        platform={harness.platform}
+      />,
+    )
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('The local service request timed out.')
+
+    await act(async () => {
+      snapshot = {
+        ...snapshot,
+        task: failedTask,
+        revision: 7,
+        latestEvent: {
+          type: 'task_event', task_id: failedTask.id, revision: 7,
+          stage: 'solve_camera', progress: 1,
+          error: { code: 'unsupported_material', category: 'subject', retryable: false },
+        },
+      }
+      listeners.forEach((listener) => listener())
+    })
+
+    expect(screen.getByRole('alert')).toHaveTextContent('当前视频无法生成可信的相机轨迹')
+    expect(screen.getByRole('alert')).toHaveTextContent('unsupported_material')
+    expect(screen.getByRole('alert')).not.toHaveTextContent('request timed out')
+  })
+
   it('links each import input to its matching asset-library tab with a project return context', async () => {
     const harness = createHarness()
 

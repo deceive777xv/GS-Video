@@ -1,11 +1,13 @@
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+from io import BytesIO
 from pathlib import Path
 from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from gs_video.api.routes import ApiServices
 from gs_video.api.schemas import ApiSettings
@@ -31,6 +33,7 @@ from gs_video.project.manager import (
     ActiveProjectSession,
 )
 from gs_video.project.repository import ProjectInstanceLock
+from gs_video.storage.artifacts import ArtifactStore
 
 
 TOKEN = "project-catalog-token"
@@ -65,8 +68,33 @@ class WorkerRegistry:
 
 
 class PreviewService:
+    def __init__(self) -> None:
+        self.preview_roots: list[Path] = []
+
     def close_live(self) -> None:
         pass
+
+    def render_live(
+        self,
+        project_root: Path,
+        scene_path: str | Path,
+        scene_summary: SceneSummary,
+        request_id: int,
+        camera: object,
+        width: int,
+        height: int,
+        *,
+        preview_root: Path,
+    ) -> bytes:
+        del scene_path, scene_summary, request_id, camera
+        assert not (project_root / "previews").exists()
+        self.preview_roots.append(preview_root)
+        (preview_root / "previews" / "live-workspace.marker").write_text(
+            "cache-owned", encoding="utf-8"
+        )
+        output = BytesIO()
+        Image.new("RGB", (width, height), (20, 40, 60)).save(output, format="JPEG")
+        return output.getvalue()
 
 
 class Inspector:
@@ -100,6 +128,7 @@ def catalog_client(tmp_path: Path) -> Iterator[TestClient]:
     catalog = ProjectCatalog(data_root)
     catalog.create("Initial")
     assets = AssetLibrary(data_root / "assets")
+    artifact_store = ArtifactStore(tmp_path / "cache")
 
     def build(project_id: str) -> ActiveProjectSession:
         repository = catalog.repository(project_id)
@@ -107,7 +136,9 @@ def catalog_client(tmp_path: Path) -> Iterator[TestClient]:
             repository=repository,
             project_lock=ProjectInstanceLock.acquire(repository.root),
             pipeline_runner=Runner(),
-            preview_artifacts=PreviewArtifactStore(repository.root),
+            preview_artifacts=PreviewArtifactStore(
+                artifact_store.project_root(project_id)
+            ),
         )
 
     manager = ActiveProjectManager(catalog, build)
@@ -122,6 +153,7 @@ def catalog_client(tmp_path: Path) -> Iterator[TestClient]:
         asset_library=assets,
         project_manager=manager,
         preview_artifacts=ActivePreviewArtifactStore(manager),
+        artifact_store=artifact_store,
         upload_root=data_root / "upload-staging",
     )
     settings = ApiSettings(
@@ -310,6 +342,56 @@ def test_shared_assets_are_separated_referenced_and_protected(
     assert cleared.status_code == 200
     removed = catalog_client.delete(f"/api/v1/assets/{asset_id}", headers=HEADERS)
     assert removed.status_code == 204
+
+
+def test_shared_scene_preview_uses_cache_workspace_without_project_cache(
+    catalog_client: TestClient, tmp_path: Path
+) -> None:
+    source = tmp_path / "scene.ply"
+    source.write_bytes(b"shared-gaussian-scene")
+    imported = catalog_client.post(
+        "/api/v1/assets/import",
+        json={
+            "path": str(source),
+            "kind": "scene_ply",
+            "assign_to_current": True,
+        },
+        headers=DESKTOP_HEADERS,
+    )
+    assert imported.status_code == 201
+    project = catalog_client.get(
+        "/api/v1/projects/current", headers=HEADERS
+    ).json()
+    project_root = catalog_client.app.state.services.project_repository.root
+    cache_root = catalog_client.app.state.services.artifact_store.lookup_project_root(
+        project["project_id"]
+    )
+    assert not (project_root / "previews").exists()
+
+    response = catalog_client.post(
+        "/api/v1/projects/current/preview/live",
+        json={
+            "request_id": 1,
+            "width": 16,
+            "height": 9,
+            "camera": {
+                "target": [0.0, 0.0, 0.0],
+                "distance": 4.0,
+                "yaw": 0.0,
+                "pitch": 0.0,
+                "fov_y_degrees": 60.0,
+            },
+        },
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.content.startswith(b"\xff\xd8")
+    assert catalog_client.app.state.preview_service.preview_roots == [cache_root]
+    assert (cache_root / "previews" / "live-workspace.marker").read_text(
+        encoding="utf-8"
+    ) == "cache-owned"
+    assert not (project_root / "previews").exists()
 
 
 @pytest.mark.parametrize("origin", [None, "http://127.0.0.1:5173"])

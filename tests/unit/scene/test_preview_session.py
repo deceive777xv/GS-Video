@@ -151,6 +151,59 @@ class RecordingGuard:
         self.closed = True
 
 
+def test_preview_session_uses_cache_workspace_for_shared_scene(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    shared_root = tmp_path / "assets"
+    shared_root.mkdir()
+    scene = shared_root / "scene.ply"
+    scene.write_bytes(b"ply\n")
+    cache_root = tmp_path / "cache" / "project-1"
+    cache_root.mkdir(parents=True)
+    summary = SceneSummary(
+        filename="scene.ply",
+        size=4,
+        sha256="a" * 64,
+        gaussian_count=1,
+        estimated_vram_mb=1,
+    )
+    camera = OrbitCamera(
+        target=(0.0, 0.0, 0.0),
+        distance=4.0,
+        yaw=0.0,
+        pitch=0.0,
+        fov_y_degrees=60.0,
+    )
+    process = ScriptedProcess()
+    session = PreviewSession(
+        worker_prefix=("renderer-python",),
+        sh_degree=3,
+        available_vram_limit_mb=8192,
+        process_factory=lambda *_args, **_options: process,
+        tree_guard_factory=RecordingGuard,
+    )
+
+    payload = session.render_live(
+        project_root,
+        scene,
+        summary,
+        1,
+        camera,
+        16,
+        9,
+        preview_root=cache_root,
+    )
+
+    assert payload.startswith(b"\xff\xd8")
+    output = Path(process.stdin.commands[0]["output_path"])
+    assert output.parent == cache_root / "previews"
+    assert not (project_root / "source").exists()
+    assert not (project_root / "previews").exists()
+    session.close()
+
+
 def test_preview_session_reuses_one_process_for_live_and_authoritative_frames(
     tmp_path: Path,
 ) -> None:

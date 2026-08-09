@@ -583,6 +583,8 @@ class PreviewServiceLike(Protocol):
         camera: OrbitCamera,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> bytes: ...
 
     def render_pick(
@@ -593,6 +595,8 @@ class PreviewServiceLike(Protocol):
         camera: OrbitCamera,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> PickBuffer: ...
 
     def close_live(self) -> None: ...
@@ -612,6 +616,8 @@ class LivePreviewSessionLike(Protocol):
         camera: OrbitCamera,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> bytes: ...
 
     def render_preview_pick(
@@ -622,6 +628,8 @@ class LivePreviewSessionLike(Protocol):
         camera: OrbitCamera,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> PickBuffer: ...
 
     def close(self) -> None: ...
@@ -647,7 +655,10 @@ class GsplatPreviewService:
         camera: OrbitCamera,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> PickBuffer:
+        del preview_root
         root = project_root.resolve(strict=True)
         external = isinstance(scene_path, Path) and scene_path.is_absolute()
         try:
@@ -827,6 +838,8 @@ class WorkerPreviewService:
         camera: OrbitCamera,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> bytes:
         self._begin_preview()
         try:
@@ -838,6 +851,7 @@ class WorkerPreviewService:
                 camera,
                 width,
                 height,
+                preview_root=preview_root,
             )
         finally:
             self._finish_preview()
@@ -851,6 +865,8 @@ class WorkerPreviewService:
         camera: OrbitCamera,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> bytes:
         self._admit(scene_summary, width, height)
         if self._live_session is None:
@@ -870,6 +886,7 @@ class WorkerPreviewService:
                 camera,
                 width,
                 height,
+                preview_root=preview_root,
             )
         except PreviewRequestSuperseded as error:
             raise ApiError(
@@ -918,6 +935,8 @@ class WorkerPreviewService:
         camera: OrbitCamera,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> PickBuffer:
         self._begin_preview()
         try:
@@ -928,6 +947,7 @@ class WorkerPreviewService:
                 camera,
                 width,
                 height,
+                preview_root=preview_root,
             )
         finally:
             self._finish_preview()
@@ -940,6 +960,8 @@ class WorkerPreviewService:
         camera: OrbitCamera,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> PickBuffer:
         self._admit(scene_summary, width, height)
         if self._live_session is not None:
@@ -951,6 +973,7 @@ class WorkerPreviewService:
                     camera,
                     width,
                     height,
+                    preview_root=preview_root,
                 )
             except PreviewRequestSuperseded as error:
                 raise ApiError(
@@ -1034,8 +1057,14 @@ class WorkerPreviewService:
                 message="The Gaussian scene no longer matches its imported summary.",
                 retryable=True,
             )
-        preview_root = root / "previews"
-        output = preview_root / f".worker-pick-{uuid4().hex}.npz"
+        workspace = (
+            root
+            if preview_root is None
+            else Path(preview_root).resolve(strict=True)
+        )
+        output_root = workspace / "previews"
+        output_root.mkdir(exist_ok=True)
+        output = output_root / f".worker-pick-{uuid4().hex}.npz"
         try:
             buffer = self._worker.render_pick(
                 RenderPickRequest(

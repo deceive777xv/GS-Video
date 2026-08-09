@@ -5,6 +5,7 @@ import errno
 import hashlib
 import os
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from collections.abc import Awaitable, Callable
 from typing import Any, BinaryIO, Protocol, cast
@@ -417,6 +418,14 @@ def _scene_input(
         category="project",
         message="Import a Gaussian scene before rendering a preview.",
     )
+
+
+def _preview_workspace(services: ApiServices, project: Project) -> Path | None:
+    if services.artifact_store is None:
+        return None
+    return services.artifact_store.project_root(project.project_id)
+
+
 def _confined_destination(root: Path, directory: str, filename: str) -> Path:
     canonical_root = root.resolve()
     destination_dir = (canonical_root / directory).resolve()
@@ -1249,6 +1258,10 @@ def build_router() -> APIRouter:
                 message="Import a Gaussian scene before rendering a preview.",
             )
         scene_input, _scene_reference = _scene_input(services, project)
+        preview_root = _preview_workspace(services, project)
+        render_live_kwargs = (
+            {} if preview_root is None else {"preview_root": preview_root}
+        )
         payload = await asyncio.to_thread(
             _preview_service(request).render_live,
             repository.root,
@@ -1258,6 +1271,7 @@ def build_router() -> APIRouter:
             _camera(preview.camera),
             preview.width,
             preview.height,
+            **render_live_kwargs,
         )
         return Response(
             content=payload,
@@ -1306,6 +1320,7 @@ def build_router() -> APIRouter:
             )
         camera = _camera(preview.camera)
         scene_path, scene_reference = _scene_input(services, project)
+        preview_root = _preview_workspace(services, project)
         scene_authority = scene_summary.model_copy(deep=True)
         preview_epoch = project.workflow.preview_epoch
         request_fingerprint: PreviewRequestFingerprint = (
@@ -1321,6 +1336,9 @@ def build_router() -> APIRouter:
             preview.width,
             preview.height,
         )
+        render_pick = _preview_service(request).render_pick
+        if preview_root is not None:
+            render_pick = partial(render_pick, preview_root=preview_root)
         buffer: PickBuffer = await _preview_coordinator(request).render(
             (
                 project.project_id,
@@ -1331,7 +1349,7 @@ def build_router() -> APIRouter:
             ),
             preview.generation,
             request_fingerprint,
-            _preview_service(request).render_pick,
+            render_pick,
             repository.root,
             scene_path,
             scene_authority,

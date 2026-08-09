@@ -214,7 +214,10 @@ class PreviewSession(RendererWorkerClient):
 
     @staticmethod
     def _scene_authority(
-        project_root: Path, scene_path: str | Path, summary: SceneSummary
+        project_root: Path,
+        scene_path: str | Path,
+        summary: SceneSummary,
+        preview_root: Path | None = None,
     ) -> tuple[Path, Path, tuple[object, ...]]:
         try:
             root = Path(project_root).resolve(strict=True)
@@ -224,19 +227,33 @@ class PreviewSession(RendererWorkerClient):
                 if external
                 else (root / scene_path).resolve(strict=True)
             )
-            source_root = (root / "source").resolve(strict=True)
-            previews = (root / "previews").resolve(strict=True)
+            source_root = None if external else (root / "source").resolve(strict=True)
+            workspace = (
+                root
+                if preview_root is None
+                else Path(preview_root).resolve(strict=True)
+            )
+            requested_previews = workspace / "previews"
+            requested_previews.mkdir(exist_ok=True)
+            previews = requested_previews.resolve(strict=True)
             metadata = scene.stat()
+            workspace_metadata = workspace.stat()
+            previews_metadata = previews.stat()
         except OSError as error:
             raise PreviewSceneUnavailableError(
                 "Gaussian scene is unavailable for preview"
             ) from error
         if (
-            (not external and not scene.is_relative_to(source_root))
+            (source_root is not None and not scene.is_relative_to(source_root))
             or not scene.is_file()
             or has_reparse_component(scene)
             or not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
+            or not stat.S_ISDIR(workspace_metadata.st_mode)
+            or not stat.S_ISDIR(previews_metadata.st_mode)
+            or previews.parent != workspace
+            or has_reparse_component(workspace)
+            or has_reparse_component(previews)
         ):
             raise PreviewSceneUnavailableError(
                 "Gaussian scene is unavailable for preview"
@@ -248,11 +265,16 @@ class PreviewSession(RendererWorkerClient):
                 "Gaussian scene no longer matches its imported authority"
             )
         fingerprint = _file_identity(metadata)
-        return scene, previews, (
+        return (
             scene,
-            summary.sha256,
-            summary.size,
-            fingerprint,
+            previews,
+            (
+                scene,
+                previews,
+                summary.sha256,
+                summary.size,
+                fingerprint,
+            ),
         )
 
     @staticmethod
@@ -525,13 +547,15 @@ class PreviewSession(RendererWorkerClient):
         camera: OrbitCamera,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> bytes:
         if type(request_id) is not int or request_id < 1:
             raise ValueError("request_id must be a positive integer")
         with self._session_lock:
             self._cancel_idle_locked()
             scene, previews, key = self._scene_authority(
-                project_root, scene_path, scene_summary
+                project_root, scene_path, scene_summary, preview_root
             )
             output = previews / f".live-preview-{uuid.uuid4().hex}.jpg"
             try:
@@ -579,6 +603,8 @@ class PreviewSession(RendererWorkerClient):
         camera: OrbitCamera,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> bytes:
         self._begin_live()
         try:
@@ -590,6 +616,7 @@ class PreviewSession(RendererWorkerClient):
                 camera,
                 width,
                 height,
+                preview_root=preview_root,
             )
         finally:
             self._finish_render()
@@ -602,11 +629,13 @@ class PreviewSession(RendererWorkerClient):
         camera: OrbitCamera,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> PickBuffer:
         with self._session_lock:
             self._cancel_idle_locked()
             scene, previews, key = self._scene_authority(
-                project_root, scene_path, scene_summary
+                project_root, scene_path, scene_summary, preview_root
             )
             self._internal_request_id = max(self._internal_request_id + 1, 1)
             output = previews / f".preview-pick-{uuid.uuid4().hex}.npz"
@@ -653,6 +682,8 @@ class PreviewSession(RendererWorkerClient):
         camera: OrbitCamera,
         width: int,
         height: int,
+        *,
+        preview_root: Path | None = None,
     ) -> PickBuffer:
         self._begin_authoritative()
         try:
@@ -663,6 +694,7 @@ class PreviewSession(RendererWorkerClient):
                 camera,
                 width,
                 height,
+                preview_root=preview_root,
             )
         finally:
             self._finish_render()
