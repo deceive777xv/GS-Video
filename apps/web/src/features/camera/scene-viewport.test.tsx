@@ -4,8 +4,10 @@ import { StrictMode } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { BackendClient } from '../../api/backend-client'
+import { BackendClientError } from '../../api/http-backend-client'
 import type { CameraDto, LivePreviewRequest, PreviewFrameDto, PreviewRequest } from '../../api/types'
-import { SceneViewport, toImagePoint } from './scene-viewport'
+import { toImagePoint } from '../coordinates/image-point'
+import { SceneViewport } from './scene-viewport'
 
 afterEach(() => vi.useRealTimers())
 
@@ -88,9 +90,80 @@ describe('SceneViewport', () => {
     await act(async () => pending[0]!.resolve(new Blob(['live'], { type: 'image/jpeg' })))
 
     await waitFor(() => expect(backend.renderLivePreview).toHaveBeenCalledTimes(2))
-    expect(createUrl).toHaveBeenCalledOnce()
+    expect(createUrl).not.toHaveBeenCalled()
     expect(liveRequests[1]!.camera).toMatchObject({ yaw: 15, pitch: 5 })
     expect(screen.getByRole('button', { name: '确认初始机位' })).toBeDisabled()
+  })
+
+  it('does not display a stale realtime frame after an A-B-A camera change', async () => {
+    const createUrl = vi.spyOn(URL, 'createObjectURL')
+      .mockReturnValueOnce('blob:live-a')
+      .mockReturnValueOnce('blob:latest-a')
+    const pending: Array<{ resolve(value: Blob): void }> = []
+    const backend = {
+      renderLivePreview: vi.fn(() => new Promise<Blob>((resolve) => pending.push({ resolve }))),
+      renderPreview: vi.fn(() => new Promise<PreviewFrameDto>(() => undefined)),
+    } as unknown as BackendClient
+    render(
+      <SceneViewport
+        backend={backend}
+        camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        onError={vi.fn()}
+        onPreview={vi.fn()}
+      />,
+    )
+
+    await waitFor(() => expect(backend.renderLivePreview).toHaveBeenCalledOnce())
+    await act(async () => pending[0]!.resolve(new Blob(['a'])))
+    expect(await screen.findByRole('img', { name: /Gaussian 场景.*预览/ })).toHaveAttribute('src', 'blob:live-a')
+
+    const viewport = screen.getByLabelText('Gaussian 场景视口')
+    fireEvent.pointerDown(viewport, { clientX: 0, clientY: 0, pointerId: 1 })
+    fireEvent.pointerMove(viewport, { clientX: 40, clientY: 0, pointerId: 1 })
+    fireEvent.pointerUp(viewport, { clientX: 40, clientY: 0, pointerId: 1 })
+    await waitFor(() => expect(backend.renderLivePreview).toHaveBeenCalledTimes(2))
+
+    fireEvent.pointerDown(viewport, { clientX: 40, clientY: 0, pointerId: 2 })
+    fireEvent.pointerMove(viewport, { clientX: 0, clientY: 0, pointerId: 2 })
+    fireEvent.pointerUp(viewport, { clientX: 0, clientY: 0, pointerId: 2 })
+    await act(async () => pending[1]!.resolve(new Blob(['stale-b'])))
+
+    await waitFor(() => expect(backend.renderLivePreview).toHaveBeenCalledTimes(3))
+    expect(createUrl).toHaveBeenCalledOnce()
+    expect(screen.getByRole('img', { name: /Gaussian 场景.*预览/ })).toHaveAttribute('src', 'blob:live-a')
+  })
+
+  it('ignores a stale realtime failure after an A-B-A camera change', async () => {
+    const pending: Array<{ resolve(value: Blob): void; reject(reason: unknown): void }> = []
+    const onError = vi.fn()
+    const backend = {
+      renderLivePreview: vi.fn(() => new Promise<Blob>((resolve, reject) => pending.push({ resolve, reject }))),
+      renderPreview: vi.fn(() => new Promise<PreviewFrameDto>(() => undefined)),
+    } as unknown as BackendClient
+    render(
+      <SceneViewport
+        backend={backend}
+        camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        onError={onError}
+        onPreview={vi.fn()}
+      />,
+    )
+
+    await waitFor(() => expect(backend.renderLivePreview).toHaveBeenCalledOnce())
+    await act(async () => pending[0]!.resolve(new Blob(['a'])))
+    const viewport = screen.getByLabelText('Gaussian 场景视口')
+    fireEvent.pointerDown(viewport, { clientX: 0, clientY: 0, pointerId: 1 })
+    fireEvent.pointerMove(viewport, { clientX: 40, clientY: 0, pointerId: 1 })
+    fireEvent.pointerUp(viewport, { clientX: 40, clientY: 0, pointerId: 1 })
+    await waitFor(() => expect(backend.renderLivePreview).toHaveBeenCalledTimes(2))
+    fireEvent.pointerDown(viewport, { clientX: 40, clientY: 0, pointerId: 2 })
+    fireEvent.pointerMove(viewport, { clientX: 0, clientY: 0, pointerId: 2 })
+    fireEvent.pointerUp(viewport, { clientX: 0, clientY: 0, pointerId: 2 })
+
+    await act(async () => pending[1]!.reject(new Error('stale B failed')))
+
+    await waitFor(() => expect(backend.renderLivePreview).toHaveBeenCalledTimes(3))
+    expect(onError).not.toHaveBeenCalled()
   })
 
   it('stops realtime pumping and requests authority immediately after live failure', async () => {
@@ -298,6 +371,8 @@ describe('SceneViewport', () => {
       <SceneViewport
         backend={backend}
         camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        confirmedCameraRevision={1}
+        confirmedPreviewArtifactId="preview-1"
         initialPreview={{ artifact_id: 'preview-1', artifact_size: 1, artifact_sha256: 'a', generation: 1, width: 960, height: 540, camera_revision: 1, pick_buffer_revision: 1 }}
         onError={vi.fn()}
         onPreview={vi.fn()}
@@ -305,6 +380,8 @@ describe('SceneViewport', () => {
     )
     await act(async () => { await Promise.resolve() })
     expect(screen.getByRole('button', { name: '确认初始机位' })).toBeEnabled()
+    fireEvent.change(screen.getByLabelText('落脚点 X 坐标'), { target: { value: '320' } })
+    fireEvent.change(screen.getByLabelText('落脚点 Y 坐标'), { target: { value: '180' } })
     expect(screen.getByRole('button', { name: '确认场景落脚点' })).toBeEnabled()
 
     fireEvent.wheel(screen.getByLabelText('Gaussian 场景视口'), { deltaY: 100 })
@@ -514,6 +591,8 @@ describe('SceneViewport', () => {
       <SceneViewport
         {...props}
         camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        confirmedCameraRevision={1}
+        confirmedPreviewArtifactId="old"
         initialPreview={{ artifact_id: 'old', artifact_size: 1, artifact_sha256: 'a', generation: 1, width: 960, height: 540, camera_revision: 1, pick_buffer_revision: 1 }}
       />,
     )
@@ -521,17 +600,260 @@ describe('SceneViewport', () => {
       <SceneViewport
         {...props}
         camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        confirmedCameraRevision={2}
+        confirmedPreviewArtifactId="new"
         initialPreview={{ artifact_id: 'new', artifact_size: 1, artifact_sha256: 'b', generation: 2, width: 960, height: 540, camera_revision: 2, pick_buffer_revision: 3 }}
       />,
     )
-    await waitFor(() => expect(screen.getByRole('button', { name: '确认场景落脚点' })).toBeEnabled())
+    await waitFor(() => expect(screen.getByRole('button', { name: '确认初始机位' })).toBeEnabled())
     await user.type(screen.getByLabelText('落脚点 X 坐标'), '320')
     await user.type(screen.getByLabelText('落脚点 Y 坐标'), '180')
+    await waitFor(() => expect(screen.getByRole('button', { name: '确认场景落脚点' })).toBeEnabled())
     await user.click(screen.getByRole('button', { name: '确认场景落脚点' }))
     expect(backend.pickFootPoint).toHaveBeenCalledWith({
       x: 320, y: 180, preview_artifact_id: 'new', camera_revision: 2,
       pick_buffer_revision: 3,
     })
+  })
+
+  it('keeps a viewport click local until the user explicitly confirms the foot point', async () => {
+    const backend = {
+      fetchPreviewArtifact: vi.fn(async () => new Blob(['preview'])),
+      pickFootPoint: vi.fn(async (input) => ({
+        image: [input.x, input.y], world: [0, 0, 0],
+        preview_artifact_id: input.preview_artifact_id,
+        camera_revision: input.camera_revision,
+        pick_buffer_revision: input.pick_buffer_revision,
+      })),
+    } as unknown as BackendClient
+    render(
+      <SceneViewport
+        backend={backend}
+        camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        confirmedCameraRevision={4}
+        confirmedPreviewArtifactId="preview-4"
+        initialPreview={{ artifact_id: 'preview-4', artifact_size: 8, artifact_sha256: 'sha', generation: 4, width: 960, height: 540, camera_revision: 4, pick_buffer_revision: 4 }}
+        onError={vi.fn()}
+        onPreview={vi.fn()}
+      />,
+    )
+    const viewport = screen.getByLabelText('Gaussian 场景视口')
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, left: 0, top: 0, right: 962, bottom: 542,
+      width: 962, height: 542, toJSON: () => ({}),
+    })
+    vi.spyOn(await screen.findByRole('img', { name: /Gaussian 场景.*预览/ }), 'getBoundingClientRect').mockReturnValue({
+      x: 1, y: 1, left: 1, top: 1, right: 961, bottom: 541,
+      width: 960, height: 540, toJSON: () => ({}),
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: '确认初始机位' })).toBeEnabled())
+
+    fireEvent.click(viewport, { clientX: 321, clientY: 181 })
+
+    expect(screen.getByLabelText('落脚点 X 坐标')).toHaveValue(320)
+    expect(screen.getByLabelText('落脚点 Y 坐标')).toHaveValue(180)
+    expect(screen.getByText('X 320 · Y 180')).toBeInTheDocument()
+    expect(backend.pickFootPoint).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: '确认场景落脚点' }))
+    await waitFor(() => expect(backend.pickFootPoint).toHaveBeenCalledOnce())
+  })
+
+  it('restores only a foot point bound to the current authoritative preview', async () => {
+    const backend = {
+      fetchPreviewArtifact: vi.fn(async (id: string) => new Blob([id])),
+    } as unknown as BackendClient
+    const camera = { target: [0, 0, 0] as [number, number, number], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }
+    const props = { backend, camera, onError: vi.fn(), onPreview: vi.fn() }
+    const footPoint = {
+      image: [300, 200] as [number, number], world: [0, 0, 0] as [number, number, number],
+      preview_artifact_id: 'old', camera_revision: 1, pick_buffer_revision: 1,
+    }
+    const view = render(
+      <SceneViewport
+        {...props}
+        confirmedCameraRevision={1}
+        confirmedPreviewArtifactId="old"
+        initialFootPoint={footPoint}
+        initialPreview={{ artifact_id: 'old', artifact_size: 1, artifact_sha256: 'a', generation: 1, width: 960, height: 540, camera_revision: 1, pick_buffer_revision: 1 }}
+      />,
+    )
+
+    await waitFor(() => expect(screen.getByLabelText('落脚点 X 坐标')).toHaveValue(300))
+    expect(screen.getByLabelText('落脚点 Y 坐标')).toHaveValue(200)
+    expect(screen.getByText('场景落脚点已验证')).toBeVisible()
+
+    view.rerender(
+      <SceneViewport
+        {...props}
+        confirmedCameraRevision={2}
+        confirmedPreviewArtifactId="new"
+        initialFootPoint={footPoint}
+        initialPreview={{ artifact_id: 'new', artifact_size: 1, artifact_sha256: 'b', generation: 2, width: 960, height: 540, camera_revision: 2, pick_buffer_revision: 2 }}
+      />,
+    )
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '确认初始机位' })).toBeEnabled())
+    expect(screen.getByLabelText('落脚点 X 坐标')).toHaveValue(null)
+    expect(screen.getByLabelText('落脚点 Y 坐标')).toHaveValue(null)
+    expect(screen.getByText('尚未选择场景落脚点')).toBeVisible()
+  })
+
+  it('does not restore a foot point when camera confirmation disagrees with the preview', async () => {
+    const backend = {
+      fetchPreviewArtifact: vi.fn(async () => new Blob(['preview'])),
+    } as unknown as BackendClient
+    render(
+      <SceneViewport
+        backend={backend}
+        camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        confirmedCameraRevision={1}
+        confirmedPreviewArtifactId="different-preview"
+        initialFootPoint={{
+          image: [300, 200], world: [0, 0, 0], preview_artifact_id: 'preview-1',
+          camera_revision: 1, pick_buffer_revision: 1,
+        }}
+        initialPreview={{ artifact_id: 'preview-1', artifact_size: 1, artifact_sha256: 'a', generation: 1, width: 960, height: 540, camera_revision: 1, pick_buffer_revision: 1 }}
+        onError={vi.fn()}
+        onPreview={vi.fn()}
+      />,
+    )
+
+    await screen.findByRole('img', { name: /Gaussian 场景.*预览/ })
+    expect(screen.getByLabelText('落脚点 X 坐标')).toHaveValue(null)
+    expect(screen.getByLabelText('落脚点 Y 坐标')).toHaveValue(null)
+    expect(screen.getByText('尚未选择场景落脚点')).toBeVisible()
+    expect(screen.getByRole('button', { name: '确认场景落脚点' })).toBeDisabled()
+  })
+
+  it('keeps initial preview authority unavailable until its artifact has loaded', async () => {
+    let resolveArtifact: ((value: Blob) => void) | undefined
+    const backend = {
+      fetchPreviewArtifact: vi.fn(() => new Promise<Blob>((resolve) => { resolveArtifact = resolve })),
+      pickFootPoint: vi.fn(),
+    } as unknown as BackendClient
+    render(
+      <SceneViewport
+        backend={backend}
+        camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        confirmedCameraRevision={1}
+        confirmedPreviewArtifactId="preview-1"
+        initialFootPoint={{
+          image: [300, 200], world: [0, 0, 0], preview_artifact_id: 'preview-1',
+          camera_revision: 1, pick_buffer_revision: 1,
+        }}
+        initialPreview={{ artifact_id: 'preview-1', artifact_size: 1, artifact_sha256: 'a', generation: 1, width: 960, height: 540, camera_revision: 1, pick_buffer_revision: 1 }}
+        onError={vi.fn()}
+        onPreview={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByLabelText('落脚点 X 坐标')).toBeDisabled()
+    expect(screen.getByRole('button', { name: '确认初始机位' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '确认场景落脚点' })).toBeDisabled()
+    expect(backend.pickFootPoint).not.toHaveBeenCalled()
+
+    resolveArtifact?.(new Blob(['preview']))
+    await waitFor(() => expect(screen.getByLabelText('落脚点 X 坐标')).toHaveValue(300))
+    expect(screen.getByRole('button', { name: '确认场景落脚点' })).toBeEnabled()
+  })
+
+  it('ignores a successful pick response after preview authority changes', async () => {
+    let resolvePick: ((value: {
+      image: [number, number]
+      world: [number, number, number]
+      preview_artifact_id: string
+      camera_revision: number
+      pick_buffer_revision: number
+    }) => void) | undefined
+    const onFootPoint = vi.fn()
+    const backend = {
+      fetchPreviewArtifact: vi.fn(async (id: string) => new Blob([id])),
+      pickFootPoint: vi.fn(() => new Promise((resolve) => { resolvePick = resolve })),
+    } as unknown as BackendClient
+    const props = { backend, onError: vi.fn(), onFootPoint, onPreview: vi.fn() }
+    const view = render(
+      <SceneViewport
+        {...props}
+        camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        confirmedCameraRevision={1}
+        confirmedPreviewArtifactId="old"
+        initialPreview={{ artifact_id: 'old', artifact_size: 1, artifact_sha256: 'a', generation: 1, width: 960, height: 540, camera_revision: 1, pick_buffer_revision: 1 }}
+      />,
+    )
+    await waitFor(() => expect(screen.getByLabelText('落脚点 X 坐标')).toBeEnabled())
+    fireEvent.change(screen.getByLabelText('落脚点 X 坐标'), { target: { value: '320' } })
+    fireEvent.change(screen.getByLabelText('落脚点 Y 坐标'), { target: { value: '180' } })
+    await waitFor(() => expect(screen.getByRole('button', { name: '确认场景落脚点' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: '确认场景落脚点' }))
+    await waitFor(() => expect(backend.pickFootPoint).toHaveBeenCalledOnce())
+
+    view.rerender(
+      <SceneViewport
+        {...props}
+        camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        confirmedCameraRevision={2}
+        confirmedPreviewArtifactId="new"
+        initialPreview={{ artifact_id: 'new', artifact_size: 1, artifact_sha256: 'b', generation: 2, width: 960, height: 540, camera_revision: 2, pick_buffer_revision: 2 }}
+      />,
+    )
+    await screen.findByRole('img', { name: /Gaussian 场景.*预览/ })
+    resolvePick?.({ image: [320, 180], world: [0, 0, 0], preview_artifact_id: 'old', camera_revision: 1, pick_buffer_revision: 1 })
+
+    await act(async () => { await Promise.resolve() })
+    expect(onFootPoint).not.toHaveBeenCalled()
+    expect(screen.getByLabelText('落脚点 X 坐标')).toHaveValue(null)
+    expect(screen.getByLabelText('落脚点 Y 坐标')).toHaveValue(null)
+  })
+
+  it.each(['stale_pick_buffer', 'camera_not_confirmed'])('locks rejected %s authority until refresh completes', async (code) => {
+    let rejectPick: ((reason: unknown) => void) | undefined
+    let resolveRefresh: (() => void) | undefined
+    const onAuthorityStale = vi.fn(() => new Promise<void>((resolve) => { resolveRefresh = resolve }))
+    const backend = {
+      fetchPreviewArtifact: vi.fn(async () => new Blob(['preview'])),
+      pickFootPoint: vi.fn(() => new Promise((_resolve, reject) => { rejectPick = reject })),
+      confirmCamera: vi.fn(async () => ({})),
+    } as unknown as BackendClient
+    render(
+      <SceneViewport
+        backend={backend}
+        camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        confirmedCameraRevision={1}
+        confirmedPreviewArtifactId="preview-1"
+        initialPreview={{ artifact_id: 'preview-1', artifact_size: 1, artifact_sha256: 'a', generation: 1, width: 960, height: 540, camera_revision: 1, pick_buffer_revision: 1 }}
+        onAuthorityStale={onAuthorityStale}
+        onError={vi.fn()}
+        onPreview={vi.fn()}
+      />,
+    )
+    await waitFor(() => expect(screen.getByLabelText('落脚点 X 坐标')).toBeEnabled())
+    fireEvent.change(screen.getByLabelText('落脚点 X 坐标'), { target: { value: '320' } })
+    fireEvent.change(screen.getByLabelText('落脚点 Y 坐标'), { target: { value: '180' } })
+    await waitFor(() => expect(screen.getByRole('button', { name: '确认场景落脚点' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: '确认场景落脚点' }))
+    expect(screen.getByLabelText('Yaw 角度')).toBeDisabled()
+    expect(screen.getByLabelText('落脚点 X 坐标')).toBeDisabled()
+
+    rejectPick?.(new BackendClientError(409, {
+      code, category: 'conflict', message: 'stale authority', retryable: true,
+    }))
+    await waitFor(() => expect(onAuthorityStale).toHaveBeenCalledOnce())
+    expect(screen.getByLabelText('落脚点 X 坐标')).toHaveValue(null)
+    expect(screen.getByRole('button', { name: '验证中…' })).toBeDisabled()
+
+    resolveRefresh?.()
+    await waitFor(() => expect(screen.getByLabelText('Yaw 角度')).toBeEnabled())
+    if (code === 'stale_pick_buffer') {
+      expect(screen.getByLabelText('落脚点 X 坐标')).toBeDisabled()
+      expect(screen.getByRole('button', { name: '确认初始机位' })).toBeDisabled()
+    } else {
+      expect(screen.getByLabelText('落脚点 X 坐标')).toBeEnabled()
+      expect(screen.getByRole('button', { name: '确认初始机位' })).toBeEnabled()
+      fireEvent.click(screen.getByRole('button', { name: '确认初始机位' }))
+      await waitFor(() => expect(backend.confirmCamera).toHaveBeenCalledWith(1))
+    }
+    expect(screen.getByRole('button', { name: '确认场景落脚点' })).toBeDisabled()
   })
 
   it('revokes old frame authority while a replacement artifact is still downloading', async () => {

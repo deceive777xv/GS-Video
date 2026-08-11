@@ -1049,8 +1049,25 @@ def build_router() -> APIRouter:
         repository = services.project_repository
 
         async with _runtime_change_lock(request):
+            current = _load_project(repository)
+            project_context_changed = (
+                "expected_project_id" in patch.model_fields_set
+                and current.project_id != patch.expected_project_id
+            )
+            ingest_context_changed = (
+                "expected_ingest_cache_key" in patch.model_fields_set
+                and current.stages.get(StageName.INGEST, StageState()).cache_key
+                != patch.expected_ingest_cache_key
+            )
+            if project_context_changed or ingest_context_changed:
+                raise ApiError(
+                    409,
+                    code="project_context_changed",
+                    category="conflict",
+                    message="The active project or ingest context changed before the update was applied.",
+                    retryable=True,
+                )
             if patch.name is not None and services.project_manager is not None:
-                current = _load_project(repository)
                 try:
                     await asyncio.to_thread(
                         services.project_manager.rename,

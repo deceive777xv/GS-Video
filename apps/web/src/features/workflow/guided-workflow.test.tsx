@@ -689,7 +689,7 @@ describe('guided workflow', () => {
 
     await user.type(screen.getByLabelText('人物 X 坐标'), '100')
     await user.type(screen.getByLabelText('人物 Y 坐标'), '120')
-    await user.click(screen.getByRole('button', { name: '确认人物位置' }))
+    await user.click(screen.getByRole('button', { name: '确认人物位置并开始分割' }))
     expect(await screen.findByLabelText('创作交互 1 / 3')).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: '下一步' }))
@@ -707,6 +707,8 @@ describe('guided workflow', () => {
     await user.click(screen.getByRole('button', { name: '下一步' }))
     expect(await screen.findByRole('button', { name: '导出视频' })).toBeEnabled()
     expect(harness.client.updateProject).toHaveBeenCalledWith({
+      expected_project_id: 'project-1',
+      expected_ingest_cache_key: 'cache',
       subject_prompt: { frame_index: 0, x: 100, y: 120 },
     })
   })
@@ -1251,7 +1253,7 @@ describe('guided workflow', () => {
     expect(screen.getByRole('button', { name: '选择源视频' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '选择 Gaussian 场景' })).toBeDisabled()
     await user.click(screen.getByRole('button', { name: /人物.*一次提示/ }))
-    expect(await screen.findByRole('button', { name: '确认人物位置' })).toBeDisabled()
+    expect(await screen.findByRole('button', { name: '确认人物位置并开始分割' })).toBeDisabled()
     await user.click(screen.getByRole('button', { name: /预览.*运动与合成/ }))
     expect(screen.getByRole('button', { name: '生成中…' })).toBeDisabled()
     expect(harness.client.startTask).not.toHaveBeenCalled()

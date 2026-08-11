@@ -6,6 +6,7 @@ import {
 } from 'react'
 
 import type { BackendClient } from '../../api/backend-client'
+import { BackendClientError } from '../../api/http-backend-client'
 import type {
   CameraInput,
   FootPointDto,
@@ -13,12 +14,13 @@ import type {
   PreviewFrameDto,
   ProjectDto,
 } from '../../api/types'
+import {
+  ImagePointFields,
+  ImagePointMarker,
+  useImagePointDraft,
+} from '../coordinates/image-point-editor'
+import { toImagePoint } from '../coordinates/image-point'
 import { nextPreviewGeneration } from './preview-generation'
-
-export interface ImageSize { width: number; height: number }
-export interface Point { x: number; y: number }
-export interface PointEvent { clientX: number; clientY: number }
-export interface PointBounds { left: number; top: number; width: number; height: number }
 
 export function toCameraInput(camera: CameraInput): CameraInput {
   return {
@@ -49,61 +51,47 @@ function normalizeYaw(value: number): number {
   return Object.is(normalized, -0) ? 0 : normalized
 }
 
-export function toImagePoint(
-  event: PointEvent,
-  bounds: PointBounds,
-  image: ImageSize,
-): Point | null {
-  if (bounds.width <= 0 || bounds.height <= 0 || image.width <= 0 || image.height <= 0) return null
-  const scale = Math.min(bounds.width / image.width, bounds.height / image.height)
-  const left = bounds.left + (bounds.width - image.width * scale) / 2
-  const top = bounds.top + (bounds.height - image.height * scale) / 2
-  const x = (event.clientX - left) / scale
-  const y = (event.clientY - top) / scale
-  if (x < 0 || y < 0 || x >= image.width || y >= image.height) return null
-  return { x: Math.floor(x), y: Math.floor(y) }
-}
-
 interface SceneViewportProps {
   backend: BackendClient
   camera: CameraInput
   initialPreview?: PreviewDto | null
+  confirmedCameraRevision?: number | null
+  confirmedPreviewArtifactId?: string | null
+  initialFootPoint?: FootPointDto | null
   canConfirm?: boolean
   onError(value: unknown): void
   onPreview(frame: PreviewFrameDto, camera: CameraInput): void
   onProjectChange?(project: ProjectDto): void
   onFootPoint?(footPoint: FootPointDto): void
+  onAuthorityStale?(): Promise<void> | void
 }
 
 export function SceneViewport({
   backend,
   camera: initialCamera,
   initialPreview = null,
+  confirmedCameraRevision = null,
+  confirmedPreviewArtifactId = null,
+  initialFootPoint = null,
   canConfirm = true,
   onError,
   onPreview,
   onProjectChange,
   onFootPoint,
+  onAuthorityStale,
 }: SceneViewportProps) {
   const [camera, setCamera] = useState(() => toCameraInput(initialCamera))
-  const [frame, setFrame] = useState<PreviewFrameDto | null>(initialPreview === null ? null : {
-    artifact_id: initialPreview.artifact_id,
-    generation: initialPreview.generation,
-    width: initialPreview.width,
-    height: initialPreview.height,
-    camera_revision: initialPreview.camera_revision,
-    pick_buffer_revision: initialPreview.pick_buffer_revision,
-  })
-  const [frameCameraFingerprint, setFrameCameraFingerprint] = useState<string | null>(
-    initialPreview === null ? null : cameraFingerprint(initialCamera),
-  )
+  const [frame, setFrame] = useState<PreviewFrameDto | null>(null)
+  const [frameCameraFingerprint, setFrameCameraFingerprint] = useState<string | null>(null)
   const [frameUrl, setFrameUrl] = useState<string | null>(null)
+  const [displayedCameraFingerprint, setDisplayedCameraFingerprint] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [authoritativeTrigger, setAuthoritativeTrigger] = useState(0)
   const [yawInput, setYawInput] = useState(() => formatAngleInput(initialCamera.yaw))
   const [pitchInput, setPitchInput] = useState(() => formatAngleInput(initialCamera.pitch))
-  const [footX, setFootX] = useState('')
-  const [footY, setFootY] = useState('')
+  const [pickingFootPoint, setPickingFootPoint] = useState(false)
+  const [rejectedPickBufferAuthority, setRejectedPickBufferAuthority] = useState<string | null>(null)
+  const [rejectedConfirmationAuthority, setRejectedConfirmationAuthority] = useState<string | null>(null)
   const generation = useRef(initialPreview?.generation ?? 0)
   const requestAuthority = useRef(0)
   const drag = useRef<{
@@ -116,6 +104,9 @@ export function SceneViewport({
   const suppressNextClick = useRef(false)
   const frameUrlRef = useRef<string | null>(null)
   const viewportRef = useRef<HTMLDivElement>(null)
+  const frameImageRef = useRef<HTMLImageElement>(null)
+  const pickingFootPointRef = useRef(false)
+  const footPickRequestId = useRef(0)
   const firstRender = useRef(initialPreview !== null)
   const onErrorRef = useRef(onError)
   const onPreviewRef = useRef(onPreview)
@@ -139,6 +130,42 @@ export function SceneViewport({
     timeout: ReturnType<typeof setTimeout>
   } | null>(null)
   const authoritativeDisplaySequence = useRef(0)
+  const frameMatchesCamera = frame !== null
+    && frameCameraFingerprint === cameraFingerprint(camera)
+  const frameTuple = frame === null
+    ? null
+    : `${frame.artifact_id}:${frame.camera_revision}:${frame.pick_buffer_revision}`
+  const currentCameraFingerprint = cameraFingerprint(camera)
+  const frameReady = frame !== null
+    && frameUrl !== null
+    && frameMatchesCamera
+    && displayedCameraFingerprint === currentCameraFingerprint
+  const confirmationAuthority = `${frameTuple ?? 'none'}:${confirmedCameraRevision ?? 'none'}:${confirmedPreviewArtifactId ?? 'none'}`
+  const frameUsable = frameReady && rejectedPickBufferAuthority !== frameTuple
+  const frameConfirmed = frameUsable
+    && confirmedCameraRevision === frame.camera_revision
+    && confirmedPreviewArtifactId === frame.artifact_id
+    && rejectedConfirmationAuthority !== confirmationAuthority
+  const frameAuthority = frameTuple === null
+    ? 'no-authoritative-frame'
+    : [
+        frameTuple,
+        frameReady ? 'ready' : `stale:${cameraFingerprint(camera)}`,
+        frameConfirmed ? 'confirmed' : 'unconfirmed',
+        rejectedPickBufferAuthority === frameTuple ? 'pick-buffer-rejected' : 'pick-buffer-usable',
+        rejectedConfirmationAuthority === confirmationAuthority ? 'confirmation-rejected' : 'confirmation-usable',
+      ].join(':')
+  const restoredFootPoint = frame !== null
+    && frameConfirmed
+    && initialFootPoint?.preview_artifact_id === frame.artifact_id
+    && initialFootPoint.camera_revision === frame.camera_revision
+    && initialFootPoint.pick_buffer_revision === frame.pick_buffer_revision
+    ? { x: initialFootPoint.image[0], y: initialFootPoint.image[1] }
+    : null
+  const footDraft = useImagePointDraft(frame, frameAuthority, restoredFootPoint)
+  const footInteractionAuthority = `${frameAuthority}:${footDraft.xText}:${footDraft.yText}`
+  const latestFootInteractionAuthority = useRef(footInteractionAuthority)
+  latestFootInteractionAuthority.current = footInteractionAuthority
 
   useEffect(() => { onErrorRef.current = onError }, [onError])
   useEffect(() => { onPreviewRef.current = onPreview }, [onPreview])
@@ -149,6 +176,7 @@ export function SceneViewport({
     if (viewport === null) return
     const updateDistance = (event: WheelEvent): void => {
       event.preventDefault()
+      if (pickingFootPointRef.current) return
       const factor = event.deltaY > 0 ? 1.08 : 0.92
       setCamera((current) => ({
         ...current,
@@ -159,12 +187,13 @@ export function SceneViewport({
     return () => viewport.removeEventListener('wheel', updateDistance)
   }, [])
 
-  const replaceFrameUrl = (next: string | null): void => {
+  const replaceFrameUrl = (next: string | null, fingerprint: string | null = null): void => {
     if (frameUrlRef.current !== null && frameUrlRef.current !== next) {
       URL.revokeObjectURL(frameUrlRef.current)
     }
     frameUrlRef.current = next
     setFrameUrl(next)
+    setDisplayedCameraFingerprint(fingerprint)
   }
 
   useEffect(() => () => replaceFrameUrl(null), [])
@@ -217,11 +246,15 @@ export function SceneViewport({
       }, controller.signal).then((blob) => {
         if (controller.signal.aborted
           || requestId <= liveDisplayRequestId.current
+          || target.sequence !== latestLiveTarget.current.sequence
+          || target.fingerprint !== latestLiveTarget.current.fingerprint
           || target.sequence <= authoritativeDisplaySequence.current) return
         liveDisplayRequestId.current = requestId
-        replaceFrameUrl(URL.createObjectURL(blob))
+        replaceFrameUrl(URL.createObjectURL(blob), target.fingerprint)
       }).catch(() => {
         if (controller.signal.aborted || epoch !== livePumpEpoch.current) return
+        if (target.sequence !== latestLiveTarget.current.sequence
+          || target.fingerprint !== latestLiveTarget.current.fingerprint) return
         liveDisabled.current = true
         forceAuthoritativeSequence.current = latestLiveTarget.current.sequence
         onErrorRef.current('实时预览暂不可用，已切换到高质量预览。')
@@ -305,7 +338,7 @@ export function SceneViewport({
           authoritativeDisplaySequence.current,
           latestLiveTarget.current.sequence,
         )
-        replaceFrameUrl(URL.createObjectURL(blob))
+        replaceFrameUrl(URL.createObjectURL(blob), nextFingerprint)
         setFrame(nextFrame)
         setFrameCameraFingerprint(nextFingerprint)
       })
@@ -356,7 +389,7 @@ export function SceneViewport({
           authoritativeDisplaySequence.current,
           authoritativeSequence,
         )
-        replaceFrameUrl(URL.createObjectURL(blob))
+        replaceFrameUrl(URL.createObjectURL(blob), cameraFingerprint(camera))
         setFrame(nextFrame)
         setFrameCameraFingerprint(cameraFingerprint(camera))
         onPreviewRef.current(nextFrame, camera)
@@ -395,6 +428,7 @@ export function SceneViewport({
   }
 
   const pointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (pickingFootPointRef.current) return
     drag.current = {
       originX: event.clientX,
       originY: event.clientY,
@@ -406,7 +440,7 @@ export function SceneViewport({
     event.currentTarget.setPointerCapture?.(event.pointerId)
   }
   const pointerMove = (event: ReactPointerEvent<HTMLDivElement>): void => {
-    if (drag.current === null) return
+    if (pickingFootPointRef.current || drag.current === null) return
     const dx = event.clientX - drag.current.lastX
     const dy = event.clientY - drag.current.lastY
     drag.current = {
@@ -434,28 +468,35 @@ export function SceneViewport({
       suppressNextClick.current = false
       return
     }
-    if (drag.current !== null || frame === null || !frameMatchesCamera || viewportRef.current === null) return
-    const mapped = toImagePoint(event, viewportRef.current.getBoundingClientRect(), frame)
+    if (pickingFootPointRef.current || drag.current !== null || frame === null || !frameUsable || frameImageRef.current === null) return
+    const mapped = toImagePoint(event, frameImageRef.current.getBoundingClientRect(), frame)
     if (mapped === null) {
       onError('点击位于预览内容之外，请在图像范围内选择落脚点。')
       return
     }
-    setFootX(String(mapped.x))
-    setFootY(String(mapped.y))
-    void submitFootPoint(mapped)
+    footDraft.select(mapped)
   }
 
-  const submitFootPoint = async (override?: Point): Promise<void> => {
-    if (frame === null || !frameMatchesCamera) {
+  const submitFootPoint = async (): Promise<void> => {
+    if (pickingFootPointRef.current) return
+    if (frame === null || !frameUsable) {
       onError('请先等待最新场景预览。')
       return
     }
-    const point = override ?? { x: Number(footX), y: Number(footY) }
-    if (!Number.isInteger(point.x) || !Number.isInteger(point.y)
-      || point.x < 0 || point.y < 0 || point.x >= frame.width || point.y >= frame.height) {
+    if (!frameConfirmed) {
+      onError('请先确认当前初始机位。')
+      return
+    }
+    const point = footDraft.point
+    if (point === null) {
       onError('落脚点坐标必须位于当前预览图像内。')
       return
     }
+    const requestId = ++footPickRequestId.current
+    const requestAuthority = footInteractionAuthority
+    const expectedFrameAuthority = frameTuple
+    pickingFootPointRef.current = true
+    setPickingFootPoint(true)
     try {
       const foot = await backend.pickFootPoint({
         x: point.x,
@@ -464,26 +505,57 @@ export function SceneViewport({
         camera_revision: frame.camera_revision,
         pick_buffer_revision: frame.pick_buffer_revision,
       })
+      if (requestId !== footPickRequestId.current
+        || latestFootInteractionAuthority.current !== requestAuthority) return
+      if (foot.preview_artifact_id !== frame.artifact_id
+        || foot.camera_revision !== frame.camera_revision
+        || foot.pick_buffer_revision !== frame.pick_buffer_revision) {
+        setRejectedPickBufferAuthority(expectedFrameAuthority)
+        footDraft.accept(null)
+        await onAuthorityStale?.()
+        onError('落脚点响应不属于当前预览，已刷新场景状态。')
+        return
+      }
+      footDraft.accept({ x: foot.image[0], y: foot.image[1] })
       onFootPoint?.(foot)
     } catch (error) {
-      onError(error instanceof Error ? error : '落脚点深度无效或预览已经过期。')
+      const authorityIsCurrent = requestId === footPickRequestId.current
+        && latestFootInteractionAuthority.current === requestAuthority
+      if (authorityIsCurrent
+        && error instanceof BackendClientError
+        && (error.code === 'stale_pick_buffer' || error.code === 'camera_not_confirmed')) {
+        if (error.code === 'stale_pick_buffer') {
+          setRejectedPickBufferAuthority(expectedFrameAuthority)
+        } else {
+          setRejectedConfirmationAuthority(confirmationAuthority)
+        }
+        footDraft.accept(null)
+        await onAuthorityStale?.()
+      }
+      if (authorityIsCurrent) {
+        onError(error instanceof Error ? error : '落脚点深度无效或预览已经过期。')
+      }
+    } finally {
+      if (requestId === footPickRequestId.current) {
+        pickingFootPointRef.current = false
+        setPickingFootPoint(false)
+      }
     }
   }
 
   const confirmCamera = async (): Promise<void> => {
-    if (frame === null || !frameMatchesCamera) {
+    if (frame === null || !frameUsable) {
       onError('请先等待最新场景预览。')
       return
     }
     try {
-      onProjectChange?.(await backend.confirmCamera(frame.camera_revision))
+      const project = await backend.confirmCamera(frame.camera_revision)
+      setRejectedConfirmationAuthority(null)
+      onProjectChange?.(project)
     } catch (error) {
       onError(error instanceof Error ? error : '初始机位确认失败。')
     }
   }
-
-  const frameMatchesCamera = frame !== null
-    && frameCameraFingerprint === cameraFingerprint(camera)
 
   return (
     <div className="viewport-layout">
@@ -501,8 +573,9 @@ export function SceneViewport({
         {frameUrl === null ? (
           <div className="viewport-empty"><span>正在准备 Gaussian 场景帧</span></div>
         ) : (
-          <img alt="最新 Gaussian 场景后端预览" draggable={false} src={frameUrl} />
+          <img alt="最新 Gaussian 场景后端预览" draggable={false} ref={frameImageRef} src={frameUrl} />
         )}
+        <ImagePointMarker containerRef={viewportRef} image={frame} mediaRef={frameImageRef} pending={footDraft.dirty} point={footDraft.point} />
         {loading ? <span className="viewport-loading">更新视图…</span> : null}
       </div>
       <aside className="viewport-controls" aria-label="机位控制">
@@ -511,6 +584,7 @@ export function SceneViewport({
             Yaw 角度
             <input
               aria-label="Yaw 角度"
+              disabled={pickingFootPoint}
               inputMode="decimal"
               onBlur={() => commitAngleInput('yaw')}
               onChange={(event) => setYawInput(event.currentTarget.value)}
@@ -531,6 +605,7 @@ export function SceneViewport({
             Pitch 角度
             <input
               aria-label="Pitch 角度"
+              disabled={pickingFootPoint}
               inputMode="decimal"
               max="89"
               min="-89"
@@ -555,6 +630,7 @@ export function SceneViewport({
           垂直视场角
           <input
             aria-label="垂直视场角"
+            disabled={pickingFootPoint}
             max="100"
             min="20"
             onChange={(event) => {
@@ -578,14 +654,24 @@ export function SceneViewport({
           />
           <output>{camera.fov_y_degrees.toFixed(0)}°</output>
         </label>
-        <button disabled={!canConfirm || !frameMatchesCamera || loading} onClick={() => void confirmCamera()} type="button">
+        <button disabled={!canConfirm || !frameUsable || loading || pickingFootPoint} onClick={() => void confirmCamera()} type="button">
           确认初始机位
         </button>
         <fieldset>
-          <legend>无鼠标落脚点输入</legend>
-          <label>落脚点 X 坐标<input aria-label="落脚点 X 坐标" inputMode="numeric" onChange={(event) => setFootX(event.currentTarget.value)} value={footX} /></label>
-          <label>落脚点 Y 坐标<input aria-label="落脚点 Y 坐标" inputMode="numeric" onChange={(event) => setFootY(event.currentTarget.value)} value={footY} /></label>
-          <button disabled={!frameMatchesCamera} onClick={() => void submitFootPoint()} type="button">确认场景落脚点</button>
+          <legend>场景落脚点</legend>
+          <ImagePointFields
+            confirmedLabel="场景落脚点已验证"
+            disabled={loading || pickingFootPoint || !frameUsable}
+            draft={footDraft}
+            emptyLabel="尚未选择场景落脚点"
+            image={frame}
+            pendingLabel="候选场景落脚点待确认"
+            xLabel="落脚点 X 坐标"
+            yLabel="落脚点 Y 坐标"
+          />
+          <button disabled={!frameConfirmed || footDraft.point === null || loading || pickingFootPoint} onClick={() => void submitFootPoint()} type="button">
+            {pickingFootPoint ? '验证中…' : '确认场景落脚点'}
+          </button>
         </fieldset>
       </aside>
     </div>

@@ -296,6 +296,8 @@ export interface EnvironmentRepairSnapshotDto {
 }
 
 export interface ProjectPatch {
+  expected_project_id?: string
+  expected_ingest_cache_key?: string | null
   name?: string
   subject_prompt?: SubjectPromptDto | null
   motion_scale?: number

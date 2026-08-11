@@ -157,6 +157,43 @@ def test_project_patch_is_strict_and_persists(
     assert set(invalid.json()) == {"code", "category", "message", "retryable"}
 
 
+def test_project_patch_rejects_stale_project_and_ingest_context(
+    api_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    current = api_client.get("/api/v1/projects/current", headers=auth_headers).json()
+
+    stale_project = api_client.patch(
+        "/api/v1/projects/current",
+        json={"expected_project_id": "stale-project", "motion_scale": 2},
+        headers=auth_headers,
+    )
+    stale_ingest = api_client.patch(
+        "/api/v1/projects/current",
+        json={
+            "expected_project_id": current["project_id"],
+            "expected_ingest_cache_key": "stale-ingest",
+            "motion_scale": 2,
+        },
+        headers=auth_headers,
+    )
+    accepted = api_client.patch(
+        "/api/v1/projects/current",
+        json={
+            "expected_project_id": current["project_id"],
+            "expected_ingest_cache_key": current["stages"].get("ingest", {}).get("cache_key"),
+            "motion_scale": 2,
+        },
+        headers=auth_headers,
+    )
+
+    assert stale_project.status_code == 409
+    assert stale_project.json()["code"] == "project_context_changed"
+    assert stale_ingest.status_code == 409
+    assert stale_ingest.json()["code"] == "project_context_changed"
+    assert accepted.status_code == 200
+    assert accepted.json()["workflow"]["motion_scale"] == 2
+
+
 def test_local_asset_import_copies_into_project_source(
     api_client: TestClient, auth_headers: dict[str, str], tmp_path: Path
 ) -> None:

@@ -3,7 +3,12 @@ import { type PointerEvent, useEffect, useRef, useState } from 'react'
 import type { BackendClient } from '../../api/backend-client'
 import { BackendClientError } from '../../api/http-backend-client'
 import type { ProjectDto, SubjectMediaDto } from '../../api/types'
-import { toImagePoint } from '../camera/scene-viewport'
+import {
+  ImagePointFields,
+  ImagePointMarker,
+  useImagePointDraft,
+} from '../coordinates/image-point-editor'
+import { toImagePoint } from '../coordinates/image-point'
 
 const SUBJECT_MEDIA_RETRY_DELAYS_MS = [250, 500, 1_000] as const
 
@@ -24,16 +29,42 @@ interface SubjectPageProps {
 export function SubjectPage({ backend, busy, project, onError, onProjectChange, onStartStage }: SubjectPageProps) {
   const [proxy, setProxy] = useState<SubjectMediaDto | null>(null)
   const [proxyUrl, setProxyUrl] = useState<string | null>(null)
+  const [proxyAuthority, setProxyAuthority] = useState<string | null>(null)
   const [alphaUrl, setAlphaUrl] = useState<string | null>(null)
-  const [x, setX] = useState('')
-  const [y, setY] = useState('')
+  const [alphaAuthority, setAlphaAuthority] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const frameRef = useRef<HTMLDivElement>(null)
+  const proxyImageRef = useRef<HTMLImageElement>(null)
   const proxyUrlRef = useRef<string | null>(null)
   const alphaUrlRef = useRef<string | null>(null)
   const onErrorRef = useRef(onError)
+  const submissionId = useRef(0)
 
   useEffect(() => { onErrorRef.current = onError }, [onError])
+
+  const subjectAuthority = `${project.project_id}:${project.stages.ingest?.cache_key ?? 'no-ingest'}`
+  const currentProxy = proxyAuthority === subjectAuthority && proxyUrl !== null ? proxy : null
+  const currentProxyUrl = currentProxy === null ? null : proxyUrl
+  const currentAlphaUrl = alphaAuthority === subjectAuthority ? alphaUrl : null
+  const savedPrompt = project.workflow.subject_prompt
+  const savedPoint = currentProxy !== null && savedPrompt?.frame_index === currentProxy.frame_index
+    ? { x: savedPrompt.x, y: savedPrompt.y }
+    : null
+  const draft = useImagePointDraft(
+    currentProxy,
+    currentProxy === null ? `${subjectAuthority}:no-proxy` : `${subjectAuthority}:${currentProxy.artifact_id}:${currentProxy.frame_index}`,
+    savedPoint,
+  )
+  const submissionAuthority = currentProxy === null
+    ? `${subjectAuthority}:no-proxy`
+    : `${subjectAuthority}:${currentProxy.artifact_id}:${currentProxy.frame_index}`
+  const latestSubmissionAuthority = useRef(submissionAuthority)
+  latestSubmissionAuthority.current = submissionAuthority
+
+  useEffect(() => {
+    submissionId.current += 1
+    setSubmitting(false)
+  }, [subjectAuthority])
 
   const replaceUrl = (role: 'proxy' | 'alpha', blob: Blob | null): void => {
     const owner = role === 'proxy' ? proxyUrlRef : alphaUrlRef
@@ -44,6 +75,11 @@ export function SubjectPage({ backend, busy, project, onError, onProjectChange, 
   }
 
   useEffect(() => {
+    setProxy(null)
+    setProxyAuthority(null)
+    replaceUrl('proxy', null)
+    setAlphaAuthority(null)
+    replaceUrl('alpha', null)
     if (project.stages.ingest?.status !== 'succeeded') return
     const controller = new AbortController()
     let timer: ReturnType<typeof setTimeout> | null = null
@@ -57,6 +93,7 @@ export function SubjectPage({ backend, busy, project, onError, onProjectChange, 
         if (controller.signal.aborted) return
         setProxy(descriptor)
         replaceUrl('proxy', blob)
+        setProxyAuthority(subjectAuthority)
       } catch (error) {
         if (controller.signal.aborted) return
         const delay = SUBJECT_MEDIA_RETRY_DELAYS_MS[attempt]
@@ -76,7 +113,7 @@ export function SubjectPage({ backend, busy, project, onError, onProjectChange, 
       controller.abort()
       if (timer !== null) clearTimeout(timer)
     }
-  }, [backend, project.stages.ingest?.cache_key, project.stages.ingest?.status])
+  }, [backend, project.project_id, project.stages.ingest?.cache_key, project.stages.ingest?.status])
 
   useEffect(() => {
     if (project.stages.segment?.status !== 'succeeded' || project.workflow.subject_prompt === null) return
@@ -89,7 +126,10 @@ export function SubjectPage({ backend, busy, project, onError, onProjectChange, 
         const blob = await backend.fetchSubjectMediaArtifact(
           'alpha', descriptor.artifact_id, controller.signal,
         )
-        if (!controller.signal.aborted) replaceUrl('alpha', blob)
+        if (!controller.signal.aborted) {
+          replaceUrl('alpha', blob)
+          setAlphaAuthority(subjectAuthority)
+        }
       } catch (error) {
         if (controller.signal.aborted) return
         const delay = SUBJECT_MEDIA_RETRY_DELAYS_MS[attempt]
@@ -108,6 +148,8 @@ export function SubjectPage({ backend, busy, project, onError, onProjectChange, 
     }
   }, [
     backend,
+    project.project_id,
+    project.stages.ingest?.cache_key,
     project.stages.segment?.cache_key,
     project.stages.segment?.status,
     project.workflow.subject_prompt?.frame_index,
@@ -122,45 +164,70 @@ export function SubjectPage({ backend, busy, project, onError, onProjectChange, 
     alphaUrlRef.current = null
   }, [])
 
-  const submit = async (point = { x: Number(x), y: Number(y) }): Promise<void> => {
+  const submit = async (): Promise<void> => {
     if (busy) return
-    if (proxy === null || !Number.isInteger(point.x) || !Number.isInteger(point.y)
-      || point.x < 0 || point.y < 0 || point.x >= proxy.width || point.y >= proxy.height) {
+    const point = draft.point
+    if (currentProxy === null || point === null) {
       onError('人物坐标必须位于代表帧图像内。')
       return
     }
+    const requestId = ++submissionId.current
+    const requestAuthority = submissionAuthority
     setSubmitting(true)
     try {
       const next = await backend.updateProject({
-        subject_prompt: { frame_index: proxy.frame_index, x: point.x, y: point.y },
+        expected_project_id: project.project_id,
+        expected_ingest_cache_key: project.stages.ingest?.cache_key ?? null,
+        subject_prompt: { frame_index: currentProxy.frame_index, x: point.x, y: point.y },
       })
+      if (requestId !== submissionId.current
+        || latestSubmissionAuthority.current !== requestAuthority) return
+      draft.accept(point)
       onProjectChange(next)
       await onStartStage('segment')
     } catch (error) {
-      onError(error instanceof Error ? error : '人物选择失败。')
+      if (requestId === submissionId.current
+        && latestSubmissionAuthority.current === requestAuthority) {
+        onError(error instanceof Error ? error : '人物选择失败。')
+      }
     } finally {
-      setSubmitting(false)
+      if (requestId === submissionId.current) setSubmitting(false)
     }
   }
 
   const pick = (event: PointerEvent<HTMLDivElement>): void => {
-    if (proxy === null || frameRef.current === null) return
-    const point = toImagePoint(event, frameRef.current.getBoundingClientRect(), proxy)
+    if (busy || submitting || currentProxy === null || proxyImageRef.current === null) return
+    const point = toImagePoint(event, proxyImageRef.current.getBoundingClientRect(), currentProxy)
     if (point === null) {
       onError('点击位于代表帧内容之外。')
       return
     }
-    setX(String(point.x)); setY(String(point.y))
-    void submit(point)
+    draft.select(point)
   }
 
   const reselect = async (): Promise<void> => {
+    const requestId = ++submissionId.current
+    const requestAuthority = submissionAuthority
+    setSubmitting(true)
     try {
-      onProjectChange(await backend.updateProject({ subject_prompt: null }))
+      const next = await backend.updateProject({
+        expected_project_id: project.project_id,
+        expected_ingest_cache_key: project.stages.ingest?.cache_key ?? null,
+        subject_prompt: null,
+      })
+      if (requestId !== submissionId.current
+        || latestSubmissionAuthority.current !== requestAuthority) return
+      onProjectChange(next)
       replaceUrl('alpha', null)
-      setX(''); setY('')
+      setAlphaAuthority(null)
+      draft.accept(null)
     } catch (error) {
-      onError(error instanceof Error ? error : '无法重新选择人物。')
+      if (requestId === submissionId.current
+        && latestSubmissionAuthority.current === requestAuthority) {
+        onError(error instanceof Error ? error : '无法重新选择人物。')
+      }
+    } finally {
+      if (requestId === submissionId.current) setSubmitting(false)
     }
   }
 
@@ -169,19 +236,28 @@ export function SubjectPage({ backend, busy, project, onError, onProjectChange, 
       <div className="page-heading">
         <p className="eyebrow">02 · SUBJECT</p>
         <h2 id="subject-title">选择前景人物</h2>
-        <p>在代表帧的人物身体内点击。服务会验证坐标后再写入项目并启动分割。</p>
+        <p>在代表帧的人物身体内点击或输入像素坐标；确认后才会启动分割。</p>
       </div>
       <div className="subject-layout">
         <div aria-label="人物代表帧" className="subject-frame preview-surface" onClick={pick} ref={frameRef} tabIndex={0}>
-          {proxyUrl === null ? <div className="viewport-empty">载入代表帧…</div> : <img alt="人物代表帧" src={proxyUrl} />}
-          {alphaUrl === null ? null : <img alt="人物 Alpha 叠加" className="alpha-overlay" src={alphaUrl} />}
+          {currentProxyUrl === null ? <div className="viewport-empty">载入代表帧…</div> : <img alt="人物代表帧" ref={proxyImageRef} src={currentProxyUrl} />}
+          {currentAlphaUrl === null ? null : <img alt="人物 Alpha 叠加" className="alpha-overlay" src={currentAlphaUrl} />}
+          <ImagePointMarker containerRef={frameRef} image={currentProxy} mediaRef={proxyImageRef} pending={draft.dirty} point={draft.point} />
         </div>
         <aside className="control-card">
           <h3>精确坐标</h3>
-          <p>键盘用户可输入代表帧像素坐标。</p>
-          <label>人物 X 坐标<input aria-label="人物 X 坐标" inputMode="numeric" onChange={(event) => setX(event.currentTarget.value)} value={x} /></label>
-          <label>人物 Y 坐标<input aria-label="人物 Y 坐标" inputMode="numeric" onChange={(event) => setY(event.currentTarget.value)} value={y} /></label>
-          <button disabled={busy || proxy === null || submitting} onClick={() => void submit()} type="button">{submitting ? '处理中…' : '确认人物位置'}</button>
+          <p>点击和键盘输入只更新候选点，不会自动开始计算。</p>
+          <ImagePointFields
+            confirmedLabel="人物坐标已保存"
+            disabled={busy || submitting}
+            draft={draft}
+            emptyLabel="尚未选择人物坐标"
+            image={currentProxy}
+            pendingLabel="候选人物坐标待确认"
+            xLabel="人物 X 坐标"
+            yLabel="人物 Y 坐标"
+          />
+          <button disabled={busy || currentProxy === null || draft.point === null || submitting} onClick={() => void submit()} type="button">{submitting ? '处理中…' : '确认人物位置并开始分割'}</button>
           {project.workflow.subject_prompt !== null ? <button className="button-secondary" onClick={() => void reselect()} type="button">重新选择人物</button> : null}
         </aside>
       </div>

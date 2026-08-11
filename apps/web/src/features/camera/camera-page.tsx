@@ -26,7 +26,14 @@ export function CameraPage({ backend, project, onError, onProjectChange, onRefre
   const onPreview = useCallback((_frame: PreviewFrameDto, _camera: CameraInput) => {
     void onRefresh().catch(onError)
   }, [onError, onRefresh])
-  const footPoint = useCallback(() => { void onRefresh().catch(onError) }, [onError, onRefresh])
+  const refreshProject = useCallback(async () => {
+    try {
+      await onRefresh()
+    } catch (error) {
+      onError(error)
+    }
+  }, [onError, onRefresh])
+  const footPoint = useCallback(() => { void refreshProject() }, [refreshProject])
 
   return (
     <section aria-labelledby="camera-title" className="page-grid page-wide">
@@ -44,7 +51,11 @@ export function CameraPage({ backend, project, onError, onProjectChange, onRefre
       <SceneViewport
         backend={backend}
         camera={camera}
+        confirmedCameraRevision={workflow.confirmed_camera_revision}
+        confirmedPreviewArtifactId={workflow.confirmed_preview_artifact_id}
+        initialFootPoint={workflow.foot_point}
         initialPreview={workflow.preview}
+        onAuthorityStale={refreshProject}
         onError={onError}
         onFootPoint={footPoint}
         onPreview={onPreview}

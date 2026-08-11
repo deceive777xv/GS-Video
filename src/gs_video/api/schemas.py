@@ -218,6 +218,8 @@ class SubjectPromptInput(StrictModel):
 
 
 class ProjectPatch(StrictModel):
+    expected_project_id: str | None = Field(default=None, min_length=1)
+    expected_ingest_cache_key: str | None = None
     name: str | None = Field(default=None, min_length=1, max_length=200)
     subject_prompt: SubjectPromptInput | None = None
     motion_scale: float | None = Field(default=None, ge=0.1, le=4.0)
