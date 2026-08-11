@@ -14,7 +14,7 @@ import {
   type TaskStore,
   useTaskStore,
 } from '../api/task-events'
-import type { BootstrapDto, ProjectDto, ProjectSummaryDto, StageName, StorageLayoutDto, TaskDto, TaskEvent, VramBudgetDto } from '../api/types'
+import type { BootstrapDto, ProjectDto, ProjectSummaryDto, StageName, StorageLayoutStatusDto, TaskDto, TaskEvent, VramBudgetDto } from '../api/types'
 import type { PlatformBridge } from '../platform/platform-bridge'
 import { CameraPage } from '../features/camera/camera-page'
 import { ExportPage } from '../features/export/export-page'
@@ -399,15 +399,10 @@ export function App({
     return next
   }, [backend])
 
-  const refreshBootstrap = useCallback(async (): Promise<void> => {
-    const next = await backend.bootstrap()
-    setBootstrap(next)
-    if (next.project === null) clearProject()
-    else {
-      acceptProject(next.project)
-      setStep(workflowStepForProject(next.project))
-    }
-  }, [acceptProject, backend, clearProject])
+  const refreshEnvironment = useCallback(async (): Promise<void> => {
+    const environment = await backend.refreshEnvironment()
+    setBootstrap((current) => current === null ? current : { ...current, environment })
+  }, [backend])
 
   useEffect(() => {
     if (loading || bootstrap === null || workflowRoute === null) return
@@ -616,7 +611,7 @@ export function App({
     return next
   }
 
-  const acceptStorageLayout = (value: StorageLayoutDto): void => {
+  const acceptStorageLayout = (value: StorageLayoutStatusDto): void => {
     setBootstrap((current) => current === null ? current : { ...current, storage_layout: value })
   }
 
@@ -801,7 +796,7 @@ export function App({
   let page: ReactNode
   switch (step) {
     case 'import':
-      page = <ImportPage backend={backend} busy={workflowBusy} environment={bootstrap.environment} onEnvironmentRefresh={refreshBootstrap} onError={reportError} onProjectChange={acceptProject} onStartStage={runStage} platform={platform} project={project} />
+      page = <ImportPage backend={backend} busy={workflowBusy} environment={bootstrap.environment} onEnvironmentRefresh={refreshEnvironment} onError={reportError} onProjectChange={acceptProject} onStartStage={runStage} platform={platform} project={project} />
       break
     case 'subject':
       page = <SubjectPage backend={backend} busy={workflowBusy} onError={reportError} onProjectChange={acceptProject} onStartStage={runStage} project={project} />

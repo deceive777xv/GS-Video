@@ -30,6 +30,7 @@ from gs_video.api.routes import ApiServices, build_router
 from gs_video.api.schemas import API_VERSION, ApiError, ApiSettings, ErrorEnvelope
 from gs_video.api.uploads import UploadManager
 from gs_video.api.workflow import PreviewArtifactStore, PreviewCoordinator
+from gs_video.environment.cache import EnvironmentReportCache
 from gs_video.runtime import WorkflowRuntimeConfig, assemble_api_services
 from gs_video.storage.artifacts import ArtifactStore
 
@@ -104,6 +105,7 @@ def create_app(settings: ApiSettings, services: ApiServices) -> FastAPI:
         services.project_repository.root
     )
     app.state.preview_coordinator = PreviewCoordinator()
+    app.state.environment_reports = EnvironmentReportCache()
     app.state.export_inspector = services.export_inspector or ExportInspector()
     storage_layout = services.storage_layout
     app.state.storage_maintenance = StorageMaintenanceCoordinator()

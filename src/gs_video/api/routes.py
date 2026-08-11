@@ -74,6 +74,7 @@ from gs_video.domain.models import (
     VideoSummary,
 )
 from gs_video.environment.doctor import EnvironmentReport
+from gs_video.environment.cache import EnvironmentReportCache
 from gs_video.environment.repair import EnvironmentRepairBusyError
 from gs_video.environment.vram import (
     STANDARD_VRAM_MB,
@@ -217,6 +218,21 @@ def _environment_repair(request: Request) -> EnvironmentRepairLike:
             retryable=False,
         )
     return repair
+
+
+def _environment_reports(request: Request) -> EnvironmentReportCache:
+    return cast(EnvironmentReportCache, request.app.state.environment_reports)
+
+
+def _probe_environment(services: ApiServices) -> EnvironmentReport:
+    suspension = _suspend_live_preview_if_supported(services.preview_service)
+    try:
+        return services.environment_doctor.check()
+    finally:
+        _resume_live_preview_if_supported(
+            services.preview_service,
+            suspension,
+        )
 
 
 _VRAM_BLOCKING_STAGES = {
@@ -723,20 +739,10 @@ def build_router() -> APIRouter:
     @protected.get("/api/v1/bootstrap", response_model=BootstrapResponse)
     async def bootstrap(request: Request) -> BootstrapResponse:
         services = _services(request)
-        suspension = await asyncio.to_thread(
-            _suspend_live_preview_if_supported,
-            services.preview_service,
+        environment = await asyncio.to_thread(
+            _environment_reports(request).get,
+            lambda: _probe_environment(services),
         )
-        try:
-            environment = await asyncio.to_thread(
-                services.environment_doctor.check
-            )
-        finally:
-            await asyncio.to_thread(
-                _resume_live_preview_if_supported,
-                services.preview_service,
-                suspension,
-            )
         capabilities: tuple[str, ...] = (
             "projects",
             "assets",
@@ -786,13 +792,24 @@ def build_router() -> APIRouter:
             environment=environment,
             vram_budget=budget,
             storage_layout=(
-                services.storage_layout.snapshot(
+                services.storage_layout.status(
                     editable=_storage_blocked_reason(request) is None,
                     blocked_reason=_storage_blocked_reason(request),
                 )
                 if services.storage_layout is not None
                 else None
             ),
+        )
+
+    @protected.post(
+        "/api/v1/runtime/environment/refresh",
+        response_model=EnvironmentReport,
+    )
+    async def refresh_environment(request: Request) -> EnvironmentReport:
+        services = _services(request)
+        return await asyncio.to_thread(
+            _environment_reports(request).refresh,
+            lambda: _probe_environment(services),
         )
 
     @protected.get(

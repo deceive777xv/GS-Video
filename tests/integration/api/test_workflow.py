@@ -999,6 +999,36 @@ def test_bootstrap_environment_probe_temporarily_suspends_preview(
     assert preview.suspended is False
 
 
+def test_bootstrap_caches_environment_until_explicit_refresh(
+    workflow_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    class CountingDoctor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def check(self) -> EnvironmentReport:
+            self.calls += 1
+            return EnvironmentReport(ready=True, vram_mb=8192, issues=[])
+
+    doctor = CountingDoctor()
+    workflow_client.app.state.services = replace(
+        workflow_client.app.state.services,
+        environment_doctor=doctor,
+    )
+
+    first = workflow_client.get("/api/v1/bootstrap", headers=auth_headers)
+    second = workflow_client.get("/api/v1/bootstrap", headers=auth_headers)
+    refreshed = workflow_client.post(
+        "/api/v1/runtime/environment/refresh",
+        headers=auth_headers,
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert refreshed.status_code == 200
+    assert doctor.calls == 2
+
+
 def test_export_result_is_ffprobe_verified_persisted_and_opaque(
     workflow_client: TestClient, auth_headers: dict[str, str]
 ) -> None:

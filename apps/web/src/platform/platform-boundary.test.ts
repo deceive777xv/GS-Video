@@ -10,6 +10,7 @@ import {
   TauriCompositionRoot,
 } from '../composition-root'
 import type { BackendClient } from '../api/backend-client'
+import { BackendClientError } from '../api/http-backend-client'
 import { BrowserPlatformBridge } from './browser-platform-bridge'
 import { TauriPlatformBridge } from './tauri-platform-bridge'
 
@@ -60,6 +61,7 @@ const bootstrap = {
 
 const fakeClient = (): BackendClient => ({
   bootstrap: vi.fn().mockResolvedValue(bootstrap),
+  refreshEnvironment: vi.fn().mockResolvedValue(bootstrap.environment),
   getVramBudget: vi.fn().mockResolvedValue(bootstrap.vram_budget),
   updateVramBudget: vi.fn().mockResolvedValue(bootstrap.vram_budget),
   getStorageLayout: vi.fn(),
@@ -283,5 +285,29 @@ describe('browser and Tauri composition roots', () => {
     expect(screen.queryByRole('button', { name: 'Connect' })).toBeNull()
     expect(screen.queryByText('injected-secret')).toBeNull()
     expect(await screen.findByText('Connected to local service')).toBeVisible()
+  })
+
+  it('shows the structured bootstrap failure in the desktop shell', async () => {
+    const client = fakeClient()
+    vi.mocked(client.bootstrap).mockRejectedValue(new BackendClientError(0, {
+      code: 'request_timeout',
+      category: 'transport',
+      message: 'The local service request timed out.',
+      retryable: true,
+    }))
+
+    render(
+      createElement(TauriCompositionRoot, {
+        session: {
+          origin: 'http://127.0.0.1:49152',
+          token: 'injected-secret',
+        },
+        createClient: () => client,
+      }),
+    )
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('The local service request timed out.')
+    expect(alert).toHaveTextContent('request_timeout')
   })
 })

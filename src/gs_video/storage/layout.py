@@ -64,7 +64,7 @@ class StorageLayoutPreference(BaseModel):
     cache_id: str
 
 
-class StorageLayoutSnapshot(BaseModel):
+class StorageLayoutStatus(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     project_library_root: str
@@ -74,6 +74,9 @@ class StorageLayoutSnapshot(BaseModel):
     restart_required: bool = False
     editable: bool = True
     blocked_reason: str | None = None
+
+
+class StorageLayoutSnapshot(StorageLayoutStatus):
     project_library_bytes: int = Field(default=0, ge=0)
     project_library_free_bytes: int = Field(default=0, ge=0)
     cache_bytes: int = Field(default=0, ge=0)
@@ -458,6 +461,20 @@ class StorageLayoutManager:
         project_root = self.project_library_root
         cache_root = self.cache_root
         return StorageLayoutSnapshot(
+            **self.status(
+                editable=editable,
+                blocked_reason=blocked_reason,
+            ).model_dump(),
+            project_library_bytes=_tree_size(project_root),
+            project_library_free_bytes=shutil.disk_usage(project_root).free,
+            cache_bytes=_tree_size(cache_root),
+            cache_free_bytes=shutil.disk_usage(cache_root).free,
+        )
+
+    def status(
+        self, *, editable: bool = True, blocked_reason: str | None = None
+    ) -> StorageLayoutStatus:
+        return StorageLayoutStatus(
             project_library_root=self._preference.project_library_root,
             project_library_id=self._preference.project_library_id,
             cache_root=self._preference.cache_root,
@@ -469,10 +486,6 @@ class StorageLayoutManager:
                 if self._restart_required
                 else None if editable else blocked_reason
             ),
-            project_library_bytes=_tree_size(project_root),
-            project_library_free_bytes=shutil.disk_usage(project_root).free,
-            cache_bytes=_tree_size(cache_root),
-            cache_free_bytes=shutil.disk_usage(cache_root).free,
         )
 
     @staticmethod
@@ -861,4 +874,5 @@ __all__ = [
     "StorageKind",
     "StorageLayoutManager",
     "StorageLayoutSnapshot",
+    "StorageLayoutStatus",
 ]

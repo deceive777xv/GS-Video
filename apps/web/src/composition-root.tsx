@@ -11,7 +11,7 @@ import {
 } from 'react'
 
 import type { BackendClient } from './api/backend-client'
-import { HttpBackendClient } from './api/http-backend-client'
+import { BackendClientError, HttpBackendClient } from './api/http-backend-client'
 import { WebSocketTaskEventSource } from './api/task-events'
 import type { BootstrapDto, SessionConfig } from './api/types'
 import { App } from './app/app'
@@ -26,6 +26,30 @@ const defaultClientFactory: BackendClientFactory = (session) =>
 
 const BackendClientContext = createContext<BackendClient | null>(null)
 const PlatformBridgeContext = createContext<PlatformBridge | null>(null)
+
+interface ConnectionFailure {
+  message: string
+  code: string | null
+}
+
+function connectionFailure(error: unknown): ConnectionFailure {
+  if (error instanceof BackendClientError) {
+    return { message: error.message, code: error.code }
+  }
+  return {
+    message: '无法连接。请确认本地服务正在运行，端口与一次性令牌仍然有效。',
+    code: null,
+  }
+}
+
+function ConnectionError({ failure }: { failure: ConnectionFailure }): ReactElement {
+  return (
+    <p className="connection-error" role="alert">
+      {failure.message}
+      {failure.code === null ? null : <><br /><code>{failure.code}</code></>}
+    </p>
+  )
+}
 
 export function useBackendClient(): BackendClient {
   const client = useContext(BackendClientContext)
@@ -94,7 +118,7 @@ export function BrowserCompositionRoot({
     eventSource: WebSocketTaskEventSource
   } | null>(null)
   const [connecting, setConnecting] = useState(false)
-  const [failed, setFailed] = useState(false)
+  const [failure, setFailure] = useState<ConnectionFailure | null>(null)
   const portInput = useRef<HTMLInputElement>(null)
   const tokenInput = useRef<HTMLInputElement>(null)
 
@@ -102,11 +126,11 @@ export function BrowserCompositionRoot({
     event.preventDefault()
     const portNumber = Number(port)
     if (!Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65_535) {
-      setFailed(true)
+      setFailure(connectionFailure(new Error('invalid port')))
       return
     }
     setConnecting(true)
-    setFailed(false)
+    setFailure(null)
     const candidate = createClient({
       origin: `http://127.0.0.1:${String(portNumber)}`,
       token,
@@ -126,8 +150,8 @@ export function BrowserCompositionRoot({
         bootstrap: initialBootstrap,
         eventSource: new WebSocketTaskEventSource(session),
       })
-    } catch {
-      setFailed(true)
+    } catch (error) {
+      setFailure(connectionFailure(error))
     } finally {
       setConnecting(false)
     }
@@ -184,7 +208,7 @@ export function BrowserCompositionRoot({
         <button disabled={connecting || token.length === 0} type="submit">
           {connecting ? 'Connecting…' : 'Connect'}
         </button>
-        {failed ? <p className="connection-error" role="alert">无法连接。请确认本地服务正在运行，端口与一次性令牌仍然有效。</p> : null}
+        {failure === null ? null : <ConnectionError failure={failure} />}
         <p className="connection-footnote">仅允许连接 127.0.0.1；不会把令牌写入浏览器存储。</p>
       </form>
     </main>
@@ -205,6 +229,7 @@ export function TauriCompositionRoot({
   const [connection, setConnection] = useState<'connecting' | 'ready' | 'failed'>(
     'connecting',
   )
+  const [failure, setFailure] = useState<ConnectionFailure | null>(null)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -214,14 +239,17 @@ export function TauriCompositionRoot({
         setInitialBootstrap(value)
         setConnection('ready')
       })
-      .catch(() => {
-        if (!controller.signal.aborted) setConnection('failed')
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setFailure(connectionFailure(error))
+          setConnection('failed')
+        }
       })
     return () => controller.abort()
   }, [client])
 
   if (connection === 'failed') {
-    return <p role="alert">Desktop local service unavailable.</p>
+    return <ConnectionError failure={failure ?? connectionFailure(undefined)} />
   }
   if (connection === 'connecting' || initialBootstrap === null) return <p>Connecting to local service…</p>
   return (

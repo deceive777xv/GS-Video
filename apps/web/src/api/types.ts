@@ -188,7 +188,7 @@ export type VramBudgetUpdate =
   | { mode: 'standard'; selected_vram_mb: null }
   | { mode: 'custom'; selected_vram_mb: number }
 
-export interface StorageLayoutDto {
+export interface StorageLayoutStatusDto {
   project_library_root: string
   project_library_id: string
   cache_root: string
@@ -196,6 +196,9 @@ export interface StorageLayoutDto {
   restart_required: boolean
   editable: boolean
   blocked_reason: string | null
+}
+
+export interface StorageLayoutDto extends StorageLayoutStatusDto {
   project_library_bytes: number
   project_library_free_bytes: number
   cache_bytes: number
@@ -232,7 +235,7 @@ export interface BootstrapDto {
   asset_counts?: Partial<Record<LibraryAssetKind, number>>
   environment: EnvironmentDto
   vram_budget: VramBudgetDto
-  storage_layout?: StorageLayoutDto | null
+  storage_layout?: StorageLayoutStatusDto | null
 }
 
 export type LibraryAssetKind = 'video' | 'ply'

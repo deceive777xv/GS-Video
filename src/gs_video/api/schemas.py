@@ -24,7 +24,7 @@ from gs_video.storage.layout import (
     CacheAction,
     CacheCleanupMode,
     ProjectLibraryAction,
-    StorageLayoutSnapshot,
+    StorageLayoutStatus,
 )
 
 
@@ -113,7 +113,7 @@ class BootstrapResponse(StrictModel):
     asset_counts: dict[LibraryAssetKind, int] = Field(default_factory=dict)
     environment: EnvironmentReport
     vram_budget: VramBudgetSnapshot
-    storage_layout: StorageLayoutSnapshot | None = None
+    storage_layout: StorageLayoutStatus | None = None
 
 
 class VramBudgetUpdate(StrictModel):

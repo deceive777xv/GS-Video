@@ -21,7 +21,12 @@ TOKEN = "storage-layout-test-token"
 
 class DoctorFake:
     def check(self) -> EnvironmentReport:
-        return EnvironmentReport(ready=True, vram_mb=8192, vram_limit_mb=8192)
+        return EnvironmentReport(
+            ready=True,
+            vram_mb=8192,
+            vram_limit_mb=8192,
+            issues=[],
+        )
 
 
 class RunnerFake:
@@ -124,6 +129,33 @@ def test_storage_layout_endpoint_switches_roots_and_requires_restart(
     assert blocked.status_code == 409
     assert blocked.json()["code"] == "storage_restart_required"
     assert still_readable.status_code == 200
+
+
+def test_bootstrap_returns_storage_status_without_measuring_usage(
+    storage_client: tuple[TestClient, StorageLayoutManager, PreviewFake, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, layout, _preview, _root = storage_client
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+
+    def reject_measurement(**_kwargs: object) -> object:
+        raise AssertionError("bootstrap must not measure storage usage")
+
+    monkeypatch.setattr(layout, "snapshot", reject_measurement)
+
+    response = client.get("/api/v1/bootstrap", headers=headers)
+
+    assert response.status_code == 200
+    storage = response.json()["storage_layout"]
+    assert storage == {
+        "project_library_root": str(layout.project_library_root),
+        "project_library_id": layout.status().project_library_id,
+        "cache_root": str(layout.cache_root),
+        "cache_id": layout.status().cache_id,
+        "restart_required": False,
+        "editable": True,
+        "blocked_reason": None,
+    }
 
 
 def test_storage_layout_endpoint_rejects_overlapping_roots(

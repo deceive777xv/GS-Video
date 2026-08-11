@@ -25,6 +25,7 @@ import type {
   SubjectMediaDto,
   SubjectMediaRole,
   EnvironmentRepairSnapshotDto,
+  EnvironmentDto,
   VramBudgetDto,
   VramBudgetUpdate,
   StorageLayoutDto,
@@ -35,6 +36,7 @@ import type {
 
 const API_PREFIX = '/api/v1'
 const DEFAULT_TIMEOUT_MS = 15_000
+const BOOTSTRAP_TIMEOUT_MS = 30_000
 
 export class BackendClientError extends Error {
   readonly status: number
@@ -63,6 +65,7 @@ interface RequestOptions {
   body?: BodyInit
   signal?: AbortSignal
   response?: 'json' | 'blob'
+  timeoutMs?: number
 }
 
 export function normalizeLocalApiOrigin(value: string): string {
@@ -135,7 +138,7 @@ export class HttpBackendClient implements BackendClient {
     const timeout = setTimeout(() => {
       timedOut = true
       controller.abort()
-    }, this.#timeoutMs)
+    }, options.timeoutMs ?? this.#timeoutMs)
 
     const headers = new Headers({
       Accept: 'application/json',
@@ -192,9 +195,14 @@ export class HttpBackendClient implements BackendClient {
   }
 
   bootstrap(signal?: AbortSignal): Promise<BootstrapDto> {
-    return signal === undefined
-      ? this.#request('/bootstrap')
-      : this.#request('/bootstrap', { signal })
+    return this.#request('/bootstrap', {
+      ...(signal === undefined ? {} : { signal }),
+      timeoutMs: Math.max(this.#timeoutMs, BOOTSTRAP_TIMEOUT_MS),
+    })
+  }
+
+  refreshEnvironment(): Promise<EnvironmentDto> {
+    return this.#request('/runtime/environment/refresh', { method: 'POST' })
   }
 
   getVramBudget(): Promise<VramBudgetDto> {

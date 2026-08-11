@@ -22,6 +22,7 @@ import type {
   SubjectMediaDto,
   SubjectMediaRole,
   EnvironmentRepairSnapshotDto,
+  EnvironmentDto,
   VramBudgetDto,
   VramBudgetUpdate,
   StorageLayoutDto,
@@ -32,6 +33,7 @@ import type {
 
 export interface BackendClient {
   bootstrap(signal?: AbortSignal): Promise<BootstrapDto>
+  refreshEnvironment(): Promise<EnvironmentDto>
   getVramBudget(): Promise<VramBudgetDto>
   updateVramBudget(input: VramBudgetUpdate): Promise<VramBudgetDto>
   getStorageLayout(): Promise<StorageLayoutDto>

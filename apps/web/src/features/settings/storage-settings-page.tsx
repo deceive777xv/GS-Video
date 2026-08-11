@@ -1,15 +1,19 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import type { BackendClient } from '../../api/backend-client'
-import type { StorageLayoutDto, StorageLayoutUpdate } from '../../api/types'
+import type {
+  StorageLayoutDto,
+  StorageLayoutStatusDto,
+  StorageLayoutUpdate,
+} from '../../api/types'
 import type { PlatformBridge } from '../../platform/platform-bridge'
 
 interface StorageSettingsPageProps {
   backend: BackendClient
   busy: boolean
-  initial: StorageLayoutDto
+  initial: StorageLayoutStatusDto
   platform: PlatformBridge
-  onChange(value: StorageLayoutDto): void
+  onChange(value: StorageLayoutStatusDto): void
   onError(value: unknown): void
 }
 
@@ -26,7 +30,7 @@ export function StorageSettingsPage({
   onChange,
   onError,
 }: StorageSettingsPageProps) {
-  const [layout, setLayout] = useState(initial)
+  const [layout, setLayout] = useState<StorageLayoutDto | null>(null)
   const [projectRoot, setProjectRoot] = useState(initial.project_library_root)
   const [cacheRoot, setCacheRoot] = useState(initial.cache_root)
   const [projectAction, setProjectAction] = useState<StorageLayoutUpdate['project_action']>('migrate')
@@ -34,12 +38,45 @@ export function StorageSettingsPage({
   const [saving, setSaving] = useState(false)
   const [cleaning, setCleaning] = useState(false)
   const [cleanupMessage, setCleanupMessage] = useState<string | null>(null)
+  const [measurementFailed, setMeasurementFailed] = useState(false)
+  const measurement = useRef<{
+    key: string
+    request: Promise<StorageLayoutDto>
+  } | null>(null)
 
   useEffect(() => {
-    setLayout(initial)
+    const key = `${initial.project_library_id}:${initial.cache_id}:${String(initial.restart_required)}`
+    if (measurement.current?.key !== key) {
+      measurement.current = { key, request: backend.getStorageLayout() }
+    }
+    const request = measurement.current.request
+    let active = true
+    setLayout(null)
+    setMeasurementFailed(false)
     setProjectRoot(initial.project_library_root)
     setCacheRoot(initial.cache_root)
-  }, [initial])
+    void request.then((next) => {
+      if (active) setLayout(next)
+    }).catch((error: unknown) => {
+      if (!active) return
+      setMeasurementFailed(true)
+      onError(error)
+    })
+    return () => {
+      active = false
+    }
+  }, [backend, initial.cache_id, initial.cache_root, initial.project_library_id, initial.project_library_root, initial.restart_required, onError])
+
+  const retryMeasurement = (): void => {
+    const key = `${initial.project_library_id}:${initial.cache_id}:${String(initial.restart_required)}`
+    const request = backend.getStorageLayout()
+    measurement.current = { key, request }
+    setMeasurementFailed(false)
+    void request.then(setLayout).catch((error: unknown) => {
+      setMeasurementFailed(true)
+      onError(error)
+    })
+  }
 
   const choose = async (kind: 'project' | 'cache'): Promise<void> => {
     if (platform.pickDirectory === undefined) return
@@ -88,7 +125,10 @@ export function StorageSettingsPage({
   }
 
   const desktop = platform.kind === 'tauri' && platform.pickDirectory !== undefined
-  const disabled = busy || saving || cleaning || !layout.editable || !desktop
+  const status = layout ?? initial
+  const disabled = busy || saving || cleaning || !status.editable || !desktop
+  const capacity = (value: number | undefined): string =>
+    value === undefined ? '正在统计…' : formatBytes(value)
 
   return (
     <main className="hub-main storage-settings-main">
@@ -111,7 +151,7 @@ export function StorageSettingsPage({
             <label><input checked={projectAction === 'migrate'} name="project-action" onChange={() => setProjectAction('migrate')} type="radio" />迁移当前项目库</label>
             <label><input checked={projectAction === 'open_existing'} name="project-action" onChange={() => setProjectAction('open_existing')} type="radio" />打开已有项目库</label>
           </fieldset>
-          <dl className="storage-capacity"><div><dt>已占用</dt><dd>{formatBytes(layout.project_library_bytes)}</dd></div><div><dt>磁盘剩余</dt><dd>{formatBytes(layout.project_library_free_bytes)}</dd></div></dl>
+          <dl className="storage-capacity"><div><dt>已占用</dt><dd>{capacity(layout?.project_library_bytes)}</dd></div><div><dt>磁盘剩余</dt><dd>{capacity(layout?.project_library_free_bytes)}</dd></div></dl>
         </article>
 
         <article className="storage-root-card">
@@ -126,17 +166,18 @@ export function StorageSettingsPage({
             <label><input checked={cacheAction === 'start_fresh'} name="cache-action" onChange={() => setCacheAction('start_fresh')} type="radio" />使用全新缓存</label>
             <label><input checked={cacheAction === 'migrate'} name="cache-action" onChange={() => setCacheAction('migrate')} type="radio" />迁移当前缓存</label>
           </fieldset>
-          <dl className="storage-capacity"><div><dt>缓存占用</dt><dd>{formatBytes(layout.cache_bytes)}</dd></div><div><dt>磁盘剩余</dt><dd>{formatBytes(layout.cache_free_bytes)}</dd></div></dl>
+          <dl className="storage-capacity"><div><dt>缓存占用</dt><dd>{capacity(layout?.cache_bytes)}</dd></div><div><dt>磁盘剩余</dt><dd>{capacity(layout?.cache_free_bytes)}</dd></div></dl>
           <div className="storage-cleanup-actions">
-            <button className="button-secondary" disabled={busy || cleaning || layout.restart_required} onClick={() => void cleanup('safe')} type="button">安全清理</button>
-            <button className="button-danger" disabled={busy || cleaning || layout.restart_required} onClick={() => void cleanup('deep')} type="button">深度清理</button>
+            <button className="button-secondary" disabled={busy || cleaning || status.restart_required || layout === null} onClick={() => void cleanup('safe')} type="button">安全清理</button>
+            <button className="button-danger" disabled={busy || cleaning || status.restart_required || layout === null} onClick={() => void cleanup('deep')} type="button">深度清理</button>
           </div>
           {cleanupMessage === null ? null : <p className="storage-cleanup-result" role="status">{cleanupMessage}</p>}
+          {measurementFailed ? <p className="storage-cleanup-result" role="alert">容量统计失败。<button className="button-secondary" onClick={retryMeasurement} type="button">重试容量统计</button></p> : null}
         </article>
       </section>
 
       {!desktop ? <p className="storage-settings-notice">浏览器模式只能查看当前目录；请在桌面应用中使用原生目录选择器修改。</p> : null}
-      {layout.restart_required ? (
+      {status.restart_required ? (
         <div className="storage-restart-card" role="status">
           <div><strong>新目录已经提交</strong><p>重启后应用只会装配新的项目库与缓存目录。</p></div>
           <button disabled={platform.restartApp === undefined} onClick={() => void platform.restartApp?.()} type="button">重启应用</button>
@@ -144,7 +185,7 @@ export function StorageSettingsPage({
       ) : (
         <div className="storage-settings-actions">
           <small>仅支持本机固定磁盘上的普通目录；项目库与缓存目录不能互相包含。</small>
-          <button disabled={disabled || (projectRoot === layout.project_library_root && cacheRoot === layout.cache_root)} onClick={() => void save()} type="button">应用目录设置</button>
+          <button disabled={disabled || (projectRoot === status.project_library_root && cacheRoot === status.cache_root)} onClick={() => void save()} type="button">应用目录设置</button>
         </div>
       )}
     </main>

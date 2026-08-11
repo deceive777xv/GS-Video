@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import gs_video.storage.layout as storage_layout_module
 from gs_video.storage.layout import (
     CacheAction,
     CacheCleanupMode,
@@ -104,6 +105,24 @@ def test_layout_rejects_non_fixed_drive(tmp_path: Path) -> None:
             tmp_path / "settings.json",
             drive_type_probe=lambda _path: 2,
         )
+
+
+def test_storage_status_does_not_measure_storage_trees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout = manager(tmp_path / "data", tmp_path / "settings.json")
+
+    def reject_measurement(_root: Path) -> int:
+        raise AssertionError("status must not recursively measure storage")
+
+    monkeypatch.setattr(storage_layout_module, "_tree_size", reject_measurement)
+
+    status = layout.status(editable=False, blocked_reason="runtime_busy")
+
+    assert status.project_library_root == str(layout.project_library_root)
+    assert status.cache_root == str(layout.cache_root)
+    assert status.editable is False
+    assert status.blocked_reason == "runtime_busy"
 
 
 def test_layout_switch_rejects_overlapping_roots(tmp_path: Path) -> None:

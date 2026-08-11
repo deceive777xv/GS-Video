@@ -24,6 +24,7 @@ const task = (revision = 9): TaskDto => ({
 
 const fakeBackendClient = (currentTask = task()): BackendClient => ({
   bootstrap: vi.fn(),
+  refreshEnvironment: vi.fn(),
   getVramBudget: vi.fn(),
   updateVramBudget: vi.fn(),
   getStorageLayout: vi.fn(),
@@ -190,6 +191,33 @@ describe('HttpBackendClient', () => {
     }))
   })
 
+  it('explicitly refreshes the cached environment report', async () => {
+    const environment = {
+      ready: true,
+      vram_mb: 8192,
+      vram_limit_mb: 8192,
+      issues: [],
+      renderer_versions: { renderer: 'fake' },
+    }
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(environment), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152',
+      token: 'secret',
+      fetchImpl,
+    })
+
+    await expect(client.refreshEnvironment()).resolves.toEqual(environment)
+
+    const [url, init] = fetchImpl.mock.calls[0] ?? []
+    expect(url).toBe('http://127.0.0.1:49152/api/v1/runtime/environment/refresh')
+    expect(init?.method).toBe('POST')
+  })
+
   it('uses the versioned endpoint and keeps the bearer token out of the URL', async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(JSON.stringify(task()), {
@@ -279,7 +307,7 @@ describe('HttpBackendClient', () => {
       fetchImpl,
     })
 
-    const request = client.bootstrap()
+    const request = client.getTask('t1')
     const rejection = expect(request).rejects.toMatchObject({
       status: 0,
       code: 'request_timeout',
@@ -288,6 +316,32 @@ describe('HttpBackendClient', () => {
     })
     await vi.advanceTimersByTimeAsync(25)
 
+    await rejection
+  })
+
+  it('gives bootstrap a 30 second safety window without extending other requests', async () => {
+    vi.useFakeTimers()
+    let requestSignal: AbortSignal | undefined
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation((_url, init) => {
+      requestSignal = init?.signal ?? undefined
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+          once: true,
+        })
+      })
+    })
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152',
+      token: 'secret',
+      fetchImpl,
+    })
+
+    const request = client.bootstrap()
+    const rejection = expect(request).rejects.toMatchObject({ code: 'request_timeout' })
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(requestSignal?.aborted).toBe(false)
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(requestSignal?.aborted).toBe(true)
     await rejection
   })
 

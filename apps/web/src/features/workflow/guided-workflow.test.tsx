@@ -124,6 +124,7 @@ function createHarness(initial = project()) {
   })
   const client: BackendClient = {
     bootstrap: vi.fn(async () => bootstrap(current)),
+    refreshEnvironment: vi.fn().mockResolvedValue(bootstrap(current).environment),
     getVramBudget: vi.fn().mockResolvedValue(bootstrap(current).vram_budget),
     updateVramBudget: vi.fn(async (input) => ({
       ...bootstrap(current).vram_budget,
@@ -589,6 +590,37 @@ describe('guided workflow', () => {
     }, { timeout: 250 })
     expect(await screen.findByRole('heading', { name: '导入素材' })).toBeInTheDocument()
     expect(harness.client.activateProject).not.toHaveBeenCalled()
+  })
+
+  it('refreshes only the environment report after a repair succeeds', async () => {
+    const current = project()
+    const harness = createHarness(current)
+    vi.mocked(harness.client.getEnvironmentRepair).mockResolvedValue({
+      state: 'succeeded',
+      job_id: 'repair-1',
+      step: null,
+      resource_id: null,
+      resource_name: null,
+      progress: 1,
+      downloaded_bytes: 0,
+      total_bytes: null,
+      message: null,
+      resume_available: false,
+      restart_required: false,
+      error: null,
+      environment: null,
+    })
+
+    render(
+      <App
+        backend={harness.client}
+        initialBootstrap={bootstrap(current)}
+        platform={harness.platform}
+      />,
+    )
+
+    await waitFor(() => expect(harness.client.refreshEnvironment).toHaveBeenCalledOnce())
+    expect(harness.client.bootstrap).not.toHaveBeenCalled()
   })
 
   it('waits only for target activation before opening another project', async () => {

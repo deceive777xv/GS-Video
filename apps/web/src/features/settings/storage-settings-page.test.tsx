@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { expect, it, vi } from 'vitest'
 
 import type { BackendClient } from '../../api/backend-client'
-import type { StorageLayoutDto } from '../../api/types'
+import type { StorageLayoutDto, StorageLayoutStatusDto } from '../../api/types'
 import type { PlatformBridge } from '../../platform/platform-bridge'
 import { StorageSettingsPage } from './storage-settings-page'
 
@@ -21,6 +21,68 @@ const initial: StorageLayoutDto = {
   cache_free_bytes: 2 * 1024 ** 3,
 }
 
+const statusOnly: StorageLayoutStatusDto = {
+  project_library_root: initial.project_library_root,
+  project_library_id: initial.project_library_id,
+  cache_root: initial.cache_root,
+  cache_id: initial.cache_id,
+  restart_required: false,
+  editable: true,
+  blocked_reason: null,
+}
+
+it('loads measured storage usage after the settings page opens', async () => {
+  const measured: StorageLayoutDto = {
+    ...initial,
+    project_library_bytes: 3 * 1024 ** 3,
+    cache_bytes: 4 * 1024 ** 3,
+  }
+  const getStorageLayout = vi.fn().mockResolvedValue(measured)
+
+  render(
+    <StorageSettingsPage
+      backend={{ getStorageLayout } as unknown as BackendClient}
+      busy={false}
+      initial={statusOnly}
+      onChange={vi.fn()}
+      onError={vi.fn()}
+      platform={{ kind: 'browser' } as PlatformBridge}
+    />,
+  )
+
+  expect(getStorageLayout).toHaveBeenCalledOnce()
+  expect(screen.getAllByText('正在统计…')).toHaveLength(4)
+  expect(await screen.findByText('3.0 GB')).toBeInTheDocument()
+  expect(screen.getByText('4.0 GB')).toBeInTheDocument()
+})
+
+it('keeps a failed measurement on settings and retries it', async () => {
+  const user = userEvent.setup()
+  const failure = new Error('measurement failed')
+  const getStorageLayout = vi.fn()
+    .mockRejectedValueOnce(failure)
+    .mockResolvedValueOnce({ ...initial, cache_bytes: 5 * 1024 ** 3 })
+  const onError = vi.fn()
+
+  render(
+    <StorageSettingsPage
+      backend={{ getStorageLayout } as unknown as BackendClient}
+      busy={false}
+      initial={statusOnly}
+      onChange={vi.fn()}
+      onError={onError}
+      platform={{ kind: 'browser' } as PlatformBridge}
+    />,
+  )
+
+  expect(await screen.findByText('容量统计失败。')).toBeInTheDocument()
+  expect(onError).toHaveBeenCalledWith(failure)
+  await user.click(screen.getByRole('button', { name: '重试容量统计' }))
+
+  expect(getStorageLayout).toHaveBeenCalledTimes(2)
+  expect(await screen.findByText('5.0 GB')).toBeInTheDocument()
+})
+
 it('chooses both desktop directories, saves, and offers restart', async () => {
   const user = userEvent.setup()
   const updated: StorageLayoutDto = {
@@ -32,7 +94,10 @@ it('chooses both desktop directories, saves, and offers restart', async () => {
     blocked_reason: 'restart_required',
   }
   const updateStorageLayout = vi.fn().mockResolvedValue(updated)
-  const backend = { updateStorageLayout } as unknown as BackendClient
+  const backend = {
+    getStorageLayout: vi.fn().mockResolvedValue(initial),
+    updateStorageLayout,
+  } as unknown as BackendClient
   const pickDirectory = vi.fn()
     .mockResolvedValueOnce('D:\Projects')
     .mockResolvedValueOnce('F:\Cache')
@@ -72,7 +137,7 @@ it('chooses both desktop directories, saves, and offers restart', async () => {
 it('keeps directory changes read-only in browser mode', () => {
   render(
     <StorageSettingsPage
-      backend={{} as BackendClient}
+      backend={{ getStorageLayout: vi.fn().mockResolvedValue(initial) } as unknown as BackendClient}
       busy={false}
       initial={initial}
       onChange={vi.fn()}
@@ -104,7 +169,11 @@ it('executes cleanup only with the confirmed backend plan token', async () => {
 
   render(
     <StorageSettingsPage
-      backend={{ planStorageCacheCleanup, cleanupStorageCache } as unknown as BackendClient}
+      backend={{
+        getStorageLayout: vi.fn().mockResolvedValue(initial),
+        planStorageCacheCleanup,
+        cleanupStorageCache,
+      } as unknown as BackendClient}
       busy={false}
       initial={initial}
       onChange={vi.fn()}
