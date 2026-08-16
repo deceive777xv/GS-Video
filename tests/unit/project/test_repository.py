@@ -47,11 +47,11 @@ def test_repository_round_trips_project(tmp_path: Path) -> None:
 
     assert loaded == project
     assert loaded.project_id == project.project_id
-    assert loaded.schema_version == 5
+    assert loaded.schema_version == 6
     assert (tmp_path / "project.json").exists()
 
 
-def test_repository_load_migrates_v2_pick_authority_and_round_trips_v4(
+def test_repository_load_migrates_v2_then_invalidates_unsafe_legacy_camera_authority(
     tmp_path: Path,
 ) -> None:
     repository = ProjectRepository(tmp_path)
@@ -82,10 +82,10 @@ def test_repository_load_migrates_v2_pick_authority_and_round_trips_v4(
     repository.save(loaded)
     round_tripped = repository.load()
 
-    assert round_tripped.schema_version == 5
-    assert round_tripped.workflow.confirmed_preview_artifact_id == artifact_id
-    assert round_tripped.workflow.foot_point is not None
-    assert round_tripped.workflow.foot_point.preview_artifact_id == artifact_id
+    assert round_tripped.schema_version == 6
+    assert round_tripped.workflow.confirmed_preview_artifact_id is None
+    assert round_tripped.workflow.foot_point is None
+    assert round_tripped.workflow.preview is None
 
 
 @pytest.mark.parametrize(
@@ -160,6 +160,27 @@ def test_repository_round_trips_workflow_authority(tmp_path: Path) -> None:
     loaded = repo.load()
     assert loaded.workflow.subject_prompt == project.workflow.subject_prompt
     assert loaded.workflow.target_camera == project.workflow.target_camera
+
+
+def test_legacy_schema_v6_authority_seeds_monotonic_camera_generation() -> None:
+    raw = Project(name="early schema v6").model_dump(mode="json")
+    raw["workflow"].pop("source_calibration_generation")
+    raw["workflow"]["source_perspective_calibration"] = {
+        "source_asset_id": "source",
+        "ingest_cache_key": "1" * 64,
+        "segment_cache_key": "2" * 64,
+        "anchor_frame_index": 0,
+        "image_width": 640,
+        "image_height": 360,
+        "vertical_fov": 50.0,
+        "horizon_line": [0.0, 1.0, -180.0],
+        "gravity_direction_camera": [0.0, -1.0, 0.0],
+        "revision": 7,
+    }
+
+    loaded = Project.model_validate(raw)
+
+    assert loaded.workflow.source_calibration_generation == 7
 
 
 def test_repository_rejects_cross_project_artifact_authority(tmp_path: Path) -> None:

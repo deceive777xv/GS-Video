@@ -424,17 +424,64 @@ class ProductionHarness:
             )
             assert prompt.status_code == 200, prompt.json()
 
+            segmented = client.post(
+                "/api/v1/tasks",
+                json={"target_stage": "segment"},
+                headers=headers,
+            )
+            assert segmented.status_code == 202
+            assert _wait_for_task(client, segmented.json()["id"], headers)[
+                "status"
+            ] == "succeeded"
+            solved_source = client.post(
+                "/api/v1/tasks",
+                json={"target_stage": "solve_camera"},
+                headers=headers,
+            )
+            assert solved_source.status_code == 202
+            assert _wait_for_task(client, solved_source.json()["id"], headers)[
+                "status"
+            ] == "succeeded"
+            authoritative = client.get(
+                "/api/v1/projects/current", headers=headers
+            ).json()
+            calibrated = client.put(
+                "/api/v1/projects/current/source-perspective",
+                json={
+                    "expected_project_id": project.project_id,
+                    "expected_segment_cache_key": authoritative["stages"]["segment"][
+                        "cache_key"
+                    ],
+                    "anchor_frame_index": 0,
+                    "image_width": 4,
+                    "image_height": 3,
+                    "vertical_fov": 60.0,
+                    "horizon_start": [0.0, 1.5],
+                    "horizon_end": [4.0, 1.5],
+                    "vertical_bottom": [2.0, 2.0],
+                    "vertical_top": [2.0, 0.0],
+                },
+                headers=headers,
+            )
+            assert calibrated.status_code == 200, calibrated.text
+            calibration = calibrated.json()["workflow"][
+                "source_perspective_calibration"
+            ]
+
             preview = client.post(
                 "/api/v1/projects/current/preview",
                 json={
+                    "expected_project_id": project.project_id,
                     "generation": 1,
                     "width": 16,
                     "height": 9,
                     "camera": {
-                        "target": [0.0, 0.0, 0.0],
-                        "distance": 4.0,
-                        "yaw": 0.0,
-                        "pitch": 0.0,
+                        "camera_to_world": [
+                            [1.0, 0.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0, -2.0],
+                            [0.0, 0.0, 1.0, -5.0],
+                            [0.0, 0.0, 0.0, 1.0],
+                        ],
                         "fov_y_degrees": 60.0,
                     },
                 },
@@ -444,24 +491,54 @@ class ProductionHarness:
             preview_descriptor = preview.json()
             confirmed = client.post(
                 "/api/v1/projects/current/camera/confirm",
-                json={"camera_revision": preview_descriptor["camera_revision"]},
+                json={
+                    "expected_project_id": project.project_id,
+                    "camera_revision": preview_descriptor["camera_revision"],
+                },
                 headers=headers,
             )
             assert confirmed.status_code == 200
-            picked = client.post(
-                "/api/v1/projects/current/pick",
+            anchored = client.put(
+                "/api/v1/projects/current/local-ground",
                 json={
-                    "x": 8,
-                    "y": 4,
+                    "expected_project_id": project.project_id,
                     "preview_artifact_id": preview_descriptor["artifact_id"],
                     "camera_revision": preview_descriptor["camera_revision"],
                     "pick_buffer_revision": preview_descriptor[
                         "pick_buffer_revision"
                     ],
+                    "points": [[4, 7], [11, 7], [8, 5]],
+                    "flip_normal": False,
                 },
                 headers=headers,
             )
-            assert picked.status_code == 200
+            assert anchored.status_code == 200, anchored.text
+            ground = anchored.json()["workflow"]["local_ground_anchor"]
+            placed = client.put(
+                "/api/v1/projects/current/synthesis-placement",
+                json={
+                    "expected_project_id": project.project_id,
+                    "source_calibration_revision": calibration["revision"],
+                    "ground_anchor_revision": ground["revision"],
+                    "mode": "perspective",
+                    "scene_azimuth": 0.0,
+                    "subject_to_scene_scale": 1.0,
+                    "composition_offset_local": [0.0, 0.0],
+                    "foot_pixel": None,
+                },
+                headers=headers,
+            )
+            assert placed.status_code == 200, placed.text
+            placement = placed.json()["workflow"]["synthesis_placement"]
+            placement_confirmed = client.post(
+                "/api/v1/projects/current/synthesis-placement/confirm",
+                json={
+                    "expected_project_id": project.project_id,
+                    "placement_revision": placement["revision"],
+                },
+                headers=headers,
+            )
+            assert placement_confirmed.status_code == 200
 
             exported = client.post(
                 "/api/v1/tasks",

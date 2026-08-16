@@ -32,6 +32,10 @@ import type {
   StorageLayoutUpdate,
   CacheCleanupResultDto,
   CacheCleanupPlanDto,
+  SourcePerspectiveCalibrationInput,
+  SourceContactConfirmationInput,
+  LocalGroundAnchorInput,
+  SynthesisPlacementInput,
 } from './types'
 
 const API_PREFIX = '/api/v1'
@@ -368,10 +372,10 @@ export class HttpBackendClient implements BackendClient {
     })
   }
 
-  confirmCamera(cameraRevision: number): Promise<ProjectDto> {
+  confirmCamera(expectedProjectId: string, cameraRevision: number): Promise<ProjectDto> {
     return this.#request('/projects/current/camera/confirm', {
       method: 'POST',
-      json: { camera_revision: cameraRevision },
+      json: { expected_project_id: expectedProjectId, camera_revision: cameraRevision },
     })
   }
 
@@ -410,9 +414,10 @@ export class HttpBackendClient implements BackendClient {
     )
   }
 
-  getSubjectMedia(role: SubjectMediaRole): Promise<SubjectMediaDto> {
+  getSubjectMedia(role: SubjectMediaRole, frameIndex?: number): Promise<SubjectMediaDto> {
+    const query = frameIndex === undefined ? '' : `?frame_index=${encodeURIComponent(frameIndex)}`
     return this.#request(
-      `/projects/current/subject-media/${encodeURIComponent(role)}`,
+      `/projects/current/subject-media/${encodeURIComponent(role)}${query}`,
     )
   }
 
@@ -420,13 +425,47 @@ export class HttpBackendClient implements BackendClient {
     role: SubjectMediaRole,
     id: string,
     signal?: AbortSignal,
+    frameIndex?: number,
   ): Promise<Blob> {
     const options: RequestOptions = { response: 'blob' }
     if (signal !== undefined) options.signal = signal
     return this.#request(
-      `/projects/current/subject-media/${encodeURIComponent(role)}/${encodeURIComponent(id)}`,
+      `/projects/current/subject-media/${encodeURIComponent(role)}/${encodeURIComponent(id)}${frameIndex === undefined ? '' : `?frame_index=${encodeURIComponent(frameIndex)}`}`,
       options,
     )
+  }
+
+  calibrateSourcePerspective(input: SourcePerspectiveCalibrationInput): Promise<ProjectDto> {
+    return this.#request('/projects/current/source-perspective', { method: 'PUT', json: input })
+  }
+
+  confirmSourceContact(input: SourceContactConfirmationInput): Promise<ProjectDto> {
+    return this.#request('/projects/current/source-contact', { method: 'PUT', json: input })
+  }
+
+  calibrateLocalGround(input: LocalGroundAnchorInput): Promise<ProjectDto> {
+    return this.#request('/projects/current/local-ground', { method: 'PUT', json: input })
+  }
+
+  solveSynthesisPlacement(input: SynthesisPlacementInput): Promise<ProjectDto> {
+    return this.#request('/projects/current/synthesis-placement', { method: 'PUT', json: input })
+  }
+
+  confirmSynthesisPlacement(expectedProjectId: string, placementRevision: number): Promise<ProjectDto> {
+    return this.#request('/projects/current/synthesis-placement/confirm', {
+      method: 'POST',
+      json: { expected_project_id: expectedProjectId, placement_revision: placementRevision },
+    })
+  }
+
+  scanSubjectVisibility(expectedProjectId: string, expectedSegmentCacheKey: string): Promise<ProjectDto> {
+    return this.#request('/projects/current/visibility-audit', {
+      method: 'POST',
+      json: {
+        expected_project_id: expectedProjectId,
+        expected_segment_cache_key: expectedSegmentCacheKey,
+      },
+    })
   }
 
   startTask(targetStage: StageName, expectedProjectId: string): Promise<TaskDto> {

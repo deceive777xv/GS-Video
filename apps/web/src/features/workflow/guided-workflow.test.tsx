@@ -10,6 +10,7 @@ import type {
   AssetKind,
   AssetListItemDto,
   ProjectDto,
+  Matrix4,
   StageStateDto,
   StageName,
   SubjectMediaDto,
@@ -25,6 +26,7 @@ afterEach(() => {
   window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`)
   sessionStorage.clear()
   vi.useRealTimers()
+  vi.restoreAllMocks()
 })
 
 function stage(status: 'pending' | 'succeeded' = 'pending'): StageStateDto {
@@ -39,7 +41,7 @@ function stage(status: 'pending' | 'succeeded' = 'pending'): StageStateDto {
 
 function project(): ProjectDto {
   return {
-    schema_version: 3,
+    schema_version: 6,
     project_id: 'project-1',
     name: 'Studio replacement',
     created_at: '2026-07-17T00:00:00Z',
@@ -59,10 +61,17 @@ function project(): ProjectDto {
       scene_summary: null,
       subject_prompt: null,
       target_camera: null,
+      exploration_camera: null,
       preview_epoch: 0,
       confirmed_camera_revision: null,
       confirmed_preview_artifact_id: null,
       foot_point: null,
+      subject_visibility_audit: null,
+      source_perspective_calibration: null,
+      local_ground_anchor: null,
+      subject_contact_constraint: null,
+      synthesis_placement: null,
+      confirmed_synthesis_placement_revision: null,
       motion_scale: 1,
       preview_height: 540,
       active_task_id: null,
@@ -70,6 +79,32 @@ function project(): ProjectDto {
       export_result: null,
     },
   }
+}
+
+function authorizeSynthesisPlacement(current: ProjectDto): void {
+  const identity = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, -4], [0, 0, 0, 1]] as Matrix4
+  current.workflow.source_perspective_calibration = {
+    source_asset_id: current.source_video ?? 'source', ingest_cache_key: 'cache',
+    segment_cache_key: 'cache', anchor_frame_index: 0, image_width: 640,
+    image_height: 360, vertical_fov: 50, horizon_line: [0, 1, -180],
+    gravity_direction_camera: [0, -1, 0], revision: 1,
+  }
+  current.workflow.local_ground_anchor = {
+    scene_asset_id: current.scene_ply ?? 'scene', p0_world: [0, 0, 0],
+    p1_world: [1, 0, 0], p2_world: [0, 0, 1], plane_normal: [0, -1, 0],
+    plane_offset: 0, frozen_camera_to_world: identity,
+    frozen_camera_fingerprint: 'fingerprint', preview_artifact_id: 'preview-1',
+    camera_revision: 1, pick_buffer_revision: 1, revision: 1,
+  }
+  current.workflow.synthesis_placement = {
+    source_calibration_revision: 1, ground_anchor_revision: 1, mode: 'perspective',
+    source_contact_revision: null,
+    scene_azimuth: 0, subject_to_scene_scale: 1, composition_offset_local: [0, 0],
+    anchor_camera_to_world: identity,
+    intrinsics: [[500, 0, 320], [0, 500, 180], [0, 0, 1]],
+    solver_cache_key: 'f'.repeat(64), revision: 1,
+  }
+  current.workflow.confirmed_synthesis_placement_revision = 1
 }
 
 function bootstrap(current: ProjectDto): BootstrapDto {
@@ -217,7 +252,13 @@ function createHarness(initial = project()) {
       return structuredClone(current)
     }),
     renderPreview: vi.fn(async (input) => {
-      current.workflow.target_camera = { ...input.camera, revision: input.generation }
+      if ('camera_to_world' in input.camera) {
+        current.workflow.exploration_camera = { ...input.camera, revision: input.generation }
+        current.workflow.target_camera = null
+      } else {
+        current.workflow.target_camera = { ...input.camera, revision: input.generation }
+        current.workflow.exploration_camera = null
+      }
       current.workflow.preview = {
         artifact_id: `preview-${input.generation}`,
         artifact_size: 8,
@@ -251,9 +292,73 @@ function createHarness(initial = project()) {
       current.workflow.foot_point = foot
       return foot
     }),
-    confirmCamera: vi.fn(async (cameraRevision) => {
+    confirmCamera: vi.fn(async (_expectedProjectId, cameraRevision) => {
       current.workflow.confirmed_camera_revision = cameraRevision
       current.workflow.confirmed_preview_artifact_id = current.workflow.preview?.artifact_id ?? null
+      return structuredClone(current)
+    }),
+    scanSubjectVisibility: vi.fn(async () => structuredClone(current)),
+    calibrateSourcePerspective: vi.fn(async (input) => {
+      current.workflow.source_perspective_calibration = {
+        source_asset_id: current.source_video ?? 'source',
+        ingest_cache_key: 'cache', segment_cache_key: 'cache',
+        anchor_frame_index: input.anchor_frame_index,
+        image_width: input.image_width, image_height: input.image_height,
+        vertical_fov: input.vertical_fov,
+        horizon_line: [0, 1, -input.image_height / 2],
+        gravity_direction_camera: [0, -1, 0], revision: 1,
+      }
+      return structuredClone(current)
+    }),
+    confirmSourceContact: vi.fn(async (input) => {
+      const calibration = current.workflow.source_perspective_calibration
+      if (calibration === null) throw new Error('source calibration required')
+      current.workflow.subject_contact_constraint = {
+        source_asset_id: calibration.source_asset_id,
+        ingest_cache_key: calibration.ingest_cache_key,
+        segment_cache_key: calibration.segment_cache_key,
+        source_calibration_revision: input.source_calibration_revision,
+        anchor_frame_index: calibration.anchor_frame_index,
+        foot_pixel: input.foot_pixel,
+        revision: 1,
+      }
+      return structuredClone(current)
+    }),
+    calibrateLocalGround: vi.fn(async (input) => {
+      const identity = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, -4], [0, 0, 0, 1]] as Matrix4
+      current.workflow.local_ground_anchor = {
+        scene_asset_id: current.scene_ply ?? 'scene',
+        p0_world: [0, 0, 0], p1_world: [1, 0, 0], p2_world: [0, 0, 1],
+        plane_normal: [0, -1, 0], plane_offset: 0,
+        frozen_camera_to_world: identity, frozen_camera_fingerprint: 'fingerprint',
+        preview_artifact_id: input.preview_artifact_id,
+        camera_revision: input.camera_revision,
+        pick_buffer_revision: input.pick_buffer_revision,
+        revision: 1,
+      }
+      return structuredClone(current)
+    }),
+    solveSynthesisPlacement: vi.fn(async (input) => {
+      const identity = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, -4], [0, 0, 0, 1]] as Matrix4
+      const nextRevision = (current.workflow.synthesis_placement?.revision ?? 0) + 1
+      current.workflow.synthesis_placement = {
+        source_calibration_revision: input.source_calibration_revision,
+        ground_anchor_revision: input.ground_anchor_revision,
+        source_contact_revision: input.mode === 'contact'
+          ? current.workflow.subject_contact_constraint?.revision ?? null
+          : null,
+        mode: input.mode, scene_azimuth: input.scene_azimuth,
+        subject_to_scene_scale: input.subject_to_scene_scale,
+        composition_offset_local: input.composition_offset_local,
+        anchor_camera_to_world: identity,
+        intrinsics: [[500, 0, 320], [0, 500, 180], [0, 0, 1]],
+        solver_cache_key: 'f'.repeat(64), revision: nextRevision,
+      }
+      current.workflow.confirmed_synthesis_placement_revision = null
+      return structuredClone(current)
+    }),
+    confirmSynthesisPlacement: vi.fn(async (_projectId, revision) => {
+      current.workflow.confirmed_synthesis_placement_revision = revision
       return structuredClone(current)
     }),
     getVerifiedExport: vi.fn(async () => ({
@@ -552,9 +657,128 @@ describe('guided workflow', () => {
       />,
     )
 
-    expect(await screen.findByRole('heading', { name: '放置目标镜头' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: '校准透视并放置合成机位' })).toBeInTheDocument()
     expect(harness.client.activateProject).toHaveBeenCalledWith('project-2')
     expect(window.location.hash).toBe('#/projects/project-2/workflow/camera')
+  })
+
+  it('discards a late camera response after an A to B project switch', async () => {
+    const first = project()
+    first.source_video = 'opaque:source-a'
+    first.scene_ply = 'opaque:scene-a'
+    first.workflow.source_summary = {
+      filename: 'a.mp4', size: 10, sha256: 'a', width: 640, height: 360,
+      duration_seconds: 1, fps: '30/1', has_audio: false, frame_count: 30,
+    }
+    first.workflow.scene_summary = {
+      filename: 'a.ply', size: 10, sha256: 'a', gaussian_count: 10,
+      estimated_vram_mb: 64,
+    }
+    first.workflow.subject_prompt = { frame_index: 0, x: 10, y: 10 }
+    first.stages.ingest = stage('succeeded')
+    first.stages.segment = stage('succeeded')
+    first.stages.solve_camera = stage('succeeded')
+    const second = structuredClone(first)
+    second.project_id = 'project-2'
+    second.name = 'Second camera project'
+    second.source_video = 'opaque:source-b'
+    second.scene_ply = 'opaque:scene-b'
+    const initial = bootstrap(first)
+    initial.projects = [first, second].map((item) => ({
+      project_id: item.project_id,
+      name: item.name,
+      created_at: item.created_at,
+      updated_at: item.created_at,
+      workflow_step: 'camera',
+      active_task_id: null,
+    }))
+    const harness = createHarness(first)
+    vi.mocked(harness.client.activateProject).mockResolvedValue(second)
+    let resolveAudit: ((value: ProjectDto) => void) | undefined
+    vi.mocked(harness.client.scanSubjectVisibility).mockImplementation(() => (
+      new Promise<ProjectDto>((resolve) => { resolveAudit = resolve })
+    ))
+    window.location.hash = '#/projects/project-1/workflow/camera'
+    const user = userEvent.setup()
+    render(<App backend={harness.client} initialBootstrap={initial} platform={harness.platform} startAtHome />)
+
+    await user.click(await screen.findByRole('button', { name: '扫描全部 Alpha' }))
+    window.location.hash = '#/projects/project-2/workflow/camera'
+    await waitFor(() => expect(harness.client.activateProject).toHaveBeenCalledWith('project-2'))
+    expect(await screen.findByText(second.name)).toBeVisible()
+
+    const stale = structuredClone(first)
+    stale.workflow.subject_visibility_audit = {
+      source_asset_id: 'opaque:source-a', segment_cache_key: 'cache',
+      fully_visible_ranges: [], bottom_cropped_ranges: [], uncertain_ranges: [],
+      recommended_anchor_frames: [], revision: 1,
+    }
+    await act(async () => { resolveAudit?.(stale) })
+
+    expect(screen.getByText(second.name)).toBeVisible()
+    expect(screen.getByText('尚未扫描全片可见性。')).toBeVisible()
+  })
+
+  it('serializes authoritative mutations across all camera panels', async () => {
+    const ready = project()
+    ready.source_video = 'opaque:source'
+    ready.scene_ply = 'opaque:scene'
+    ready.workflow.source_summary = {
+      filename: 'source.mp4', size: 10, sha256: 'a', width: 640, height: 360,
+      duration_seconds: 1, fps: '30/1', has_audio: false, frame_count: 30,
+    }
+    ready.workflow.scene_summary = {
+      filename: 'scene.ply', size: 10, sha256: 'b', gaussian_count: 10,
+      estimated_vram_mb: 64,
+    }
+    ready.workflow.subject_prompt = { frame_index: 0, x: 10, y: 10 }
+    ready.stages.ingest = stage('succeeded')
+    ready.stages.segment = stage('succeeded')
+    ready.stages.solve_camera = stage('succeeded')
+    const harness = createHarness(ready)
+    vi.mocked(harness.client.scanSubjectVisibility).mockImplementation(() => new Promise<ProjectDto>(() => undefined))
+    window.location.hash = '#/projects/project-1/workflow/camera'
+    const user = userEvent.setup()
+    render(<App backend={harness.client} initialBootstrap={bootstrap(ready)} platform={harness.platform} />)
+
+    await user.click(await screen.findByRole('button', { name: '扫描全部 Alpha' }))
+    const freeze = screen.getByRole('button', { name: '冻结当前探索视角' })
+    expect(freeze).toBeDisabled()
+    fireEvent.click(freeze)
+    expect(harness.client.renderPreview).not.toHaveBeenCalled()
+  })
+
+  it('requires solving again before a changed synthesis draft can be confirmed', async () => {
+    const ready = project()
+    ready.source_video = 'opaque:source'
+    ready.scene_ply = 'opaque:scene'
+    ready.workflow.source_summary = {
+      filename: 'source.mp4', size: 10, sha256: 'a', width: 640, height: 360,
+      duration_seconds: 1, fps: '30/1', has_audio: false, frame_count: 30,
+    }
+    ready.workflow.scene_summary = {
+      filename: 'scene.ply', size: 10, sha256: 'b', gaussian_count: 10,
+      estimated_vram_mb: 64,
+    }
+    ready.workflow.subject_prompt = { frame_index: 0, x: 10, y: 10 }
+    ready.stages.ingest = stage('succeeded')
+    ready.stages.segment = stage('succeeded')
+    ready.stages.solve_camera = stage('succeeded')
+    authorizeSynthesisPlacement(ready)
+    const harness = createHarness(ready)
+    window.location.hash = '#/projects/project-1/workflow/camera'
+    const user = userEvent.setup()
+    render(<App backend={harness.client} initialBootstrap={bootstrap(ready)} platform={harness.platform} />)
+
+    const confirm = await screen.findByRole('button', { name: '确认合成机位' })
+    expect(confirm).toBeEnabled()
+    const azimuth = screen.getByLabelText('场景方位角')
+    await user.clear(azimuth)
+    await user.type(azimuth, '15')
+    expect(confirm).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: '更新受约束合成预览' }))
+    await waitFor(() => expect(confirm).toBeEnabled())
+    expect(harness.client.confirmSynthesisPlacement).not.toHaveBeenCalled()
   })
 
   it('opens the current project without waiting for a bootstrap refresh', async () => {
@@ -709,7 +933,7 @@ describe('guided workflow', () => {
     expect(screen.getByRole('heading', { name: '从一个项目继续，或开始新的合成。' })).toBeInTheDocument()
   })
 
-  it('completes the happy path with exactly three authoritative creative interactions', async () => {
+  it('completes the constrained-camera path with four authoritative creative interactions', async () => {
     const user = userEvent.setup()
     const harness = createHarness()
     render(<App backend={harness.client} platform={harness.platform} />)
@@ -722,17 +946,33 @@ describe('guided workflow', () => {
     await user.type(screen.getByLabelText('人物 X 坐标'), '100')
     await user.type(screen.getByLabelText('人物 Y 坐标'), '120')
     await user.click(screen.getByRole('button', { name: '确认人物位置并开始分割' }))
-    expect(await screen.findByLabelText('创作交互 1 / 3')).toBeInTheDocument()
+    expect(await screen.findByLabelText('创作交互 1 / 4')).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: '下一步' }))
-    const confirmCamera = await screen.findByRole('button', { name: '确认初始机位' })
-    await waitFor(() => expect(confirmCamera).toBeEnabled())
-    await user.click(confirmCamera)
-    expect(await screen.findByLabelText('创作交互 2 / 3')).toBeInTheDocument()
-    await user.type(screen.getByLabelText('落脚点 X 坐标'), '320')
-    await user.type(screen.getByLabelText('落脚点 Y 坐标'), '180')
-    await user.click(screen.getByRole('button', { name: '确认场景落脚点' }))
-    expect(await screen.findByLabelText('创作交互 3 / 3')).toBeInTheDocument()
+    const calibrate = await screen.findByRole('button', { name: '确认源透视校准' })
+    await waitFor(() => expect(calibrate).toBeEnabled())
+    await user.click(calibrate)
+    expect(await screen.findByLabelText('创作交互 2 / 4')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '冻结当前探索视角' }))
+    const confirmFreeze = screen.getByRole('button', { name: '确认冻结视角' })
+    await waitFor(() => expect(confirmFreeze).toBeEnabled())
+    await user.click(confirmFreeze)
+    const viewport = screen.getByLabelText('Gaussian 6DoF 探索视口')
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue({
+      left: 0, top: 0, right: 960, bottom: 540, width: 960, height: 540,
+      x: 0, y: 0, toJSON: () => ({}),
+    })
+    for (const [x, y] of [[220, 400], [700, 400], [460, 280]]) {
+      fireEvent.pointerDown(viewport, { clientX: x, clientY: y })
+      fireEvent.pointerUp(viewport)
+      await user.click(screen.getByRole('button', { name: /确认 P\d 候选/ }))
+    }
+    await user.click(screen.getByRole('button', { name: '确认三点局部地面' }))
+    expect(await screen.findByLabelText('创作交互 3 / 4')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '更新受约束合成预览' }))
+    await user.click(await screen.findByRole('button', { name: '确认合成机位' }))
+    expect(await screen.findByLabelText('创作交互 4 / 4')).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: '下一步' }))
     await user.click(screen.getByRole('button', { name: '生成预览' }))
@@ -781,8 +1021,8 @@ describe('guided workflow', () => {
       />,
     )
 
-    expect(await screen.findByLabelText('创作交互 2 / 3')).toBeInTheDocument()
-    expect(screen.getByRole('heading', { name: '放置目标镜头' })).toBeInTheDocument()
+    expect(await screen.findByLabelText('创作交互 1 / 4')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '校准透视并放置合成机位' })).toBeInTheDocument()
     expect(harness.client.bootstrap).not.toHaveBeenCalled()
   })
 
@@ -1200,7 +1440,7 @@ describe('guided workflow', () => {
     expect(readUploadResume('project-1', 'source_video')).toBeNull()
   })
 
-  it('does not let an older preview refresh overwrite a newer camera confirmation', async () => {
+  it('keeps live 6DoF Roll exploration non-authoritative until the view is frozen', async () => {
     const recovered = project()
     recovered.source_video = 'opaque:source'
     recovered.scene_ply = 'opaque:scene'
@@ -1226,23 +1466,62 @@ describe('guided workflow', () => {
       pick_buffer_revision: 1,
     }
     const harness = createHarness(recovered)
-    const stale = harness.getProject()
-    let resolveRefresh!: (project: ProjectDto) => void
-    vi.mocked(harness.client.getProject).mockImplementationOnce(async () => new Promise<ProjectDto>((resolve) => { resolveRefresh = resolve }))
     const user = userEvent.setup()
     render(<App backend={harness.client} initialBootstrap={bootstrap(recovered)} platform={harness.platform} />)
 
-    const fov = screen.getByRole('slider', { name: '垂直视场角' })
-    await user.click(fov)
-    await user.keyboard('{ArrowRight}')
-    await waitFor(() => expect(harness.client.getProject).toHaveBeenCalledTimes(1))
-    await user.click(screen.getByRole('button', { name: '确认初始机位' }))
-    expect(await screen.findByLabelText('创作交互 2 / 3')).toBeInTheDocument()
-    await act(async () => {
-      resolveRefresh(stale)
-      await Promise.resolve()
+    const roll = screen.getByRole('spinbutton', { name: '探索相机 roll' })
+    await user.clear(roll)
+    await user.type(roll, '12.5')
+    await waitFor(() => expect(harness.client.renderLivePreview).toHaveBeenCalled())
+    const latest = vi.mocked(harness.client.renderLivePreview).mock.calls.at(-1)?.[0]
+    expect(latest?.camera).toHaveProperty('camera_to_world')
+    expect(harness.getProject().workflow.exploration_camera).toBeNull()
+    expect(screen.getByLabelText('创作交互 1 / 4')).toBeInTheDocument()
+  })
+
+  it('keeps contact mode unavailable until the source foot candidate is explicitly confirmed', async () => {
+    const ready = project()
+    ready.source_video = 'opaque:source'
+    ready.scene_ply = 'opaque:scene'
+    ready.workflow.source_summary = {
+      filename: 'portrait.mp4', size: 10, sha256: 's', width: 640, height: 360,
+      duration_seconds: 12, fps: '30/1', has_audio: true, frame_count: 360,
+    }
+    ready.workflow.scene_summary = {
+      filename: 'garden.ply', size: 20, sha256: 'g', gaussian_count: 100,
+      estimated_vram_mb: 128,
+    }
+    ready.workflow.subject_prompt = { frame_index: 0, x: 100, y: 120 }
+    ready.stages.ingest = stage('succeeded')
+    ready.stages.segment = stage('succeeded')
+    ready.stages.solve_camera = stage('succeeded')
+    authorizeSynthesisPlacement(ready)
+    ready.workflow.subject_contact_constraint = null
+    ready.workflow.synthesis_placement = null
+    ready.workflow.confirmed_synthesis_placement_revision = null
+    const harness = createHarness(ready)
+    const user = userEvent.setup()
+
+    render(<App backend={harness.client} initialBootstrap={bootstrap(ready)} platform={harness.platform} />)
+
+    const contactMode = await screen.findByRole('radio', { name: '脚底接触 P0' })
+    expect(contactMode).toBeDisabled()
+    const sourceImage = await screen.findByRole('img', { name: '源透视锚定帧' })
+    const sourceFrame = sourceImage.parentElement
+    expect(sourceFrame).not.toBeNull()
+    vi.spyOn(sourceFrame!, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, left: 0, top: 0, right: 640, bottom: 360,
+      width: 640, height: 360, toJSON: () => ({}),
     })
-    expect(screen.getByLabelText('创作交互 2 / 3')).toBeInTheDocument()
+    fireEvent.pointerDown(sourceFrame!, { clientX: 320, clientY: 300 })
+    await user.click(screen.getByRole('button', { name: '确认脚底候选' }))
+
+    await waitFor(() => expect(harness.client.confirmSourceContact).toHaveBeenCalledWith({
+      expected_project_id: ready.project_id,
+      source_calibration_revision: 1,
+      foot_pixel: [320, 300],
+    }))
+    expect(contactMode).toBeEnabled()
   })
 
   it('disables every task-starting control while any authoritative owner is active', async () => {
@@ -1267,6 +1546,7 @@ describe('guided workflow', () => {
     ready.workflow.confirmed_camera_revision = 1
     ready.workflow.confirmed_preview_artifact_id = 'preview-1'
     ready.workflow.foot_point = { image: [10, 10], world: [0, 0, 0], preview_artifact_id: 'preview-1', camera_revision: 1, pick_buffer_revision: 1 }
+    authorizeSynthesisPlacement(ready)
     ready.workflow.active_task_id = 'task-render'
     const harness = createHarness(ready)
     const active = { id: 'task-render', target_stage: 'render' as const, status: 'running' as const, revision: 4, error: null }
@@ -1343,6 +1623,7 @@ describe('guided workflow', () => {
     ready.workflow.confirmed_camera_revision = 1
     ready.workflow.confirmed_preview_artifact_id = 'preview-1'
     ready.workflow.foot_point = { image: [10, 10], world: [0, 0, 0], preview_artifact_id: 'preview-1', camera_revision: 1, pick_buffer_revision: 1 }
+    authorizeSynthesisPlacement(ready)
     const harness = createHarness(ready)
     vi.mocked(harness.client.startTask).mockImplementation(() => new Promise(() => undefined))
     render(<App backend={harness.client} initialBootstrap={bootstrap(ready)} platform={harness.platform} />)

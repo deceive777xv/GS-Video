@@ -43,7 +43,7 @@ def build_subject_router() -> APIRouter:
         response_model=SubjectMediaResponse,
     )
     async def get_subject_media(
-        request: Request, role: SubjectMediaRole
+        request: Request, role: SubjectMediaRole, frame_index: int | None = None
     ) -> SubjectMediaResponse:
         repository = _repository(request)
         project = _load_project(repository)
@@ -52,6 +52,7 @@ def build_subject_router() -> APIRouter:
             project,
             _artifact_root(request, project, repository),
             role,
+            frame_index,
         )
         return SubjectMediaResponse(
             role=resolved.role,
@@ -67,7 +68,10 @@ def build_subject_router() -> APIRouter:
         "/api/v1/projects/current/subject-media/{role}/{artifact_id}"
     )
     async def get_subject_media_artifact(
-        request: Request, role: SubjectMediaRole, artifact_id: str
+        request: Request,
+        role: SubjectMediaRole,
+        artifact_id: str,
+        frame_index: int | None = None,
     ) -> Response:
         repository = _repository(request)
         project = _load_project(repository)
@@ -76,6 +80,7 @@ def build_subject_router() -> APIRouter:
             project,
             _artifact_root(request, project, repository),
             role,
+            frame_index,
         )
         if resolved.artifact_id != artifact_id:
             raise ApiError(

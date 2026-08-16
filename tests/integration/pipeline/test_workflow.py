@@ -20,13 +20,14 @@ from gs_video.domain.models import (
     ArtifactCategory,
     ArtifactRef,
     ArtifactRole,
-    CameraPose,
-    FootPointState,
-    PreviewState,
+    LocalGroundAnchor,
     Project,
     StageName,
     StageStatus,
     SubjectPromptState,
+    SourcePerspectiveCalibration,
+    SynthesisConstraintMode,
+    SynthesisPlacement,
     VideoSummary,
 )
 from gs_video.media.export import ExportResult
@@ -434,33 +435,7 @@ def test_concrete_cpu_services_progress_through_export_and_persist_artifacts(
         frame_count=2,
     )
     project.workflow.subject_prompt = SubjectPromptState(frame_index=0, x=1, y=1)
-    project.workflow.target_camera = CameraPose(
-        target=(0, 0, 0),
-        distance=4,
-        yaw=0,
-        pitch=0,
-        fov_y_degrees=55,
-        revision=1,
-    )
-    project.workflow.confirmed_camera_revision = 1
-    project.workflow.confirmed_preview_artifact_id = "preview-1"
-    project.workflow.preview = PreviewState(
-        artifact_id="preview-1",
-        artifact_size=10,
-        artifact_sha256="f" * 64,
-        generation=1,
-        width=4,
-        height=3,
-        camera_revision=1,
-        pick_buffer_revision=1,
-    )
-    project.workflow.foot_point = FootPointState(
-        image=(1, 1),
-        world=(0, 0, 0),
-        preview_artifact_id="preview-1",
-        camera_revision=1,
-        pick_buffer_revision=1,
-    )
+    project.scene_ply = "scene/scene.ply"
     paths = WorkflowPaths(tmp_path)
     exporter = _IntegrationExporter()
     services = workflow.WorkflowServices(
@@ -485,6 +460,59 @@ def test_concrete_cpu_services_progress_through_export_and_persist_artifacts(
         ),
     )
     runner = workflow.build_mvp_workflow(services, project)
+
+    segmented = runner.run(StageName.SEGMENT, CancellationToken())
+    assert segmented.status is StageStatus.SUCCEEDED
+    solved = runner.run(StageName.SOLVE_CAMERA, CancellationToken())
+    assert solved.status is StageStatus.SUCCEEDED
+    ingest_key = project.stages[StageName.INGEST].cache_key
+    segment_key = project.stages[StageName.SEGMENT].cache_key
+    assert ingest_key is not None and segment_key is not None
+    camera_to_world = (
+        (1.0, 0.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0, -2.0),
+        (0.0, 0.0, 1.0, -5.0),
+        (0.0, 0.0, 0.0, 1.0),
+    )
+    project.workflow.source_perspective_calibration = SourcePerspectiveCalibration(
+        source_asset_id=project.source_video,
+        ingest_cache_key=ingest_key,
+        segment_cache_key=segment_key,
+        anchor_frame_index=0,
+        image_width=8,
+        image_height=6,
+        vertical_fov=55,
+        horizon_line=(0.0, 1.0, -3.0),
+        gravity_direction_camera=(0.0, -1.0, 0.0),
+        revision=1,
+    )
+    project.workflow.local_ground_anchor = LocalGroundAnchor(
+        scene_asset_id=project.scene_ply,
+        p0_world=(0.0, 0.0, 0.0),
+        p1_world=(1.0, 0.0, 0.0),
+        p2_world=(0.0, 0.0, 1.0),
+        plane_normal=(0.0, -1.0, 0.0),
+        plane_offset=0.0,
+        frozen_camera_to_world=camera_to_world,
+        frozen_camera_fingerprint="integration-ground",
+        preview_artifact_id="preview-1",
+        camera_revision=1,
+        pick_buffer_revision=1,
+        revision=1,
+    )
+    project.workflow.synthesis_placement = SynthesisPlacement(
+        source_calibration_revision=1,
+        ground_anchor_revision=1,
+        mode=SynthesisConstraintMode.PERSPECTIVE,
+        scene_azimuth=0.0,
+        subject_to_scene_scale=1.0,
+        composition_offset_local=(0.0, 0.0),
+        anchor_camera_to_world=camera_to_world,
+        intrinsics=((3.0, 0.0, 4.0), (0.0, 3.0, 3.0), (0.0, 0.0, 1.0)),
+        solver_cache_key="f" * 64,
+        revision=1,
+    )
+    project.workflow.confirmed_synthesis_placement_revision = 1
 
     result = runner.run(StageName.EXPORT, CancellationToken())
 

@@ -371,6 +371,7 @@ def test_shared_scene_preview_uses_cache_workspace_without_project_cache(
     response = catalog_client.post(
         "/api/v1/projects/current/preview/live",
         json={
+            "expected_project_id": project["project_id"],
             "request_id": 1,
             "width": 16,
             "height": 9,

@@ -39,7 +39,7 @@ import './app.css'
 const STEP_LABELS: Record<WorkflowStep, { number: string; title: string; detail: string }> = {
   import: { number: '01', title: '导入', detail: '视频 + PLY' },
   subject: { number: '02', title: '人物', detail: '一次提示' },
-  camera: { number: '03', title: '机位', detail: '镜头 + 落脚点' },
+  camera: { number: '03', title: '机位', detail: '透视 + 局部地面' },
   preview: { number: '04', title: '预览', detail: '运动与合成' },
   export: { number: '05', title: '导出', detail: '验证 MP4' },
 }
@@ -792,6 +792,20 @@ export function App({
     : Math.round(Math.min(1, Math.max(0, authoritativeProgress.progress)) * 100)
   const retryableTask = activeTask?.status === 'failed'
     && progressEvent?.error?.retryable === true
+  const pageAuthority = projectAuthority.current
+  const acceptCameraProject = (nextProject: ProjectDto): void => {
+    if (
+      projectAuthority.current === pageAuthority
+      && activeProjectId.current === project.project_id
+      && nextProject.project_id === project.project_id
+    ) acceptProject(nextProject)
+  }
+  const reportCameraError = (value: unknown): void => {
+    if (
+      projectAuthority.current === pageAuthority
+      && activeProjectId.current === project.project_id
+    ) reportError(value)
+  }
 
   let page: ReactNode
   switch (step) {
@@ -802,7 +816,7 @@ export function App({
       page = <SubjectPage backend={backend} busy={workflowBusy} onError={reportError} onProjectChange={acceptProject} onStartStage={runStage} project={project} />
       break
     case 'camera':
-      page = <CameraPage backend={backend} onError={reportError} onProjectChange={acceptProject} onRefresh={refreshProject} project={project} />
+      page = <CameraPage backend={backend} busy={workflowBusy} onError={reportCameraError} onProjectChange={acceptCameraProject} onRefresh={refreshProject} project={project} />
       break
     case 'preview':
       page = <PreviewPage
@@ -864,10 +878,10 @@ export function App({
               )
             })}
           </ol>
-          <div aria-label={`创作交互 ${interactionCount} / 3`} className="interaction-meter">
-            <div><span>创作交互</span><strong>{interactionCount} / 3</strong></div>
-            <div className="meter-track"><span style={{ width: `${interactionCount / 3 * 100}%` }} /></div>
-            <p>只统计后端已持久化的人物、机位与落脚点。</p>
+          <div aria-label={`创作交互 ${interactionCount} / 4`} className="interaction-meter">
+            <div><span>创作交互</span><strong>{interactionCount} / 4</strong></div>
+            <div className="meter-track"><span style={{ width: `${interactionCount / 4 * 100}%` }} /></div>
+            <p>只统计后端已持久化的人物、源透视、局部地面与合成机位。</p>
           </div>
         </nav>
 

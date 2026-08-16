@@ -31,6 +31,7 @@ def map_relative_poses(
     source_camera_to_world: list[np.ndarray] | tuple[np.ndarray, ...],
     target_start: npt.ArrayLike,
     motion_scale: float,
+    anchor_frame_index: int = 0,
 ) -> list[Float64Array]:
     if not source_camera_to_world:
         raise ValueError("source_camera_to_world must not be empty")
@@ -40,19 +41,29 @@ def map_relative_poses(
         validate_rigid_transform(pose, f"source_camera_to_world[{index}]")
         for index, pose in enumerate(source_camera_to_world)
     ]
+    if not 0 <= anchor_frame_index < len(source):
+        raise ValueError("anchor_frame_index must identify a source pose")
     target = validate_rigid_transform(target_start, "target_start")
-    source0_inverse = np.linalg.inv(source[0])
+    source_anchor_inverse = np.linalg.inv(source[anchor_frame_index])
     mapped: list[Float64Array] = []
     for source_pose in source:
-        relative = source0_inverse @ source_pose
+        relative = source_anchor_inverse @ source_pose
         relative[:3, 3] *= motion_scale
         result = target @ relative
         mapped.append(validate_rigid_transform(result, "mapped pose"))
-    mapped[0] = target.copy()
+    mapped[anchor_frame_index] = target.copy()
     return mapped
 
 
 def map_trajectory(
-    solution: CameraSolution, target_start: npt.ArrayLike, motion_scale: float
+    solution: CameraSolution,
+    target_start: npt.ArrayLike,
+    motion_scale: float,
+    anchor_frame_index: int = 0,
 ) -> list[Float64Array]:
-    return map_relative_poses(solution.camera_to_world, target_start, motion_scale)
+    return map_relative_poses(
+        solution.camera_to_world,
+        target_start,
+        motion_scale,
+        anchor_frame_index,
+    )

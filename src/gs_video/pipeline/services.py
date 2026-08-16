@@ -48,7 +48,11 @@ from gs_video.domain.models import (
     StageName,
     StageState,
     StageStatus,
+    SubjectPromptState,
+    SubjectVisibilityAudit,
+    SynthesisConstraintMode,
     VideoSummary,
+    VisibilityRange,
 )
 from gs_video.media.export import ExportResult, export_mp4, probe_mp4
 from gs_video.media.ingest import extract_proxy_frames, extract_source_frames
@@ -57,17 +61,21 @@ from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
 from gs_video.project.cache import cache_key
 from gs_video.resource_admission import cache_has_capacity, fits_vram_budget
-from gs_video.scene.camera import OrbitCamera
 from gs_video.scene.worker_client import RendererWorkerIdentity
 from gs_video.scene.worker_protocol import RenderSequenceRequest
 from gs_video.segmentation.paths import has_reparse_component
+from gs_video.segmentation.visibility_audit import (
+    VisibilityAuditResult,
+    VisibilityCandidateRange,
+    audit_visibility_mask_paths,
+)
 from gs_video.storage.artifacts import ArtifactStore
 
 
 INGEST_IMPLEMENTATION_VERSION = "media-ingest-v1"
 SEGMENT_IMPLEMENTATION_VERSION = "segment-adapter-v1"
 CAMERA_IMPLEMENTATION_VERSION = "opencv-camera-adapter-v1"
-TRAJECTORY_IMPLEMENTATION_VERSION = "trajectory-map-v1"
+TRAJECTORY_IMPLEMENTATION_VERSION = "trajectory-map-anchor-v2"
 COMPOSITE_IMPLEMENTATION_VERSION = "full-resolution-composite-v1"
 EXPORT_IMPLEMENTATION_VERSION = "verified-export-v1"
 RENDER_IMPLEMENTATION_VERSION = "renderer-worker-adapter-v1"
@@ -963,6 +971,9 @@ class SegmentWorkflowService:
     ) -> StageResult:
         token.raise_if_cancelled()
         ingest = _stage_state(project, StageName.INGEST)
+        ingest_cache_key = ingest.cache_key
+        if ingest_cache_key is None:
+            raise RepairableError("导入阶段缺少缓存 authority")
         proxies = _artifact_path(
             self.paths, ingest, ArtifactRole.PROXY_FRAMES, ArtifactCategory.PROXIES
         )
@@ -990,7 +1001,7 @@ class SegmentWorkflowService:
         identity = _segmentation_identity(self.segmenter, token)
         result_key = cache_key(
             StageName.SEGMENT.value,
-            {"ingest_cache_key": ingest.cache_key},
+            {"ingest_cache_key": ingest_cache_key},
             {"prompt": prompt_state.model_dump(mode="json"), "backend": identity},
             SEGMENT_IMPLEMENTATION_VERSION,
         )
@@ -1058,11 +1069,71 @@ class SegmentWorkflowService:
             expected_sizes=inventory.sizes,
             token=token,
         )
+        audit = audit_visibility_mask_paths(
+            output / f"{index:06d}.png" for index in range(1, inventory.count + 1)
+        )
+        self._persist_visibility_audit(
+            project,
+            ingest_cache_key=ingest_cache_key,
+            segment_cache_key=result_key,
+            prompt=prompt_state,
+            audit=audit,
+        )
         return StageResult(
             output_paths=(reference,),
             cache_key=result_key,
             artifacts={ArtifactRole.SUBJECT_MASKS: reference},
         )
+
+    def _persist_visibility_audit(
+        self,
+        project: Project,
+        *,
+        ingest_cache_key: str,
+        segment_cache_key: str,
+        prompt: SubjectPromptState,
+        audit: VisibilityAuditResult,
+    ) -> None:
+        source_asset_id = project.source_video_asset_id or project.source_video
+        if source_asset_id is None:
+            raise RepairableError("源视频 authority 不存在")
+
+        def persisted_range(value: VisibilityCandidateRange) -> VisibilityRange:
+            return VisibilityRange(
+                start_frame=value.start_frame,
+                end_frame=value.end_frame,
+                review_frames=value.review_frames,
+            )
+
+        def mutation(latest: Project) -> None:
+            latest_source = latest.source_video_asset_id or latest.source_video
+            latest_ingest = _stage_state(latest, StageName.INGEST)
+            if (
+                latest_source != source_asset_id
+                or latest_ingest.cache_key != ingest_cache_key
+                or latest.workflow.subject_prompt != prompt
+            ):
+                raise RepairableError("主体可见性审计期间源素材 authority 发生变化")
+            previous = latest.workflow.subject_visibility_audit
+            revision = 1 if previous is None else previous.revision + 1
+            latest.workflow.subject_visibility_audit = SubjectVisibilityAudit(
+                source_asset_id=source_asset_id,
+                segment_cache_key=segment_cache_key,
+                fully_visible_ranges=tuple(map(persisted_range, audit.fully_visible_ranges)),
+                bottom_cropped_ranges=tuple(map(persisted_range, audit.bottom_cropped_ranges)),
+                uncertain_ranges=tuple(map(persisted_range, audit.uncertain_ranges)),
+                recommended_anchor_frames=audit.recommended_anchor_frames,
+                revision=revision,
+            )
+            latest.workflow.source_perspective_calibration = None
+            latest.workflow.subject_contact_constraint = None
+            latest.workflow.synthesis_placement = None
+            latest.workflow.confirmed_synthesis_placement_revision = None
+            latest.workflow.export_result = None
+
+        if self.paths.update_project is not None:
+            self.paths.update_project(mutation)
+        mutation(project)
 
 
 class CameraSolveWorkflowService:
@@ -1168,29 +1239,50 @@ class TrajectoryMapWorkflowService:
         solution_snapshot = _file_snapshot(solution_path, "相机求解产物", token)
         solution = read_camera_solution(solution_path)
         workflow = project.workflow
-        camera = workflow.target_camera
-        preview = workflow.preview
-        foot = workflow.foot_point
-        if camera is None or preview is None or foot is None:
-            raise RepairableError("目标相机、确认预览和落脚点尚未完整设置")
+        calibration = workflow.source_perspective_calibration
+        ground = workflow.local_ground_anchor
+        contact = workflow.subject_contact_constraint
+        placement = workflow.synthesis_placement
+        if calibration is None or ground is None or placement is None:
+            raise RepairableError("源透视、局部地面和合成机位尚未完整设置")
+        ingest = _stage_state(project, StageName.INGEST)
+        segment = _stage_state(project, StageName.SEGMENT)
+        source_asset_id = project.source_video_asset_id or project.source_video
+        scene_asset_id = project.scene_ply_asset_id or project.scene_ply
         authority_matches = (
-            camera.revision == workflow.confirmed_camera_revision
-            and camera.revision == preview.camera_revision
-            and camera.revision == foot.camera_revision
-            and preview.artifact_id == workflow.confirmed_preview_artifact_id
-            and preview.artifact_id == foot.preview_artifact_id
-            and preview.pick_buffer_revision == foot.pick_buffer_revision
+            calibration.source_asset_id == source_asset_id
+            and calibration.ingest_cache_key == ingest.cache_key
+            and calibration.segment_cache_key == segment.cache_key
+            and ground.scene_asset_id == scene_asset_id
+            and placement.source_calibration_revision == calibration.revision
+            and placement.ground_anchor_revision == ground.revision
+            and workflow.confirmed_synthesis_placement_revision
+            == placement.revision
         )
+        if placement.mode is SynthesisConstraintMode.CONTACT:
+            authority_matches = authority_matches and contact is not None and (
+                contact.source_asset_id == calibration.source_asset_id
+                and contact.ingest_cache_key == calibration.ingest_cache_key
+                and contact.segment_cache_key == calibration.segment_cache_key
+                and contact.source_calibration_revision == calibration.revision
+                and contact.anchor_frame_index == calibration.anchor_frame_index
+                and placement.source_contact_revision == contact.revision
+            )
+        elif contact is not None:
+            authority_matches = False
         if not authority_matches:
-            raise RepairableError("目标相机、确认预览和落脚点 authority 不一致")
-        target = OrbitCamera(
-            target=camera.target,
-            distance=camera.distance,
-            yaw=camera.yaw,
-            pitch=camera.pitch,
-            fov_y_degrees=camera.fov_y_degrees,
+            raise RepairableError("合成机位与源透视或局部地面 authority 不一致")
+        if solution.confidence < 0.2:
+            raise RepairableError("源相机轨迹置信度不足，无法安全映射")
+        target_camera_to_world = np.asarray(
+            placement.anchor_camera_to_world, dtype=np.float64
         )
-        mapped = map_trajectory(solution, target.camera_to_world(), workflow.motion_scale)
+        mapped = map_trajectory(
+            solution,
+            target_camera_to_world,
+            placement.subject_to_scene_scale * workflow.motion_scale,
+            calibration.anchor_frame_index,
+        )
         token.raise_if_cancelled()
         result_key = cache_key(
             StageName.MAP_TRAJECTORY.value,
@@ -1199,10 +1291,11 @@ class TrajectoryMapWorkflowService:
                 "camera_artifact_sha256": solution_snapshot.sha256,
             },
             {
-                "camera": camera.model_dump(mode="json"),
-                "confirmed_preview_artifact_id": workflow.confirmed_preview_artifact_id,
-                "foot_point": foot.model_dump(mode="json"),
-                "motion_scale": workflow.motion_scale,
+                "source_calibration": calibration.model_dump(mode="json"),
+                "local_ground": ground.model_dump(mode="json"),
+                "contact": None if contact is None else contact.model_dump(mode="json"),
+                "placement": placement.model_dump(mode="json"),
+                "motion_amplitude": workflow.motion_scale,
             },
             TRAJECTORY_IMPLEMENTATION_VERSION,
         )
@@ -1211,7 +1304,7 @@ class TrajectoryMapWorkflowService:
             token.raise_if_cancelled()
             write_mapped_trajectory(
                 staging / "trajectory.json",
-                MappedTrajectory(camera.fov_y_degrees, mapped),
+                MappedTrajectory(calibration.vertical_fov, mapped),
             )
             _assert_file_snapshot(
                 solution_path,
@@ -1229,7 +1322,7 @@ class TrajectoryMapWorkflowService:
             self.paths.resolve(reference, directory=False)
         )
         if (
-            restored.fov_y_degrees != camera.fov_y_degrees
+            restored.fov_y_degrees != calibration.vertical_fov
             or len(restored.camera_to_world) != len(mapped)
             or any(
                 not np.allclose(actual, expected, atol=1e-12)

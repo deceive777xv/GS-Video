@@ -25,7 +25,8 @@ from gs_video.environment.vram import (
     validated_vram_limit_mb,
 )
 from gs_video.pipeline.cancellation import CancellationToken
-from gs_video.scene.camera import OrbitCamera
+from gs_video.scene.camera import OrbitCamera, matrix4_tuple
+from gs_video.scene.synthesis_camera import MatrixCamera
 from gs_video.scene.preview_protocol import (
     CompleteEvent,
     ErrorEvent,
@@ -43,7 +44,7 @@ from gs_video.scene.worker_client import (
     RendererWorkerClient,
     _file_identity,
 )
-from gs_video.scene.worker_protocol import OrbitCameraPayload
+from gs_video.scene.worker_protocol import CameraPayload, MatrixCameraPayload, OrbitCameraPayload
 from gs_video.segmentation.paths import has_reparse_component, worker_path
 
 
@@ -278,7 +279,13 @@ class PreviewSession(RendererWorkerClient):
         )
 
     @staticmethod
-    def _camera_payload(camera: OrbitCamera) -> OrbitCameraPayload:
+    def _camera_payload(camera: OrbitCamera | MatrixCamera) -> CameraPayload:
+        if isinstance(camera, MatrixCamera):
+            matrix = camera.camera_to_world()
+            return MatrixCameraPayload(
+                camera_to_world=matrix4_tuple(matrix),
+                fov_y_degrees=camera.fov_y_degrees,
+            )
         return OrbitCameraPayload(
             target=camera.target,
             distance=camera.distance,
@@ -332,7 +339,7 @@ class PreviewSession(RendererWorkerClient):
         previews: Path,
         summary: SceneSummary,
         key: tuple[object, ...],
-        camera: OrbitCamera,
+        camera: OrbitCamera | MatrixCamera,
     ) -> _SessionProcess:
         request_path = previews / f".preview-session-open-{uuid.uuid4().hex}.json"
         startup_gate = self._create_control_file(previews, "preview-gate", b"WAIT\n")
@@ -413,7 +420,7 @@ class PreviewSession(RendererWorkerClient):
         previews: Path,
         summary: SceneSummary,
         key: tuple[object, ...],
-        camera: OrbitCamera,
+        camera: OrbitCamera | MatrixCamera,
     ) -> _SessionProcess:
         current = self._session
         if current is not None and (
@@ -544,7 +551,7 @@ class PreviewSession(RendererWorkerClient):
         scene_path: str | Path,
         scene_summary: SceneSummary,
         request_id: int,
-        camera: OrbitCamera,
+        camera: OrbitCamera | MatrixCamera,
         width: int,
         height: int,
         *,
@@ -600,7 +607,7 @@ class PreviewSession(RendererWorkerClient):
         scene_path: str | Path,
         scene_summary: SceneSummary,
         request_id: int,
-        camera: OrbitCamera,
+        camera: OrbitCamera | MatrixCamera,
         width: int,
         height: int,
         *,
@@ -626,7 +633,7 @@ class PreviewSession(RendererWorkerClient):
         project_root: Path,
         scene_path: str | Path,
         scene_summary: SceneSummary,
-        camera: OrbitCamera,
+        camera: OrbitCamera | MatrixCamera,
         width: int,
         height: int,
         *,
@@ -679,7 +686,7 @@ class PreviewSession(RendererWorkerClient):
         project_root: Path,
         scene_path: str | Path,
         scene_summary: SceneSummary,
-        camera: OrbitCamera,
+        camera: OrbitCamera | MatrixCamera,
         width: int,
         height: int,
         *,

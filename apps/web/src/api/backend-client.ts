@@ -29,6 +29,10 @@ import type {
   StorageLayoutUpdate,
   CacheCleanupResultDto,
   CacheCleanupPlanDto,
+  SourcePerspectiveCalibrationInput,
+  SourceContactConfirmationInput,
+  LocalGroundAnchorInput,
+  SynthesisPlacementInput,
 } from './types'
 
 export interface BackendClient {
@@ -72,17 +76,24 @@ export interface BackendClient {
   closeLivePreview(): Promise<void>
   fetchPreviewArtifact(id: string, signal?: AbortSignal): Promise<Blob>
   pickFootPoint(input: PickRequest): Promise<FootPointDto>
-  confirmCamera(cameraRevision: number): Promise<ProjectDto>
+  confirmCamera(expectedProjectId: string, cameraRevision: number): Promise<ProjectDto>
+  scanSubjectVisibility(expectedProjectId: string, expectedSegmentCacheKey: string): Promise<ProjectDto>
+  calibrateSourcePerspective(input: SourcePerspectiveCalibrationInput): Promise<ProjectDto>
+  confirmSourceContact(input: SourceContactConfirmationInput): Promise<ProjectDto>
+  calibrateLocalGround(input: LocalGroundAnchorInput): Promise<ProjectDto>
+  solveSynthesisPlacement(input: SynthesisPlacementInput): Promise<ProjectDto>
+  confirmSynthesisPlacement(expectedProjectId: string, placementRevision: number): Promise<ProjectDto>
   getVerifiedExport(): Promise<VerifiedExportDto>
   fetchExportArtifact(id: string, signal?: AbortSignal): Promise<Blob>
   getCompositePreview(signal?: AbortSignal): Promise<CompositePreviewDto>
   fetchCompositePreviewArtifact(id: string, signal?: AbortSignal): Promise<Blob>
   copyVerifiedExport(id: string, destination: string): Promise<void>
-  getSubjectMedia(role: SubjectMediaRole): Promise<SubjectMediaDto>
+  getSubjectMedia(role: SubjectMediaRole, frameIndex?: number): Promise<SubjectMediaDto>
   fetchSubjectMediaArtifact(
     role: SubjectMediaRole,
     id: string,
     signal?: AbortSignal,
+    frameIndex?: number,
   ): Promise<Blob>
   startTask(targetStage: StageName, expectedProjectId: string): Promise<TaskDto>
   getTask(id: string): Promise<TaskDto>

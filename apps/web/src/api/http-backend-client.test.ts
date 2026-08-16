@@ -56,6 +56,12 @@ const fakeBackendClient = (currentTask = task()): BackendClient => ({
   fetchPreviewArtifact: vi.fn(),
   pickFootPoint: vi.fn(),
   confirmCamera: vi.fn(),
+  scanSubjectVisibility: vi.fn(),
+  calibrateSourcePerspective: vi.fn(),
+  confirmSourceContact: vi.fn(),
+  calibrateLocalGround: vi.fn(),
+  solveSynthesisPlacement: vi.fn(),
+  confirmSynthesisPlacement: vi.fn(),
   getVerifiedExport: vi.fn(),
   fetchExportArtifact: vi.fn(),
   getCompositePreview: vi.fn(),
@@ -452,6 +458,7 @@ describe('HttpBackendClient', () => {
     await expect(
       client.renderPreview(
         {
+          expected_project_id: 'project-1',
           generation: 3,
           width: 960,
           height: 540,
@@ -487,6 +494,7 @@ describe('HttpBackendClient', () => {
     })
 
     const frame = await client.renderLivePreview({
+      expected_project_id: 'project-1',
       request_id: 7,
       width: 960,
       height: 540,
@@ -498,6 +506,7 @@ describe('HttpBackendClient', () => {
     expect(frame.type).toBe('image/jpeg')
     expect(String(fetchImpl.mock.calls[0]?.[0])).toContain('/projects/current/preview/live')
     expect(fetchImpl.mock.calls[0]?.[1]?.body).toBe(JSON.stringify({
+      expected_project_id: 'project-1',
       request_id: 7,
       width: 960,
       height: 540,
@@ -723,11 +732,11 @@ describe('HttpBackendClient', () => {
       fetchImpl,
     })
 
-    await client.confirmCamera(4)
+    await client.confirmCamera('project-1', 4)
 
     expect(fetchImpl).toHaveBeenCalledWith(
       'http://127.0.0.1:49152/api/v1/projects/current/camera/confirm',
-      expect.objectContaining({ method: 'POST', body: '{"camera_revision":4}' }),
+      expect.objectContaining({ method: 'POST', body: '{"expected_project_id":"project-1","camera_revision":4}' }),
     )
   })
 

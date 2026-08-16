@@ -11,11 +11,13 @@ export function stageSucceeded(project: ProjectDto, stage: StageName): boolean {
 export function creativeInteractionCount(project: ProjectDto): number {
   const workflow = project.workflow
   return Number(workflow.subject_prompt !== null)
+    + Number(workflow.source_perspective_calibration !== null)
+    + Number(workflow.local_ground_anchor !== null)
     + Number(
-      workflow.confirmed_camera_revision !== null
-      && workflow.confirmed_preview_artifact_id !== null,
+      workflow.synthesis_placement !== null
+      && workflow.confirmed_synthesis_placement_revision
+        === workflow.synthesis_placement.revision,
     )
-    + Number(workflow.foot_point !== null)
 }
 
 export function workflowStepForProject(project: ProjectDto): WorkflowStep {
@@ -31,9 +33,9 @@ export function workflowStepForProject(project: ProjectDto): WorkflowStep {
     || !stageSucceeded(project, 'solve_camera')
   ) return 'subject'
   if (
-    workflow.confirmed_camera_revision === null
-    || workflow.confirmed_preview_artifact_id === null
-    || workflow.foot_point === null
+    workflow.synthesis_placement === null
+    || workflow.confirmed_synthesis_placement_revision
+      !== workflow.synthesis_placement.revision
   ) return 'camera'
   if (!stageSucceeded(project, 'composite')) return 'preview'
   return 'export'
@@ -52,7 +54,9 @@ export function canVisitStep(project: ProjectDto, step: WorkflowStep): boolean {
         && stageSucceeded(project, 'segment')
         && stageSucceeded(project, 'solve_camera')
     case 'preview':
-      return workflow.confirmed_camera_revision !== null && workflow.foot_point !== null
+      return workflow.synthesis_placement !== null
+        && workflow.confirmed_synthesis_placement_revision
+          === workflow.synthesis_placement.revision
     case 'export':
       return stageSucceeded(project, 'composite')
   }

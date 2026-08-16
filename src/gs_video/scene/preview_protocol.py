@@ -9,7 +9,7 @@ import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
-from gs_video.scene.worker_protocol import OrbitCameraPayload
+from gs_video.scene.worker_protocol import CameraPayload
 from gs_video.scene.worker_protocol import assert_safe_directory, ensure_safe_directory
 from gs_video.segmentation.paths import has_reparse_component
 
@@ -37,7 +37,7 @@ class OpenPreviewSessionRequest(_StrictModel):
     maximum_width: int = Field(strict=True, gt=0, le=960)
     maximum_height: int = Field(strict=True, gt=0, le=540)
     available_vram_limit_mb: int = Field(strict=True, ge=1024)
-    initial_camera: OrbitCameraPayload
+    initial_camera: CameraPayload
 
     @field_validator("scene_path", "output_root")
     @classmethod
@@ -49,7 +49,7 @@ class RenderLiveCommand(_StrictModel):
     type: Literal["render_live"]
     request_id: int = Field(strict=True, ge=1)
     output_path: Path
-    camera: OrbitCameraPayload
+    camera: CameraPayload
     width: int = Field(strict=True, gt=0, le=960)
     height: int = Field(strict=True, gt=0, le=540)
 
@@ -63,7 +63,7 @@ class RenderPickCommand(_StrictModel):
     type: Literal["render_pick"]
     request_id: int = Field(strict=True, ge=1)
     output_path: Path
-    camera: OrbitCameraPayload
+    camera: CameraPayload
     width: int = Field(strict=True, gt=0, le=960)
     height: int = Field(strict=True, gt=0, le=540)
 

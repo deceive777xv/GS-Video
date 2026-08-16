@@ -20,7 +20,7 @@ from gs_video.domain.contracts import PickBuffer, RenderSequence, RenderSettings
 from gs_video.domain.errors import GsVideoError
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
-from gs_video.scene.camera import OrbitCamera
+from gs_video.scene.camera import CameraMatrices
 from gs_video.scene.ply import GaussianScene, assess_scene_vram
 from gs_video.segmentation.paths import has_reparse_component
 
@@ -259,7 +259,7 @@ class GsplatRenderer:
 
     @staticmethod
     def _camera_arguments(
-        camera: OrbitCamera, width: int, height: int
+        camera: CameraMatrices, width: int, height: int
     ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
         try:
             view = np.asarray(camera.view_matrix(), dtype=np.float32)
@@ -387,7 +387,7 @@ class GsplatRenderer:
         self,
         rasterizer: Rasterizer,
         runtime: Mapping[str, object],
-        camera: OrbitCamera,
+        camera: CameraMatrices,
         settings: RenderSettings,
         render_mode: str,
     ) -> tuple[object, object, object]:
@@ -411,7 +411,7 @@ class GsplatRenderer:
     def render(
         self,
         scene: GaussianScene,
-        cameras: Sequence[OrbitCamera],
+        cameras: Sequence[CameraMatrices],
         output_dir: Path,
         settings: RenderSettings,
         emit: ProgressEmitter,
@@ -423,7 +423,7 @@ class GsplatRenderer:
     def _render_locked(
         self,
         scene: GaussianScene,
-        cameras: Sequence[OrbitCamera],
+        cameras: Sequence[CameraMatrices],
         output_dir: Path,
         settings: RenderSettings,
         emit: ProgressEmitter,
@@ -485,7 +485,7 @@ class GsplatRenderer:
         )
 
     def render_pick(
-        self, scene: GaussianScene, camera: OrbitCamera, width: int, height: int
+        self, scene: GaussianScene, camera: CameraMatrices, width: int, height: int
     ) -> PickBuffer:
         with self._operation_lock:
             return self._render_pick_locked(scene, camera, width, height)
@@ -536,7 +536,7 @@ class GsplatRenderer:
     def render_prepared_rgb(
         self,
         prepared: PreparedPreviewScene,
-        camera: OrbitCamera,
+        camera: CameraMatrices,
         width: int,
         height: int,
     ) -> npt.NDArray[np.uint8]:
@@ -567,7 +567,7 @@ class GsplatRenderer:
     def render_prepared_rgb_profiled(
         self,
         prepared: PreparedPreviewScene,
-        camera: OrbitCamera,
+        camera: CameraMatrices,
         width: int,
         height: int,
     ) -> tuple[npt.NDArray[np.uint8], PreparedPreviewTimings]:
@@ -609,7 +609,7 @@ class GsplatRenderer:
     def render_prepared_pick(
         self,
         prepared: PreparedPreviewScene,
-        camera: OrbitCamera,
+        camera: CameraMatrices,
         width: int,
         height: int,
     ) -> PickBuffer:
@@ -645,7 +645,7 @@ class GsplatRenderer:
                 prepared.metrics.release_frame()
 
     def _render_pick_locked(
-        self, scene: GaussianScene, camera: OrbitCamera, width: int, height: int
+        self, scene: GaussianScene, camera: CameraMatrices, width: int, height: int
     ) -> PickBuffer:
         settings = RenderSettings(
             width=width, height=height, sh_degree=self._scene_sh_degree(scene)

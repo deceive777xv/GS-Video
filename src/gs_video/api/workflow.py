@@ -35,7 +35,8 @@ from gs_video.environment.vram import (
 )
 from gs_video.resource_admission import fits_vram_budget
 from gs_video.pipeline.artifacts import validate_cache_key
-from gs_video.scene.camera import OrbitCamera
+from gs_video.scene.camera import OrbitCamera, matrix4_tuple
+from gs_video.scene.synthesis_camera import MatrixCamera
 from gs_video.scene.gsplat_renderer import GsplatRenderer
 from gs_video.scene.ply import load_gaussian_ply
 from gs_video.scene.preview_session import (
@@ -45,24 +46,41 @@ from gs_video.scene.preview_session import (
     PreviewSceneUnavailableError,
 )
 from gs_video.scene.worker_client import RendererWorkerClient
-from gs_video.scene.worker_protocol import OrbitCameraPayload, RenderPickRequest
+from gs_video.scene.worker_protocol import (
+    CameraPayload,
+    MatrixCameraPayload,
+    OrbitCameraPayload,
+    RenderPickRequest,
+)
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.segmentation.paths import has_reparse_component
+from gs_video.segmentation.visibility_audit import (
+    VisibilityAuditResult,
+    audit_visibility_mask_paths,
+)
 
 
 MAX_PREVIEW_ARTIFACT_BYTES = 16 * 1024 * 1024
 MAX_SUBJECT_IMAGE_PIXELS = 1920 * 1080
 _PreviewResult = TypeVar("_PreviewResult")
 PreviewAuthority = tuple[str, str, str, int, int]
-PreviewRequestFingerprint = tuple[
-    tuple[float, float, float],
-    float,
-    float,
-    float,
-    float,
-    int,
-    int,
-]
+PreviewRequestFingerprint = tuple[object, ...]
+CameraLike = OrbitCamera | MatrixCamera
+
+
+def _camera_payload(camera: CameraLike) -> CameraPayload:
+    if isinstance(camera, MatrixCamera):
+        return MatrixCameraPayload(
+            camera_to_world=matrix4_tuple(camera.camera_to_world()),
+            fov_y_degrees=camera.fov_y_degrees,
+        )
+    return OrbitCameraPayload(
+        target=camera.target,
+        distance=camera.distance,
+        yaw=camera.yaw,
+        pitch=camera.pitch,
+        fov_y_degrees=camera.fov_y_degrees,
+    )
 
 
 def _stale_preview_generation() -> ApiError:
@@ -488,6 +506,7 @@ def resolve_subject_media(
     project: Project,
     project_root: Path,
     role: SubjectMediaRole,
+    frame_index: int | None = None,
 ) -> ResolvedSubjectMedia:
     definition = _SUBJECT_MEDIA_DEFINITIONS[role]
     prompt = project.workflow.subject_prompt
@@ -502,19 +521,26 @@ def resolve_subject_media(
     artifact_root, inventory = _subject_artifact_inventory(
         project, project_root, definition
     )
-    frame_index = 0 if prompt is None else prompt.frame_index
-    if frame_index >= len(inventory):
+    selected_frame_index = (
+        frame_index
+        if frame_index is not None
+        else (0 if prompt is None else prompt.frame_index)
+    )
+    if selected_frame_index < 0 or selected_frame_index >= len(inventory):
         raise ApiError(
             409,
             code="subject_media_unavailable",
             category="project",
             message="The requested subject media frame is outside the inventory.",
         )
-    path = artifact_root / f"{frame_index + 1:06d}{definition.suffix}"
+    path = artifact_root / f"{selected_frame_index + 1:06d}{definition.suffix}"
     expected_dimensions = None
     if role is SubjectMediaRole.ALPHA:
         proxy = resolve_subject_media(
-            project, project_root, SubjectMediaRole.PROXY
+            project,
+            project_root,
+            SubjectMediaRole.PROXY,
+            selected_frame_index,
         )
         expected_dimensions = (proxy.width, proxy.height)
     payload, digest, width, height = _read_subject_image(
@@ -533,12 +559,12 @@ def resolve_subject_media(
             "The subject media frame inventory changed while it was read."
         )
     artifact_id = hashlib.sha256(
-        f"{role.value}\0{stage.cache_key}\0{frame_index}\0{digest}".encode()
+        f"{role.value}\0{stage.cache_key}\0{selected_frame_index}\0{digest}".encode()
     ).hexdigest()[:32]
     return ResolvedSubjectMedia(
         role=role,
         artifact_id=artifact_id,
-        frame_index=frame_index,
+        frame_index=selected_frame_index,
         width=width,
         height=height,
         size=len(payload),
@@ -573,6 +599,19 @@ def validate_subject_prompt(
         ) from error
 
 
+def audit_subject_visibility(
+    project: Project,
+    project_root: Path,
+) -> VisibilityAuditResult:
+    definition = _SUBJECT_MEDIA_DEFINITIONS[SubjectMediaRole.ALPHA]
+    artifact_root, inventory = _subject_artifact_inventory(
+        project, project_root, definition
+    )
+    return audit_visibility_mask_paths(
+        artifact_root / item.name for item in inventory
+    )
+
+
 class PreviewServiceLike(Protocol):
     def render_live(
         self,
@@ -580,7 +619,7 @@ class PreviewServiceLike(Protocol):
         scene_path: str | Path,
         scene_summary: SceneSummary,
         request_id: int,
-        camera: OrbitCamera,
+        camera: CameraLike,
         width: int,
         height: int,
         *,
@@ -592,7 +631,7 @@ class PreviewServiceLike(Protocol):
         project_root: Path,
         scene_path: str | Path,
         scene_summary: SceneSummary,
-        camera: OrbitCamera,
+        camera: CameraLike,
         width: int,
         height: int,
         *,
@@ -613,7 +652,7 @@ class LivePreviewSessionLike(Protocol):
         scene_path: str | Path,
         scene_summary: SceneSummary,
         request_id: int,
-        camera: OrbitCamera,
+        camera: CameraLike,
         width: int,
         height: int,
         *,
@@ -625,7 +664,7 @@ class LivePreviewSessionLike(Protocol):
         project_root: Path,
         scene_path: str | Path,
         scene_summary: SceneSummary,
-        camera: OrbitCamera,
+        camera: CameraLike,
         width: int,
         height: int,
         *,
@@ -652,7 +691,7 @@ class GsplatPreviewService:
         project_root: Path,
         scene_path: str | Path,
         scene_summary: SceneSummary,
-        camera: OrbitCamera,
+        camera: CameraLike,
         width: int,
         height: int,
         *,
@@ -835,7 +874,7 @@ class WorkerPreviewService:
         scene_path: str | Path,
         scene_summary: SceneSummary,
         request_id: int,
-        camera: OrbitCamera,
+        camera: CameraLike,
         width: int,
         height: int,
         *,
@@ -862,7 +901,7 @@ class WorkerPreviewService:
         scene_path: str | Path,
         scene_summary: SceneSummary,
         request_id: int,
-        camera: OrbitCamera,
+        camera: CameraLike,
         width: int,
         height: int,
         *,
@@ -932,7 +971,7 @@ class WorkerPreviewService:
         project_root: Path,
         scene_path: str | Path,
         scene_summary: SceneSummary,
-        camera: OrbitCamera,
+        camera: CameraLike,
         width: int,
         height: int,
         *,
@@ -957,7 +996,7 @@ class WorkerPreviewService:
         project_root: Path,
         scene_path: str | Path,
         scene_summary: SceneSummary,
-        camera: OrbitCamera,
+        camera: CameraLike,
         width: int,
         height: int,
         *,
@@ -1071,13 +1110,7 @@ class WorkerPreviewService:
                     type="render_pick",
                     scene_path=scene,
                     output_npz=output,
-                    camera=OrbitCameraPayload(
-                        target=camera.target,
-                        distance=camera.distance,
-                        yaw=camera.yaw,
-                        pitch=camera.pitch,
-                        fov_y_degrees=camera.fov_y_degrees,
-                    ),
+                    camera=_camera_payload(camera),
                     width=width,
                     height=height,
                 ),

@@ -42,6 +42,35 @@ def test_relative_mapping_uses_inverse_source_zero_before_target_start() -> None
     np.testing.assert_allclose(mapped[1], expected, atol=1e-12)
 
 
+def test_relative_mapping_anchors_the_user_selected_source_frame() -> None:
+    source = [
+        pose(tx=1.0, yaw_degrees=5),
+        pose(tx=2.0, yaw_degrees=15),
+        pose(tx=4.0, yaw_degrees=30),
+    ]
+    target_anchor = pose(tx=8.0, yaw_degrees=-25)
+
+    mapped = map_relative_poses(
+        source,
+        target_anchor,
+        motion_scale=0.5,
+        anchor_frame_index=1,
+    )
+
+    np.testing.assert_allclose(mapped[1], target_anchor, atol=1e-12)
+    expected_rotation = target_anchor[:3, :3] @ (
+        np.linalg.inv(source[1]) @ source[2]
+    )[:3, :3]
+    np.testing.assert_allclose(mapped[2][:3, :3], expected_rotation, atol=1e-12)
+    assert np.linalg.norm(mapped[2][:3, 3] - mapped[1][:3, 3]) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("anchor", [-1, 2])
+def test_relative_mapping_rejects_invalid_anchor_frame(anchor: int) -> None:
+    with pytest.raises(ValueError, match="anchor_frame_index"):
+        map_relative_poses([np.eye(4), np.eye(4)], np.eye(4), 1.0, anchor)
+
+
 def test_map_trajectory_accepts_solution_and_does_not_alias_inputs() -> None:
     source = [np.eye(4), pose(tx=2.0)]
     target_start = pose(tx=4.0)

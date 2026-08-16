@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 from gs_video.domain.models import ArtifactCategory
 
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 def _canonical_project_id(value: object) -> str:
@@ -138,6 +138,37 @@ def migrate_project_dict(raw: dict[str, object]) -> dict[str, object]:
                 }
             data["schema_version"] = 5
             version = 5
+        elif version == 5:
+            workflow_value = data.setdefault("workflow", {})
+            if not isinstance(workflow_value, dict):
+                raise ValueError("项目工作流状态必须是对象")
+            # A legacy orbit camera plus one picked point cannot safely imply a
+            # source calibration or a three-point local plane. Preserve all
+            # upstream media/segmentation/camera-solve artifacts and fail closed
+            # at target placement.
+            for legacy_key in (
+                "target_camera",
+                "confirmed_camera_revision",
+                "confirmed_preview_artifact_id",
+                "foot_point",
+                "preview",
+                "export_result",
+            ):
+                if legacy_key in workflow_value:
+                    workflow_value[legacy_key] = None
+            stages = data.setdefault("stages", {})
+            if not isinstance(stages, dict):
+                raise ValueError("项目阶段状态必须是对象")
+            for stage_name in ("map_trajectory", "render", "composite", "export"):
+                stage = stages.get(stage_name)
+                if isinstance(stage, dict):
+                    stage["status"] = "stale"
+                    stage["cache_key"] = None
+                    stage["error_code"] = None
+                    stage["run_id"] = None
+                    stage["input_generation"] = int(stage.get("input_generation", 0)) + 1
+            data["schema_version"] = 6
+            version = 6
         else:
             raise ValueError(f"不支持的项目版本: {version}")
 

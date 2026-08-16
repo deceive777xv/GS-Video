@@ -75,6 +75,7 @@ describe('SceneViewport', () => {
       <SceneViewport
         backend={backend}
         camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        expectedProjectId="project-1"
         onError={vi.fn()}
         onPreview={vi.fn()}
       />,
@@ -371,6 +372,7 @@ describe('SceneViewport', () => {
       <SceneViewport
         backend={backend}
         camera={{ target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50 }}
+        expectedProjectId="project-1"
         confirmedCameraRevision={1}
         confirmedPreviewArtifactId="preview-1"
         initialPreview={{ artifact_id: 'preview-1', artifact_size: 1, artifact_sha256: 'a', generation: 1, width: 960, height: 540, camera_revision: 1, pick_buffer_revision: 1 }}
@@ -822,6 +824,7 @@ describe('SceneViewport', () => {
         confirmedCameraRevision={1}
         confirmedPreviewArtifactId="preview-1"
         initialPreview={{ artifact_id: 'preview-1', artifact_size: 1, artifact_sha256: 'a', generation: 1, width: 960, height: 540, camera_revision: 1, pick_buffer_revision: 1 }}
+        expectedProjectId="project-1"
         onAuthorityStale={onAuthorityStale}
         onError={vi.fn()}
         onPreview={vi.fn()}
@@ -851,7 +854,7 @@ describe('SceneViewport', () => {
       expect(screen.getByLabelText('落脚点 X 坐标')).toBeEnabled()
       expect(screen.getByRole('button', { name: '确认初始机位' })).toBeEnabled()
       fireEvent.click(screen.getByRole('button', { name: '确认初始机位' }))
-      await waitFor(() => expect(backend.confirmCamera).toHaveBeenCalledWith(1))
+      await waitFor(() => expect(backend.confirmCamera).toHaveBeenCalledWith('project-1', 1))
     }
     expect(screen.getByRole('button', { name: '确认场景落脚点' })).toBeDisabled()
   })

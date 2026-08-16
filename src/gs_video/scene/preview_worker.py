@@ -17,6 +17,7 @@ from PIL import Image
 
 from gs_video.domain.errors import UnsupportedMaterialError
 from gs_video.scene.camera import OrbitCamera
+from gs_video.scene.synthesis_camera import MatrixCamera
 from gs_video.scene.gsplat_renderer import GsplatRenderer, PreparedPreviewScene
 from gs_video.scene.ply import load_gaussian_ply
 from gs_video.scene.preview_protocol import (
@@ -34,6 +35,7 @@ from gs_video.scene.preview_protocol import (
 )
 from gs_video.scene.worker import _bounded_message, _require_input_file, _wait_for_startup_gate
 from gs_video.scene.worker_protocol import (
+    MatrixCameraPayload,
     OrbitCameraPayload,
     assert_safe_directory,
     ensure_safe_directory,
@@ -113,7 +115,12 @@ def _publish(temporary: Path, output: Path) -> None:
     os.replace(temporary, output)
 
 
-def _camera(payload: OrbitCameraPayload) -> OrbitCamera:
+def _camera(payload: OrbitCameraPayload | MatrixCameraPayload) -> OrbitCamera | MatrixCamera:
+    if isinstance(payload, MatrixCameraPayload):
+        return MatrixCamera(
+            camera_to_world_matrix=np.asarray(payload.camera_to_world, dtype=np.float64),
+            fov_y_degrees=payload.fov_y_degrees,
+        )
     return OrbitCamera(**payload.model_dump())
 
 

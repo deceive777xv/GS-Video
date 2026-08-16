@@ -4,7 +4,7 @@ from enum import StrEnum
 from ipaddress import ip_address
 from math import isfinite
 from pathlib import Path, PurePath, PureWindowsPath
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -264,18 +264,43 @@ class CameraInput(StrictModel):
         return value
 
 
+class MatrixCameraInput(StrictModel):
+    camera_to_world: list[list[float]] = Field(min_length=4, max_length=4)
+    fov_y_degrees: float = Field(gt=1, lt=179, allow_inf_nan=False)
+
+    @field_validator("camera_to_world")
+    @classmethod
+    def validate_camera_matrix(cls, value: list[list[float]]) -> list[list[float]]:
+        if any(len(row) != 4 for row in value):
+            raise ValueError("camera_to_world must be a 4x4 matrix")
+        import numpy as np
+
+        matrix = np.asarray(value, dtype=np.float64)
+        rotation = matrix[:3, :3]
+        if (
+            not np.all(np.isfinite(matrix))
+            or not np.allclose(matrix[3], (0.0, 0.0, 0.0, 1.0), atol=1e-8)
+            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6)
+            or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-6)
+        ):
+            raise ValueError("camera_to_world must be a finite rigid transform")
+        return value
+
+
 class PreviewFrameRequest(StrictModel):
+    expected_project_id: str = Field(min_length=1)
     generation: int = Field(ge=1)
     width: int = Field(gt=0, le=960)
     height: int = Field(gt=0, le=540)
-    camera: CameraInput
+    camera: CameraInput | MatrixCameraInput
 
 
 class LivePreviewRequest(StrictModel):
+    expected_project_id: str = Field(min_length=1)
     request_id: int = Field(ge=1)
     width: int = Field(gt=0, le=960)
     height: int = Field(gt=0, le=540)
-    camera: CameraInput
+    camera: CameraInput | MatrixCameraInput
 
 
 class PreviewFrameResponse(StrictModel):
@@ -304,7 +329,90 @@ class PickResponse(StrictModel):
 
 
 class CameraConfirmationRequest(StrictModel):
+    expected_project_id: str = Field(min_length=1)
     camera_revision: int = Field(ge=1)
+
+
+class SourcePerspectiveCalibrationRequest(StrictModel):
+    expected_project_id: str = Field(min_length=1)
+    expected_segment_cache_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    anchor_frame_index: int = Field(ge=0)
+    image_width: int = Field(gt=0, le=16384)
+    image_height: int = Field(gt=0, le=16384)
+    vertical_fov: float = Field(gt=1, lt=179, allow_inf_nan=False)
+    horizon_start: list[float] = Field(min_length=2, max_length=2)
+    horizon_end: list[float] = Field(min_length=2, max_length=2)
+    vertical_bottom: list[float] = Field(min_length=2, max_length=2)
+    vertical_top: list[float] = Field(min_length=2, max_length=2)
+
+
+class VisibilityAuditRequest(StrictModel):
+    expected_project_id: str = Field(min_length=1)
+    expected_segment_cache_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class SourceContactConfirmationRequest(StrictModel):
+    expected_project_id: str = Field(min_length=1)
+    source_calibration_revision: int = Field(ge=1)
+    foot_pixel: list[int] = Field(min_length=2, max_length=2)
+
+    @field_validator("foot_pixel")
+    @classmethod
+    def validate_foot_pixel(cls, value: list[int]) -> list[int]:
+        if any(component < 0 for component in value):
+            raise ValueError("foot pixel must be non-negative")
+        return value
+
+
+class LocalGroundAnchorRequest(StrictModel):
+    expected_project_id: str = Field(min_length=1)
+    preview_artifact_id: str = Field(min_length=1, max_length=128)
+    camera_revision: int = Field(ge=1)
+    pick_buffer_revision: int = Field(ge=1)
+    points: list[list[int]] = Field(min_length=3, max_length=3)
+    flip_normal: bool = False
+
+    @field_validator("points")
+    @classmethod
+    def validate_points(
+        cls, value: list[list[int]]
+    ) -> list[list[int]]:
+        if any(len(point) != 2 for point in value):
+            raise ValueError("each ground point must contain two coordinates")
+        if any(component < 0 for point in value for component in point):
+            raise ValueError("ground points must be non-negative")
+        if len({tuple(point) for point in value}) != 3:
+            raise ValueError("ground points must be distinct")
+        return value
+
+
+class SynthesisPlacementRequest(StrictModel):
+    expected_project_id: str = Field(min_length=1)
+    source_calibration_revision: int = Field(ge=1)
+    ground_anchor_revision: int = Field(ge=1)
+    mode: Literal["contact", "perspective"]
+    scene_azimuth: float = Field(ge=-180, lt=180, allow_inf_nan=False)
+    subject_to_scene_scale: float = Field(ge=0.25, le=4, allow_inf_nan=False)
+    composition_offset_local: list[float] = Field(
+        default_factory=lambda: [0.0, 0.0], min_length=2, max_length=2
+    )
+    foot_pixel: list[int] | None = Field(default=None, min_length=2, max_length=2)
+
+    @model_validator(mode="after")
+    def validate_mode_fields(self) -> Self:
+        if self.mode == "contact":
+            if self.foot_pixel is None or any(value < 0 for value in self.foot_pixel):
+                raise ValueError("contact mode requires a non-negative foot pixel")
+            if self.composition_offset_local != [0.0, 0.0]:
+                raise ValueError("contact mode does not allow composition offset")
+        elif self.foot_pixel is not None:
+            raise ValueError("perspective mode must not include a foot pixel")
+        return self
+
+
+class SynthesisPlacementConfirmationRequest(StrictModel):
+    expected_project_id: str = Field(min_length=1)
+    placement_revision: int = Field(ge=1)
 
 
 class VerifiedExportResponse(StrictModel):

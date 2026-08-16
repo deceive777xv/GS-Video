@@ -30,15 +30,16 @@ from gs_video.domain.models import (
     ArtifactCategory,
     ArtifactRef,
     ArtifactRole,
-    CameraPose,
-    FootPointState,
-    PreviewState,
+    LocalGroundAnchor,
     Project,
     SceneSummary,
+    SourcePerspectiveCalibration,
     StageName,
     StageState,
     StageStatus,
     SubjectPromptState,
+    SynthesisConstraintMode,
+    SynthesisPlacement,
     VideoSummary,
 )
 from gs_video.media.export import ExportResult
@@ -552,33 +553,51 @@ def camera_succeeded(project: Project, root: Path, cache_key: str = key("c")) ->
 
 
 def authorize_mapping(project: Project) -> None:
-    project.workflow.target_camera = CameraPose(
-        target=(0, 0, 0),
-        distance=4,
-        yaw=0,
-        pitch=0,
-        fov_y_degrees=55,
+    project.scene_ply = "source/scene.ply"
+    project.stages[StageName.SEGMENT] = StageState(
+        status=StageStatus.SUCCEEDED,
+        cache_key=key("b"),
+    )
+    project.workflow.source_perspective_calibration = SourcePerspectiveCalibration(
+        source_asset_id="source/source.mp4",
+        ingest_cache_key=key("a"),
+        segment_cache_key=key("b"),
+        anchor_frame_index=0,
+        image_width=8,
+        image_height=6,
+        vertical_fov=55,
+        horizon_line=(0.0, 1.0, -3.0),
+        gravity_direction_camera=(0.0, -1.0, 0.0),
         revision=2,
     )
-    project.workflow.confirmed_camera_revision = 2
-    project.workflow.confirmed_preview_artifact_id = "preview-2"
-    project.workflow.preview = PreviewState(
-        artifact_id="preview-2",
-        artifact_size=100,
-        artifact_sha256="d" * 64,
-        generation=1,
-        width=4,
-        height=3,
-        camera_revision=2,
-        pick_buffer_revision=4,
-    )
-    project.workflow.foot_point = FootPointState(
-        image=(1, 1),
-        world=(0.0, 0.0, 0.0),
+    identity = tuple(tuple(float(value) for value in row) for row in np.eye(4))
+    project.workflow.local_ground_anchor = LocalGroundAnchor(
+        scene_asset_id="source/scene.ply",
+        p0_world=(0.0, 0.0, 0.0),
+        p1_world=(1.0, 0.0, 0.0),
+        p2_world=(0.0, 0.0, 1.0),
+        plane_normal=(0.0, -1.0, 0.0),
+        plane_offset=0.0,
+        frozen_camera_to_world=identity,
+        frozen_camera_fingerprint="camera-fingerprint",
         preview_artifact_id="preview-2",
         camera_revision=2,
         pick_buffer_revision=4,
+        revision=3,
     )
+    project.workflow.synthesis_placement = SynthesisPlacement(
+        source_calibration_revision=2,
+        ground_anchor_revision=3,
+        mode=SynthesisConstraintMode.PERSPECTIVE,
+        scene_azimuth=0.0,
+        subject_to_scene_scale=1.0,
+        composition_offset_local=(0.0, 0.0),
+        anchor_camera_to_world=identity,
+        intrinsics=((5.0, 0.0, 4.0), (0.0, 5.0, 3.0), (0.0, 0.0, 1.0)),
+        solver_cache_key=key("f"),
+        revision=4,
+    )
+    project.workflow.confirmed_synthesis_placement_revision = 4
     project.workflow.motion_scale = 0.5
 
 
@@ -607,11 +626,11 @@ def test_trajectory_mapper_requires_and_serializes_single_preview_authority(
     ) == pytest.approx(0.5)
 
 
-def test_trajectory_mapper_rejects_mismatched_pick_authority(tmp_path: Path) -> None:
+def test_trajectory_mapper_rejects_mismatched_placement_authority(tmp_path: Path) -> None:
     project = camera_succeeded(source_project(tmp_path), tmp_path)
     authorize_mapping(project)
-    assert project.workflow.foot_point is not None
-    project.workflow.foot_point.pick_buffer_revision = 3
+    assert project.workflow.synthesis_placement is not None
+    project.workflow.synthesis_placement.ground_anchor_revision = 2
 
     with pytest.raises(RepairableError, match="authority|授权|预览"):
         TrajectoryMapWorkflowService(WorkflowPaths(tmp_path)).run(
@@ -654,6 +673,7 @@ def test_trajectory_rejects_camera_replacement_during_mapping(
         solution: CameraSolution,
         target_camera_to_world: np.ndarray,
         translation_scale: float,
+        anchor_frame_index: int = 0,
     ) -> tuple[np.ndarray, ...]:
         replacement = solution_path.with_name("replacement.json")
         restored = read_camera_solution(solution_path)
@@ -669,7 +689,12 @@ def test_trajectory_rejects_camera_replacement_during_mapping(
         )
         assert replacement.stat().st_size == solution_path.stat().st_size
         replacement.replace(solution_path)
-        return original_map(solution, target_camera_to_world, translation_scale)
+        return original_map(
+            solution,
+            target_camera_to_world,
+            translation_scale,
+            anchor_frame_index,
+        )
 
     monkeypatch.setattr(workflow_services, "map_trajectory", replacing_map)
 

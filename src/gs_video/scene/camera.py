@@ -2,12 +2,53 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import cos, isfinite, radians, sin, tan
+from typing import Protocol, TypeAlias
 
 import numpy as np
 import numpy.typing as npt
 
 
 Float64Array = npt.NDArray[np.float64]
+Matrix3Tuple: TypeAlias = tuple[
+    tuple[float, float, float],
+    tuple[float, float, float],
+    tuple[float, float, float],
+]
+Matrix4Tuple: TypeAlias = tuple[
+    tuple[float, float, float, float],
+    tuple[float, float, float, float],
+    tuple[float, float, float, float],
+    tuple[float, float, float, float],
+]
+
+
+class CameraMatrices(Protocol):
+    def view_matrix(self) -> Float64Array: ...
+
+    def intrinsics(self, width: int, height: int) -> Float64Array: ...
+
+
+def matrix3_tuple(value: npt.ArrayLike) -> Matrix3Tuple:
+    matrix = np.asarray(value, dtype=np.float64)
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        raise ValueError("matrix must be a finite 3x3 array")
+    return (
+        (float(matrix[0, 0]), float(matrix[0, 1]), float(matrix[0, 2])),
+        (float(matrix[1, 0]), float(matrix[1, 1]), float(matrix[1, 2])),
+        (float(matrix[2, 0]), float(matrix[2, 1]), float(matrix[2, 2])),
+    )
+
+
+def matrix4_tuple(value: npt.ArrayLike) -> Matrix4Tuple:
+    matrix = np.asarray(value, dtype=np.float64)
+    if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+        raise ValueError("matrix must be a finite 4x4 array")
+    return (
+        (float(matrix[0, 0]), float(matrix[0, 1]), float(matrix[0, 2]), float(matrix[0, 3])),
+        (float(matrix[1, 0]), float(matrix[1, 1]), float(matrix[1, 2]), float(matrix[1, 3])),
+        (float(matrix[2, 0]), float(matrix[2, 1]), float(matrix[2, 2]), float(matrix[2, 3])),
+        (float(matrix[3, 0]), float(matrix[3, 1]), float(matrix[3, 2]), float(matrix[3, 3])),
+    )
 
 
 @dataclass(frozen=True)

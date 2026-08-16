@@ -34,6 +34,10 @@ export function PreviewPage({
   const descriptorAuthority = useRef<string | null>(null)
   const preview = project.workflow.preview
   const composite = project.stages.composite
+  const synthesisPlacement = project.workflow.synthesis_placement ?? null
+  const placementConfirmed = synthesisPlacement !== null
+    && project.workflow.confirmed_synthesis_placement_revision
+      === synthesisPlacement.revision
   const compositeAuthority = composite?.status === 'succeeded'
     && composite.cache_key !== null
     && composite.cache_key !== undefined
@@ -207,8 +211,8 @@ export function PreviewPage({
           </div>
           <div className="preview-caption">
             <span>{compositeAuthority === null ? '相机参考 · 非合成视频' : '后端验证 · 低分辨率合成'}</span>
-            <span>垂直 FOV {project.workflow.target_camera?.fov_y_degrees.toFixed(0) ?? '—'}°</span>
-            <span>焦点距离 {project.workflow.target_camera?.distance.toFixed(2) ?? '—'}</span>
+            <span>源垂直 FOV {project.workflow.source_perspective_calibration?.vertical_fov.toFixed(0) ?? '—'}°</span>
+            <span>受约束机位 r{project.workflow.synthesis_placement?.revision ?? '—'}</span>
           </div>
         </article>
         <aside className="control-card">
@@ -218,7 +222,7 @@ export function PreviewPage({
             <output>{Number(motionScale).toFixed(2)}×</output>
           </label>
           <button className="button-secondary" onClick={() => void patchMotion()} type="button">应用运动幅度</button>
-          <button disabled={busy || running || compositeRunning || project.workflow.foot_point === null} onClick={() => void generate()} type="button">{busy || running || compositeRunning ? '生成中…' : '生成预览'}</button>
+          <button disabled={busy || running || compositeRunning || !placementConfirmed} onClick={() => void generate()} type="button">{busy || running || compositeRunning ? '生成中…' : '生成预览'}</button>
           <div className="stage-list" aria-label="预览阶段缓存状态">
             {stageRows.map((name) => <div key={name}><span>{name}</span><strong>{project.stages[name]?.status ?? 'pending'}</strong></div>)}
           </div>

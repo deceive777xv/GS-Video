@@ -9,6 +9,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Annotated, Literal, TypeAlias
 
+import numpy as np
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -65,6 +66,44 @@ class OrbitCameraPayload(_StrictModel):
         return _finite(value, "camera value")
 
 
+class MatrixCameraPayload(_StrictModel):
+    camera_to_world: tuple[
+        tuple[float, float, float, float],
+        tuple[float, float, float, float],
+        tuple[float, float, float, float],
+        tuple[float, float, float, float],
+    ]
+    fov_y_degrees: float = Field(gt=0, lt=180)
+
+    @field_validator("camera_to_world", mode="before")
+    @classmethod
+    def validate_matrix(cls, value: object) -> object:
+        if not isinstance(value, (list, tuple)) or len(value) != 4:
+            raise ValueError("camera_to_world must be a 4x4 matrix")
+        for row in value:
+            if not isinstance(row, (list, tuple)) or len(row) != 4:
+                raise ValueError("camera_to_world must be a 4x4 matrix")
+            for item in row:
+                _finite(item, "camera_to_world")
+        matrix = np.asarray(value, dtype=np.float64)
+        rotation = matrix[:3, :3]
+        if (
+            not np.allclose(matrix[3], (0.0, 0.0, 0.0, 1.0), atol=1e-8)
+            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6)
+            or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-6)
+        ):
+            raise ValueError("camera_to_world must be a rigid transform")
+        return value
+
+    @field_validator("fov_y_degrees", mode="before")
+    @classmethod
+    def validate_number(cls, value: object) -> object:
+        return _finite(value, "camera value")
+
+
+CameraPayload: TypeAlias = OrbitCameraPayload | MatrixCameraPayload
+
+
 class RenderSequenceRequest(_StrictModel):
     type: Literal["render_sequence"]
     scene_path: Path
@@ -102,7 +141,7 @@ class RenderPickRequest(_StrictModel):
     type: Literal["render_pick"]
     scene_path: Path
     output_npz: Path
-    camera: OrbitCameraPayload
+    camera: CameraPayload
     width: int = Field(strict=True, gt=0, le=16384)
     height: int = Field(strict=True, gt=0, le=16384)
 

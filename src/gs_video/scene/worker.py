@@ -127,7 +127,7 @@ def _render_sequence(request: RenderSequenceRequest) -> CompleteEvent:
     renderer = GsplatRenderer()
     sequence = renderer.render(
         load_gaussian_ply(request.scene_path),
-        cameras,  # type: ignore[arg-type]
+        cameras,
         request.output_dir,
         RenderSettings(
             width=request.width,
@@ -151,13 +151,24 @@ def _render_sequence(request: RenderSequenceRequest) -> CompleteEvent:
 def _render_pick(request: RenderPickRequest) -> CompleteEvent:
     import numpy as np
 
-    from gs_video.scene.camera import OrbitCamera
     from gs_video.scene.gsplat_renderer import GsplatRenderer
     from gs_video.scene.ply import load_gaussian_ply
+    from gs_video.scene.worker_protocol import MatrixCameraPayload
+    from gs_video.scene.synthesis_camera import MatrixCamera
+    from gs_video.scene.camera import OrbitCamera
 
     _require_input_file(request.scene_path, "Gaussian scene")
     _require_owned_output(request.output_npz, directory=False)
-    camera = OrbitCamera(**request.camera.model_dump())
+    camera = (
+        MatrixCamera(
+            camera_to_world_matrix=np.asarray(
+                request.camera.camera_to_world, dtype=np.float64
+            ),
+            fov_y_degrees=request.camera.fov_y_degrees,
+        )
+        if isinstance(request.camera, MatrixCameraPayload)
+        else OrbitCamera(**request.camera.model_dump())
+    )
     renderer = GsplatRenderer()
     pick = renderer.render_pick(
         load_gaussian_ply(request.scene_path), camera, request.width, request.height

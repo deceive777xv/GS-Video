@@ -54,6 +54,7 @@ function normalizeYaw(value: number): number {
 interface SceneViewportProps {
   backend: BackendClient
   camera: CameraInput
+  expectedProjectId?: string
   initialPreview?: PreviewDto | null
   confirmedCameraRevision?: number | null
   confirmedPreviewArtifactId?: string | null
@@ -69,6 +70,7 @@ interface SceneViewportProps {
 export function SceneViewport({
   backend,
   camera: initialCamera,
+  expectedProjectId = 'unbound-project',
   initialPreview = null,
   confirmedCameraRevision = null,
   confirmedPreviewArtifactId = null,
@@ -239,6 +241,7 @@ export function SceneViewport({
       const requestId = Math.max(Date.now(), liveRequestId.current + 1)
       liveRequestId.current = requestId
       void renderLivePreview({
+        expected_project_id: expectedProjectId,
         request_id: requestId,
         width: 960,
         height: 540,
@@ -274,7 +277,7 @@ export function SceneViewport({
         liveInFlight.current = false
       }
     }
-  }, [backend])
+  }, [backend, expectedProjectId])
 
   useEffect(() => {
     const fingerprint = cameraFingerprint(camera)
@@ -378,6 +381,7 @@ export function SceneViewport({
       generation.current = nextGeneration
       setLoading(true)
       void backend.renderPreview({
+        expected_project_id: expectedProjectId,
         generation: nextGeneration,
         width: 960,
         height: 540,
@@ -405,7 +409,7 @@ export function SceneViewport({
       clearTimeout(timeout)
       controller.abort()
     }
-  }, [authoritativeTrigger, backend, camera])
+  }, [authoritativeTrigger, backend, camera, expectedProjectId])
 
   const restoreAngleInput = (axis: 'yaw' | 'pitch'): void => {
     if (axis === 'yaw') setYawInput(formatAngleInput(camera.yaw))
@@ -549,7 +553,7 @@ export function SceneViewport({
       return
     }
     try {
-      const project = await backend.confirmCamera(frame.camera_revision)
+      const project = await backend.confirmCamera(expectedProjectId, frame.camera_revision)
       setRejectedConfirmationAuthority(null)
       onProjectChange?.(project)
     } catch (error) {
