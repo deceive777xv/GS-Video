@@ -236,6 +236,21 @@ class SourcePerspectiveCalibration(BaseModel):
     vertical_fov: float = Field(gt=1, lt=179, allow_inf_nan=False)
     horizon_line: tuple[float, float, float]
     gravity_direction_camera: tuple[float, float, float]
+    evidence_method: str = "automatic_prior"
+    reference_relation: str | None = None
+    guide_groups: tuple[
+        tuple[
+            tuple[tuple[float, float], tuple[float, float]],
+            tuple[tuple[float, float], tuple[float, float]],
+        ],
+        tuple[
+            tuple[tuple[float, float], tuple[float, float]],
+            tuple[tuple[float, float], tuple[float, float]],
+        ],
+    ] | None = None
+    evidence_confidence: str = "low"
+    evidence_diagnostics: tuple[str, ...] = ()
+    camera_solution_cache_key: str | None = None
     revision: int = Field(ge=1)
 
     @field_validator("horizon_line", "gravity_direction_camera")

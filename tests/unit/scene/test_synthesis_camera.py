@@ -67,6 +67,60 @@ def test_horizontal_horizon_recovers_camera_up_direction() -> None:
     np.testing.assert_allclose(perspective.up_camera, (0.0, -1.0, 0.0), atol=1e-9)
 
 
+def _guide_pair(vanishing_point: tuple[float, float]) -> tuple[
+    tuple[tuple[float, float], tuple[float, float]],
+    tuple[tuple[float, float], tuple[float, float]],
+]:
+    def segment(start: tuple[float, float]) -> tuple[tuple[float, float], tuple[float, float]]:
+        return start, (
+            start[0] + 0.28 * (vanishing_point[0] - start[0]),
+            start[1] + 0.28 * (vanishing_point[1] - start[1]),
+        )
+
+    return segment((220.0, 260.0)), segment((420.0, 880.0))
+
+
+def test_orthogonal_guides_recover_vertical_fov_and_horizontal_plane_normal() -> None:
+    width, height, expected_fov = 1920, 1080, 60.0
+    focal = 0.5 * height / np.tan(np.radians(expected_fov) / 2)
+
+    perspective = SourcePerspective.from_orthogonal_guides(
+        width=width,
+        height=height,
+        group_a=_guide_pair((width / 2 + focal, height / 2)),
+        group_b=_guide_pair((width / 2 - focal, height / 2)),
+        reference_relation="both_horizontal_plane",
+    )
+
+    assert perspective.fov_y_degrees == pytest.approx(expected_fov)
+    np.testing.assert_allclose(perspective.up_camera, (0.0, -1.0, 0.0), atol=1e-8)
+
+
+def test_orthogonal_guides_reject_parallel_and_non_positive_focal_evidence() -> None:
+    parallel = (((100.0, 50.0), (300.0, 100.0)), ((100.0, 150.0), (300.0, 200.0)))
+    with pytest.raises(ValueError, match="parallel or nearly parallel"):
+        SourcePerspective.from_orthogonal_guides(
+            width=640,
+            height=360,
+            group_a=parallel,
+            group_b=parallel,
+            reference_relation="a_vertical_b_horizontal",
+        )
+
+    nearly_parallel = (
+        ((100.0, 100.0), (500.0, 100.0)),
+        ((100.0, 200.0), (500.0, 200.01)),
+    )
+    with pytest.raises(ValueError, match="parallel or nearly parallel"):
+        SourcePerspective.from_orthogonal_guides(
+            width=640,
+            height=360,
+            group_a=nearly_parallel,
+            group_b=nearly_parallel,
+            reference_relation="a_vertical_b_horizontal",
+        )
+
+
 @pytest.mark.parametrize("azimuth", [0.0, 45.0, 90.0])
 def test_contact_mode_keeps_selected_pixel_bound_to_p0(azimuth: float) -> None:
     rig = SynthesisCameraRig(

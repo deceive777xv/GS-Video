@@ -455,11 +455,8 @@ class ProductionHarness:
                     "anchor_frame_index": 0,
                     "image_width": 4,
                     "image_height": 3,
-                    "vertical_fov": 60.0,
-                    "horizon_start": [0.0, 1.5],
-                    "horizon_end": [4.0, 1.5],
-                    "vertical_bottom": [2.0, 2.0],
-                    "vertical_top": [2.0, 0.0],
+                    "evidence_method": "automatic_prior",
+                    "prior_source": "centered_60_degree_default",
                 },
                 headers=headers,
             )

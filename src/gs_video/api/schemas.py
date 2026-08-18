@@ -339,11 +339,35 @@ class SourcePerspectiveCalibrationRequest(StrictModel):
     anchor_frame_index: int = Field(ge=0)
     image_width: int = Field(gt=0, le=16384)
     image_height: int = Field(gt=0, le=16384)
-    vertical_fov: float = Field(gt=1, lt=179, allow_inf_nan=False)
-    horizon_start: list[float] = Field(min_length=2, max_length=2)
-    horizon_end: list[float] = Field(min_length=2, max_length=2)
-    vertical_bottom: list[float] = Field(min_length=2, max_length=2)
-    vertical_top: list[float] = Field(min_length=2, max_length=2)
+    evidence_method: Literal["orthogonal_guides", "automatic_prior"]
+    reference_relation: Literal[
+        "a_vertical_b_horizontal", "both_horizontal_plane"
+    ] | None = None
+    group_a: list[list[list[float]]] | None = None
+    group_b: list[list[list[float]]] | None = None
+    prior_source: Literal["centered_60_degree_default"] | None = None
+
+    @model_validator(mode="after")
+    def validate_evidence(self) -> Self:
+        if self.evidence_method == "orthogonal_guides":
+            if self.reference_relation is None or self.group_a is None or self.group_b is None:
+                raise ValueError("orthogonal guide evidence requires relation and both guide groups")
+            if self.prior_source is not None:
+                raise ValueError("orthogonal guide evidence must not include an automatic prior")
+            for group_name, group in (("group_a", self.group_a), ("group_b", self.group_b)):
+                if len(group) != 2 or any(
+                    len(segment) != 2 or any(len(point) != 2 for point in segment)
+                    for segment in group
+                ):
+                    raise ValueError(f"{group_name} must contain two two-point line segments")
+                if not all(isfinite(component) for segment in group for point in segment for component in point):
+                    raise ValueError(f"{group_name} must contain finite coordinates")
+        else:
+            if self.prior_source is None:
+                raise ValueError("automatic prior evidence requires prior_source")
+            if self.reference_relation is not None or self.group_a is not None or self.group_b is not None:
+                raise ValueError("automatic prior evidence must not include guide evidence")
+        return self
 
 
 class VisibilityAuditRequest(StrictModel):

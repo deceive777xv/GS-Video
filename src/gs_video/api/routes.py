@@ -73,6 +73,8 @@ from gs_video.api.workflow import (
     validate_pick_buffer,
     validate_subject_prompt,
 )
+
+
 from gs_video.domain.contracts import PickBuffer
 from gs_video.domain.models import (
     CameraPose,
@@ -141,6 +143,22 @@ from gs_video.resource_admission import (
     fits_vram_budget,
     project_cache_has_capacity,
 )
+
+
+ImageGuideGroup = tuple[
+    tuple[tuple[float, float], tuple[float, float]],
+    tuple[tuple[float, float], tuple[float, float]],
+]
+
+
+def _image_guide_group(value: list[list[list[float]]]) -> ImageGuideGroup:
+    return cast(
+        ImageGuideGroup,
+        tuple(
+            tuple(tuple(float(component) for component in point) for point in segment)
+            for segment in value
+        ),
+    )
 
 
 _DESKTOP_ORIGINS = {
@@ -1765,13 +1783,27 @@ def build_router() -> APIRouter:
                     message="The source or segmentation authority changed before calibration was saved.",
                 )
             try:
-                perspective = SourcePerspective.from_horizon(
-                    width=calibration.image_width,
-                    height=calibration.image_height,
-                    fov_y_degrees=calibration.vertical_fov,
-                    horizon_start=(calibration.horizon_start[0], calibration.horizon_start[1]),
-                    horizon_end=(calibration.horizon_end[0], calibration.horizon_end[1]),
-                )
+                if calibration.evidence_method == "orthogonal_guides":
+                    assert calibration.group_a is not None
+                    assert calibration.group_b is not None
+                    assert calibration.reference_relation is not None
+                    guide_a = _image_guide_group(calibration.group_a)
+                    guide_b = _image_guide_group(calibration.group_b)
+                    perspective = SourcePerspective.from_orthogonal_guides(
+                        width=calibration.image_width,
+                        height=calibration.image_height,
+                        group_a=guide_a,
+                        group_b=guide_b,
+                        reference_relation=calibration.reference_relation,
+                    )
+                else:
+                    perspective = SourcePerspective.from_horizon(
+                        width=calibration.image_width,
+                        height=calibration.image_height,
+                        fov_y_degrees=60.0,
+                        horizon_start=(0.0, calibration.image_height / 2),
+                        horizon_end=(float(calibration.image_width), calibration.image_height / 2),
+                    )
             except ValueError as error:
                 raise ApiError(
                     422,
@@ -1779,51 +1811,6 @@ def build_router() -> APIRouter:
                     category="validation",
                     message=str(error),
                 ) from error
-            vertical_bottom = np.array((*calibration.vertical_bottom, 1.0))
-            vertical_top = np.array((*calibration.vertical_top, 1.0))
-            vertical_line = np.cross(vertical_bottom, vertical_top)
-            if np.linalg.norm(vertical_line[:2]) <= 1e-9:
-                raise ApiError(
-                    422,
-                    code="invalid_vertical_reference",
-                    category="validation",
-                    message="The vertical reference endpoints must be distinct.",
-                )
-            vertical_vanishing_point = perspective.intrinsics() @ perspective.up_camera
-            if abs(vertical_vanishing_point[2]) > 1e-8:
-                point = vertical_vanishing_point[:2] / vertical_vanishing_point[2]
-                residual = abs(
-                    vertical_line[0] * point[0]
-                    + vertical_line[1] * point[1]
-                    + vertical_line[2]
-                ) / np.linalg.norm(vertical_line[:2])
-                consistent = residual <= 0.05 * max(
-                    calibration.image_width, calibration.image_height
-                )
-            else:
-                line_direction = np.array(
-                    (
-                        calibration.vertical_top[0] - calibration.vertical_bottom[0],
-                        calibration.vertical_top[1] - calibration.vertical_bottom[1],
-                    )
-                )
-                vp_direction = vertical_vanishing_point[:2]
-                denominator = np.linalg.norm(line_direction) * np.linalg.norm(vp_direction)
-                consistent = denominator > 1e-9 and (
-                    abs(
-                        line_direction[0] * vp_direction[1]
-                        - line_direction[1] * vp_direction[0]
-                    )
-                    / denominator
-                    <= 0.1
-                )
-            if not consistent:
-                raise ApiError(
-                    422,
-                    code="perspective_references_inconsistent",
-                    category="validation",
-                    message="The selected horizon and vertical reference are inconsistent for this FOV.",
-                )
             revision = project.workflow.source_calibration_generation + 1
             project.workflow.source_calibration_generation = revision
             project.workflow.source_perspective_calibration = SourcePerspectiveCalibration(
@@ -1833,7 +1820,7 @@ def build_router() -> APIRouter:
                 anchor_frame_index=calibration.anchor_frame_index,
                 image_width=calibration.image_width,
                 image_height=calibration.image_height,
-                vertical_fov=calibration.vertical_fov,
+                vertical_fov=perspective.fov_y_degrees,
                 horizon_line=(
                     float(perspective.horizon_line[0]),
                     float(perspective.horizon_line[1]),
@@ -1843,6 +1830,20 @@ def build_router() -> APIRouter:
                     float(perspective.up_camera[0]),
                     float(perspective.up_camera[1]),
                     float(perspective.up_camera[2]),
+                ),
+                evidence_method=calibration.evidence_method,
+                reference_relation=calibration.reference_relation,
+                guide_groups=(
+                    _image_guide_group(calibration.group_a),
+                    _image_guide_group(calibration.group_b),
+                )
+                if calibration.group_a is not None and calibration.group_b is not None
+                else None,
+                evidence_confidence="high" if calibration.evidence_method == "orthogonal_guides" else "low",
+                evidence_diagnostics=(
+                    "方形像素、零 skew、中心主点；FOV 由两组正交方向求解。",
+                ) if calibration.evidence_method == "orthogonal_guides" else (
+                    "未获得足够透视证据，使用中心主点、方形像素和 60° 垂直 FOV 系统初值。",
                 ),
                 revision=revision,
             )

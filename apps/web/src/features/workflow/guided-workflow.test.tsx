@@ -87,7 +87,9 @@ function authorizeSynthesisPlacement(current: ProjectDto): void {
     source_asset_id: current.source_video ?? 'source', ingest_cache_key: 'cache',
     segment_cache_key: 'cache', anchor_frame_index: 0, image_width: 640,
     image_height: 360, vertical_fov: 50, horizon_line: [0, 1, -180],
-    gravity_direction_camera: [0, -1, 0], revision: 1,
+    gravity_direction_camera: [0, -1, 0], evidence_method: 'automatic_prior',
+    reference_relation: null, guide_groups: null, evidence_confidence: 'low',
+    evidence_diagnostics: ['test prior'], camera_solution_cache_key: null, revision: 1,
   }
   current.workflow.local_ground_anchor = {
     scene_asset_id: current.scene_ply ?? 'scene', p0_world: [0, 0, 0],
@@ -304,9 +306,12 @@ function createHarness(initial = project()) {
         ingest_cache_key: 'cache', segment_cache_key: 'cache',
         anchor_frame_index: input.anchor_frame_index,
         image_width: input.image_width, image_height: input.image_height,
-        vertical_fov: input.vertical_fov,
+        vertical_fov: 60,
         horizon_line: [0, 1, -input.image_height / 2],
-        gravity_direction_camera: [0, -1, 0], revision: 1,
+        gravity_direction_camera: [0, -1, 0], evidence_method: input.evidence_method,
+        reference_relation: input.reference_relation ?? null, guide_groups: null,
+        evidence_confidence: input.evidence_method === 'orthogonal_guides' ? 'high' : 'low',
+        evidence_diagnostics: ['test evidence'], camera_solution_cache_key: null, revision: 1,
       }
       return structuredClone(current)
     }),
@@ -659,7 +664,7 @@ describe('guided workflow', () => {
 
     expect(await screen.findByRole('heading', { name: '校准透视并放置合成机位' })).toBeInTheDocument()
     expect(harness.client.activateProject).toHaveBeenCalledWith('project-2')
-    expect(window.location.hash).toBe('#/projects/project-2/workflow/camera')
+    expect(window.location.hash).toBe('#/projects/project-2/workflow/camera/source')
   })
 
   it('discards a late camera response after an A to B project switch', async () => {
@@ -716,7 +721,7 @@ describe('guided workflow', () => {
     await act(async () => { resolveAudit?.(stale) })
 
     expect(screen.getByText(second.name)).toBeVisible()
-    expect(screen.getByText('尚未扫描全片可见性。')).toBeVisible()
+    expect(screen.getByText(/尚未扫描全片可见性/)).toBeVisible()
   })
 
   it('serializes authoritative mutations across all camera panels', async () => {
@@ -742,7 +747,8 @@ describe('guided workflow', () => {
     render(<App backend={harness.client} initialBootstrap={bootstrap(ready)} platform={harness.platform} />)
 
     await user.click(await screen.findByRole('button', { name: '扫描全部 Alpha' }))
-    const freeze = screen.getByRole('button', { name: '冻结当前探索视角' })
+    await user.click(screen.getByRole('link', { name: /2 · GS 场景/ }))
+    const freeze = await screen.findByRole('button', { name: '冻结当前探索视角' })
     expect(freeze).toBeDisabled()
     fireEvent.click(freeze)
     expect(harness.client.renderPreview).not.toHaveBeenCalled()
@@ -949,12 +955,14 @@ describe('guided workflow', () => {
     expect(await screen.findByLabelText('创作交互 1 / 4')).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: '下一步' }))
+    await user.click(await screen.findByRole('radio', { name: '系统初值（低置信度）' }))
     const calibrate = await screen.findByRole('button', { name: '确认源透视校准' })
     await waitFor(() => expect(calibrate).toBeEnabled())
     await user.click(calibrate)
     expect(await screen.findByLabelText('创作交互 2 / 4')).toBeInTheDocument()
 
-    await user.click(screen.getByRole('button', { name: '冻结当前探索视角' }))
+    await user.click(screen.getByRole('link', { name: /2 · GS 场景/ }))
+    await user.click(await screen.findByRole('button', { name: '冻结当前探索视角' }))
     const confirmFreeze = screen.getByRole('button', { name: '确认冻结视角' })
     await waitFor(() => expect(confirmFreeze).toBeEnabled())
     await user.click(confirmFreeze)
@@ -970,7 +978,8 @@ describe('guided workflow', () => {
     }
     await user.click(screen.getByRole('button', { name: '确认三点局部地面' }))
     expect(await screen.findByLabelText('创作交互 3 / 4')).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: '更新受约束合成预览' }))
+    await user.click(screen.getByRole('link', { name: /3 · 合成机位/ }))
+    await user.click(await screen.findByRole('button', { name: '更新受约束合成预览' }))
     await user.click(await screen.findByRole('button', { name: '确认合成机位' }))
     expect(await screen.findByLabelText('创作交互 4 / 4')).toBeInTheDocument()
 
@@ -1469,9 +1478,17 @@ describe('guided workflow', () => {
     const user = userEvent.setup()
     render(<App backend={harness.client} initialBootstrap={bootstrap(recovered)} platform={harness.platform} />)
 
-    const roll = screen.getByRole('spinbutton', { name: '探索相机 roll' })
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 120)) })
+    expect(harness.client.renderLivePreview).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('link', { name: /2 · GS 场景/ }))
+    const roll = await screen.findByRole('spinbutton', { name: '探索相机 roll' })
+    const viewport = screen.getByLabelText('Gaussian 6DoF 探索视口')
+    const wheel = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 100 })
+    viewport.dispatchEvent(wheel)
+    expect(wheel.defaultPrevented).toBe(true)
+    expect(within(viewport).getByRole('button', { name: '前' })).toBeInTheDocument()
     await user.clear(roll)
-    await user.type(roll, '12.5')
+    await user.type(roll, '12.5{Enter}')
     await waitFor(() => expect(harness.client.renderLivePreview).toHaveBeenCalled())
     const latest = vi.mocked(harness.client.renderLivePreview).mock.calls.at(-1)?.[0]
     expect(latest?.camera).toHaveProperty('camera_to_world')
@@ -1504,8 +1521,9 @@ describe('guided workflow', () => {
 
     render(<App backend={harness.client} initialBootstrap={bootstrap(ready)} platform={harness.platform} />)
 
-    const contactMode = await screen.findByRole('radio', { name: '脚底接触 P0' })
+    let contactMode = await screen.findByRole('radio', { name: '脚底接触 P0' })
     expect(contactMode).toBeDisabled()
+    await user.click(screen.getByRole('link', { name: /1 · 源透视/ }))
     const sourceImage = await screen.findByRole('img', { name: '源透视锚定帧' })
     const sourceFrame = sourceImage.parentElement
     expect(sourceFrame).not.toBeNull()
@@ -1513,6 +1531,7 @@ describe('guided workflow', () => {
       x: 0, y: 0, left: 0, top: 0, right: 640, bottom: 360,
       width: 640, height: 360, toJSON: () => ({}),
     })
+    await user.click(screen.getByRole('button', { name: '脚底候选' }))
     fireEvent.pointerDown(sourceFrame!, { clientX: 320, clientY: 300 })
     await user.click(screen.getByRole('button', { name: '确认脚底候选' }))
 
@@ -1521,6 +1540,8 @@ describe('guided workflow', () => {
       source_calibration_revision: 1,
       foot_pixel: [320, 300],
     }))
+    await user.click(screen.getByRole('link', { name: /3 · 合成机位/ }))
+    contactMode = await screen.findByRole('radio', { name: '脚底接触 P0' })
     expect(contactMode).toBeEnabled()
   })
 

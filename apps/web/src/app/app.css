@@ -487,11 +487,29 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
 }
 /* Constrained camera calibration workspace */
+.camera-workbench-page {
+  align-content: start;
+  justify-self: center;
+  margin-inline: auto;
+  max-width: 1120px;
+  width: min(100%, 1120px);
+}
 .constrained-camera-workspace {
   display: grid;
   gap: 18px;
   grid-column: 1 / -1;
 }
+
+.camera-subnav {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.camera-subnav a { border: 1px solid var(--line); border-radius: 10px; color: var(--muted); display: grid; gap: 3px; padding: 11px 13px; text-decoration: none; }
+.camera-subnav a strong { color: var(--text); font-size: .78rem; }
+.camera-subnav a small { font-size: .65rem; }
+.camera-subnav a.is-complete::after { color: var(--acid); content: "已完成"; font-size: .62rem; grid-column: 2; grid-row: 1; justify-self: end; }
+.camera-subnav a.is-current { background: var(--acid-soft); border-color: rgba(183,246,61,.55); box-shadow: inset 0 2px var(--acid); }
 
 .calibration-card {
   background: color-mix(in srgb, var(--panel) 92%, transparent);
@@ -526,7 +544,7 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 .source-calibration-grid, .synthesis-layout {
   display: grid;
   gap: 16px;
-  grid-template-columns: minmax(0, 1fr) minmax(260px, .42fr);
+  grid-template-columns: minmax(0, 804px) minmax(280px, 300px);
 }
 
 .source-reference-frame, .synthesis-preview {
@@ -539,12 +557,67 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 }
 
 .source-reference-frame img, .synthesis-preview canvas { display: block; height: 100%; object-fit: contain; width: 100%; }
+.source-reference-frame.tool-foot { cursor: crosshair; }
+.perspective-guides { inset: 0; position: absolute; touch-action: none; z-index: 4; }
+.guide-segment { height: 3px; position: absolute; transform-origin: left center; }
+.guide-a { background: #b7f63d; box-shadow: 0 0 10px rgba(183,246,61,.55); }
+.guide-b { background: #55d6c2; box-shadow: 0 0 10px rgba(85,214,194,.55); }
+.guide-handle { background: currentColor; border: 2px solid #08100a; border-radius: 50%; color: inherit; height: 18px; min-height: 18px; padding: 0; position: absolute; top: 50%; transform: translate(-50%, -50%); width: 18px; }
+.guide-a .guide-handle { color: #b7f63d; }
+.guide-b .guide-handle { color: #55d6c2; }
+.guide-handle:focus-visible { outline-offset: 3px; }
+.segmented-tools { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.segmented-tools button { background: transparent; border-color: #364149; color: #aab6b0; }
+.segmented-tools button[aria-pressed="true"] { background: var(--acid-soft); border-color: var(--acid); color: var(--acid); }
+.calibration-fields fieldset { background: rgba(8,12,15,.24); border: 1px solid var(--line); border-radius: 8px; display: grid; gap: 7px; margin: 0; padding: 9px; }
+.calibration-fields legend { color: var(--muted); font-size: .65rem; padding: 0 4px; }
+.calibration-fields fieldset label { align-items: center; display: grid; gap: 8px; grid-template-columns: auto 1fr; }
+.evidence-readout { background: rgba(8,12,15,.34); border: 1px solid var(--line); border-radius: 8px; display: grid; gap: 6px; padding: 10px; }
+.evidence-readout strong { color: var(--acid); font-size: .76rem; }
+.evidence-readout span, .evidence-readout small { color: var(--muted); font-size: .68rem; line-height: 1.45; }
+.evidence-readout b { color: var(--text); }
+.evidence-readout.is-invalid { border-color: rgba(255,107,107,.3); }
+.evidence-readout.is-invalid strong { color: #d98b8b; }
+.source-secondary-panel { border-top: 1px solid var(--line); display: grid; gap: 10px; margin-top: 16px; padding-top: 14px; }
+.source-secondary-panel h4, .source-secondary-panel p { margin: 0; }
+.source-secondary-panel h4 { font-size: .82rem; }
+.source-secondary-panel p { color: var(--muted); font-size: .72rem; }
 .reference-line { background: var(--acid); box-shadow: 0 0 0 1px #0008, 0 0 10px color-mix(in srgb, var(--acid) 70%, transparent); display: block; height: 2px; pointer-events: none; position: absolute; transform-origin: left center; z-index: 3; }
 .vertical-line { height: 100%; width: 2px; transform-origin: bottom center; }
 .perspective-ground-grid { inset: 0; pointer-events: none; position: absolute; width: 100%; height: 100%; z-index: 2; }
 .perspective-ground-grid polyline { fill: none; stroke: rgba(183,246,61,.34); stroke-width: 1; vector-effect: non-scaling-stroke; }
 .calibration-fields { display: grid; gap: 10px; }
 .calibration-fields label, .sixdof-readout label { display: grid; gap: 5px; }
+.camera-workbench-page .calibration-fields { color: #a5b1ab; font-size: .68rem; }
+.camera-workbench-page .calibration-fields > label,
+.camera-workbench-page .calibration-fields fieldset label { color: #aeb9b4; font-size: .68rem; font-weight: 500; line-height: 1.35; }
+.camera-workbench-page .calibration-fields input:not([type="radio"]):not([type="range"]) {
+  min-height: 34px;
+  padding: .46rem .58rem;
+  color: #d8e1dd;
+  background: #0b1013;
+  font-size: .72rem;
+}
+.camera-workbench-page .segmented-tools button {
+  min-height: 36px;
+  padding: .45rem .65rem;
+  font-size: .7rem;
+  font-weight: 650;
+}
+.camera-workbench-page .anchor-suggestions { align-items: center; color: #87958e; font-size: .66rem; }
+.camera-workbench-page .anchor-suggestions button {
+  min-height: 32px;
+  padding: .36rem .58rem;
+  font-size: .68rem;
+  font-weight: 700;
+}
+.camera-workbench-page .calibration-fields > button {
+  min-height: 38px;
+  padding: .52rem .72rem;
+  font-size: .72rem;
+  font-weight: 750;
+}
+.camera-workbench-page .calibration-fields > small { color: #87958e; font-size: .66rem; line-height: 1.4; }
 
 .ground-point-marker {
   align-items: center;
@@ -571,8 +644,32 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 
 .sixdof-readout { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .sixdof-readout input { min-width: 0; width: 100%; }
-.movement-pad button { flex: 1 1 28%; }
+.exploration-viewport { overscroll-behavior: contain; }
+.game-movement-pad { bottom: 16px; display: grid; gap: 4px; grid-template-columns: repeat(4, 42px); grid-template-rows: repeat(3, 42px); left: 16px; position: absolute; z-index: 8; }
+.game-movement-pad button { backdrop-filter: blur(5px); background: rgba(12,18,16,.78); border-color: rgba(183,246,61,.62); color: var(--text); min-height: 42px; padding: 0; }
+.game-movement-pad .move-forward { grid-column: 2; grid-row: 1; }
+.game-movement-pad .move-left { grid-column: 1; grid-row: 2; }
+.game-movement-pad .move-back { grid-column: 2; grid-row: 2; }
+.game-movement-pad .move-right { grid-column: 3; grid-row: 2; }
+.game-movement-pad .move-up { grid-column: 4; grid-row: 1; }
+.game-movement-pad .move-down { grid-column: 4; grid-row: 2; }
+.exploration-viewport::after { left: auto; right: .8rem; }
+.range-number { align-items: center; display: grid; gap: 7px; grid-template-columns: 1fr 78px; }
+.range-number input[type="number"] { min-width: 0; }
+.camera-secondary-panel { margin-top: 14px; }
+.camera-secondary-panel fieldset { border: 1px solid var(--line); border-radius: 10px; margin: 0; padding: 12px; }
+.camera-secondary-panel legend { color: var(--muted); font-size: .68rem; }
+.camera-secondary-panel p { color: var(--muted); font-size: .72rem; }
+.secondary-actions { align-items: center; display: flex; flex-wrap: wrap; gap: 9px; }
+.secondary-actions label { color: var(--muted); font-size: .72rem; }
+.synthesis-preview { aspect-ratio: 16 / 9 !important; }
+.synthesis-preview.is-draggable { cursor: grab; touch-action: none; }
+.synthesis-preview.is-draggable:active { cursor: grabbing; }
+.derived-camera-readout { display: grid; gap: 6px; grid-template-columns: repeat(2, minmax(0,1fr)); }
+.derived-camera-readout span { background: #090d10; border-radius: 5px; color: var(--muted); display: flex; font: .65rem ui-monospace, monospace; justify-content: space-between; padding: 7px; }
+.derived-camera-readout b { color: var(--text); }
 
 @media (max-width: 900px) {
   .source-calibration-grid, .synthesis-layout { grid-template-columns: 1fr; }
+  .camera-subnav { grid-template-columns: 1fr; }
 }

@@ -11,10 +11,17 @@ import type {
   MatrixCameraInput,
   PreviewFrameDto,
   ProjectDto,
-  SourcePerspectiveCalibrationDto,
   SubjectMediaDto,
 } from '../../api/types'
 import { toImagePoint, type ImagePoint } from '../coordinates/image-point'
+import {
+  defaultGuideGroups,
+  imagePointToFramePercent,
+  PerspectiveGuides,
+  solvePerspectiveGuides,
+  type GuideGroups,
+  type ReferenceRelation,
+} from './perspective-guides'
 
 interface WorkspaceProps {
   backend: BackendClient
@@ -25,6 +32,12 @@ interface WorkspaceProps {
   onRefresh(): Promise<ProjectDto>
 }
 
+export type CameraPanel = 'source' | 'scene' | 'synthesis'
+
+interface CameraWorkspaceProps extends WorkspaceProps {
+  panel: CameraPanel
+}
+
 interface MutationWorkspaceProps extends WorkspaceProps {
   mutationPending: boolean
   beginMutation(): boolean
@@ -32,12 +45,14 @@ interface MutationWorkspaceProps extends WorkspaceProps {
 }
 
 interface SourceCalibrationPanelProps extends MutationWorkspaceProps {
+  active: boolean
   confirmedFoot: ImagePoint | null
   draftDirty: boolean
   onDraftDirtyChange(value: boolean): void
 }
 
 interface SynthesisPanelProps extends MutationWorkspaceProps {
+  active: boolean
   calibrationDraftDirty: boolean
   confirmedFoot: ImagePoint | null
 }
@@ -126,53 +141,41 @@ function useBlobUrl(): [string | null, (blob: Blob | null) => void] {
 }
 
 function Marker({ point, width, height, label }: { point: ImagePoint; width: number; height: number; label: string }) {
+  const scale = Math.min(16 / width, 9 / height)
+  const left = ((16 - width * scale) / 2 + (point.x + .5) * scale) / 16 * 100
+  const top = ((9 - height * scale) / 2 + (point.y + .5) * scale) / 9 * 100
   return (
     <span
       className="ground-point-marker"
-      style={{ left: `${(point.x + 0.5) / width * 100}%`, top: `${(point.y + 0.5) / height * 100}%` }}
+      style={{ left: `${left}%`, top: `${top}%` }}
     >{label}</span>
   )
 }
 
+function NumericField({ disabled, label, onCommit, step = .1, value }: {
+  disabled: boolean
+  label: string
+  onCommit(value: number): void
+  step?: number
+  value: number
+}) {
+  const [text, setText] = useState(String(Number(value.toFixed(3))))
+  const inputRef = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (document.activeElement !== inputRef.current) setText(String(Number(value.toFixed(3))))
+  }, [value])
+  const commit = (): void => {
+    const parsed = Number(text)
+    if (text.trim() !== '' && Number.isFinite(parsed)) onCommit(parsed)
+    else setText(String(Number(value.toFixed(3))))
+  }
+  return <input aria-label={label} disabled={disabled} onBlur={commit} onChange={(event) => setText(event.currentTarget.value)} onKeyDown={(event) => {
+    if (event.key === 'Enter') { event.preventDefault(); commit(); event.currentTarget.blur() }
+    if (event.key === 'Escape') { event.preventDefault(); setText(String(Number(value.toFixed(3)))); event.currentTarget.blur() }
+  }} ref={inputRef} step={step} type="number" value={text} />
+}
+
 type Vector3 = [number, number, number]
-
-interface CalibrationControls {
-  fov: number
-  horizonLeft: number
-  horizonRight: number
-  verticalXBottom: number
-  verticalXTop: number
-}
-
-function calibrationControls(calibration: SourcePerspectiveCalibrationDto | null): CalibrationControls {
-  if (calibration === null) return {
-    fov: 50, horizonLeft: 50, horizonRight: 50, verticalXBottom: 50, verticalXTop: 50,
-  }
-  const { image_width: width, image_height: height } = calibration
-  const [a, b, c] = calibration.horizon_line
-  const horizonY = (x: number): number => Math.abs(b) <= 1e-9 ? height / 2 : -(a * x + c) / b
-  const focal = 0.5 * height / Math.tan(calibration.vertical_fov * Math.PI / 360)
-  const [gx, gy, gz] = calibration.gravity_direction_camera
-  const bottomX = width / 2
-  const bottomY = height - 1
-  let topX = bottomX
-  if (Math.abs(gz) > 1e-9) {
-    const vanishingX = (focal * gx + width / 2 * gz) / gz
-    const vanishingY = (focal * gy + height / 2 * gz) / gz
-    if (Math.abs(vanishingY - bottomY) > 1e-9) {
-      topX = bottomX + (vanishingX - bottomX) * -bottomY / (vanishingY - bottomY)
-    }
-  } else if (Math.abs(gy) > 1e-9) {
-    topX = bottomX - bottomY * gx / gy
-  }
-  return {
-    fov: calibration.vertical_fov,
-    horizonLeft: horizonY(0) / height * 100,
-    horizonRight: horizonY(width) / height * 100,
-    verticalXBottom: bottomX / width * 100,
-    verticalXTop: topX / width * 100,
-  }
-}
 
 function dot3(left: Vector3, right: Vector3): number {
   return left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
@@ -217,41 +220,6 @@ function projectWorldPoint(point: Vector3, cameraToWorld: Matrix4, fov: number, 
   if (camera[2] <= 1e-6) return null
   const focal = 0.5 * height / Math.tan(fov * Math.PI / 360)
   return { x: focal * camera[0] / camera[2] + width / 2, y: focal * camera[1] / camera[2] + height / 2 }
-}
-
-function PerspectiveGrid({ width, height, fov, horizonLeft, horizonRight }: {
-  width: number; height: number; fov: number; horizonLeft: number; horizonRight: number
-}) {
-  const leftY = horizonLeft / 100 * height
-  const rightY = horizonRight / 100 * height
-  const horizon: Vector3 = [leftY - rightY, width, -width * leftY]
-  const focal = 0.5 * height / Math.tan(fov * Math.PI / 360)
-  let up = unit3([focal * horizon[0], focal * horizon[1], width / 2 * horizon[0] + height / 2 * horizon[1] + horizon[2]])
-  if (up === null) return null
-  if (up[1] > 0) up = [-up[0], -up[1], -up[2]]
-  const optical: Vector3 = [0, 0, 1]
-  const forward = unit3([
-    optical[0] - dot3(optical, up) * up[0],
-    optical[1] - dot3(optical, up) * up[1],
-    optical[2] - dot3(optical, up) * up[2],
-  ])
-  if (forward === null) return null
-  const right = unit3(cross3(forward, up))
-  if (right === null) return null
-  const project = (x: number, z: number): string | null => {
-    const point: Vector3 = [
-      right[0] * x + forward[0] * z - up[0],
-      right[1] * x + forward[1] * z - up[1],
-      right[2] * x + forward[2] * z - up[2],
-    ]
-    if (point[2] <= 1e-6) return null
-    return `${focal * point[0] / point[2] + width / 2},${focal * point[1] / point[2] + height / 2}`
-  }
-  const depthLines = [1.25, 1.7, 2.3, 3.2, 4.5, 6.5, 9]
-    .map((z) => [-6, 6].map((x) => project(x, z)).filter((point): point is string => point !== null))
-  const longitudinal = [-4, -3, -2, -1, 0, 1, 2, 3, 4]
-    .map((x) => [1.05, 1.3, 1.7, 2.3, 3.2, 4.5, 6.5, 9, 13].map((z) => project(x, z)).filter((point): point is string => point !== null))
-  return <svg aria-label="由当前 FOV 与地平线派生的透视地面网格" className="perspective-ground-grid" preserveAspectRatio="none" viewBox={`0 0 ${width} ${height}`}>{[...depthLines, ...longitudinal].map((points, index) => points.length < 2 ? null : <polyline key={index} points={points.join(' ')} />)}</svg>
 }
 
 function ReviewThumbnail({ backend, busy, frame, selected, onError, onSelect }: {
@@ -316,6 +284,7 @@ function AuditReviewGroup({ backend, busy, label, ranges, selectedFrame, onError
 
 function SourceCalibrationPanel({
   backend,
+  active,
   busy,
   project,
   onError,
@@ -337,29 +306,34 @@ function SourceCalibrationPanel({
   const [media, setMedia] = useState<SubjectMediaDto | null>(null)
   const [sourceUrl, replaceSourceUrl] = useBlobUrl()
   const [alphaUrl, replaceAlphaUrl] = useBlobUrl()
-  const initialControls = calibrationControls(workflow.source_perspective_calibration)
-  const [fov, setFov] = useState(initialControls.fov)
-  const [horizonLeft, setHorizonLeft] = useState(initialControls.horizonLeft)
-  const [horizonRight, setHorizonRight] = useState(initialControls.horizonRight)
-  const [verticalXBottom, setVerticalXBottom] = useState(initialControls.verticalXBottom)
-  const [verticalXTop, setVerticalXTop] = useState(initialControls.verticalXTop)
+  const storedGroups = workflow.source_perspective_calibration?.guide_groups
+  const [groups, setGroups] = useState<GuideGroups>(() => storedGroups === null || storedGroups === undefined
+    ? defaultGuideGroups(960, 540)
+    : storedGroups.map((group) => group.map((segment) => segment.map(([x, y]) => ({ x, y })))) as GuideGroups)
+  const [relation, setRelation] = useState<ReferenceRelation>(workflow.source_perspective_calibration?.reference_relation ?? 'a_vertical_b_horizontal')
+  const [guidesTouched, setGuidesTouched] = useState(storedGroups !== null && storedGroups !== undefined)
+  const [evidenceMethod, setEvidenceMethod] = useState<'orthogonal_guides' | 'automatic_prior'>(
+    workflow.source_perspective_calibration === null || workflow.source_perspective_calibration.evidence_method === 'orthogonal_guides' ? 'orthogonal_guides' : 'automatic_prior',
+  )
+  const [tool, setTool] = useState<'guides' | 'foot'>('guides')
   const [footDraft, setFootDraft] = useState<ImagePoint | null>(null)
   const sourceFrameRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     const calibration = workflow.source_perspective_calibration
     if (calibration === null) return
-    const controls = calibrationControls(calibration)
     setAnchorFrame(calibration.anchor_frame_index)
-    setFov(controls.fov)
-    setHorizonLeft(controls.horizonLeft)
-    setHorizonRight(controls.horizonRight)
-    setVerticalXBottom(controls.verticalXBottom)
-    setVerticalXTop(controls.verticalXTop)
+    setRelation(calibration.reference_relation ?? 'a_vertical_b_horizontal')
+    setEvidenceMethod(calibration.evidence_method === 'orthogonal_guides' ? 'orthogonal_guides' : 'automatic_prior')
+    if (calibration.guide_groups !== null) {
+      setGroups(calibration.guide_groups.map((group) => group.map((segment) => segment.map(([x, y]) => ({ x, y })))) as GuideGroups)
+      setGuidesTouched(true)
+    }
     onDraftDirtyChange(false)
   }, [onDraftDirtyChange, workflow.source_perspective_calibration?.revision])
 
   useEffect(() => {
+    if (!active) return
     let cancelled = false
     setMedia(null)
     replaceSourceUrl(null)
@@ -376,6 +350,11 @@ function SourceCalibrationPanel({
         ])
         if (cancelled) return
         setMedia(descriptor)
+        if (workflow.source_perspective_calibration?.guide_groups === null
+          || workflow.source_perspective_calibration?.guide_groups === undefined) {
+          setGroups(defaultGuideGroups(descriptor.width, descriptor.height))
+          setGuidesTouched(false)
+        }
         replaceSourceUrl(source)
         replaceAlphaUrl(alpha)
         setFootDraft(null)
@@ -385,7 +364,7 @@ function SourceCalibrationPanel({
     }
     void load()
     return () => { cancelled = true }
-  }, [anchorFrame, backend, project.project_id, segmentKey])
+  }, [active, anchorFrame, backend, project.project_id, segmentKey, workflow.source_perspective_calibration?.revision])
 
   const scan = async (): Promise<void> => {
     if (segmentKey === null || !beginMutation()) return
@@ -405,11 +384,12 @@ function SourceCalibrationPanel({
         anchor_frame_index: anchorFrame,
         image_width: width,
         image_height: height,
-        vertical_fov: fov,
-        horizon_start: [0, horizonLeft / 100 * height],
-        horizon_end: [width, horizonRight / 100 * height],
-        vertical_bottom: [verticalXBottom / 100 * width, height - 1],
-        vertical_top: [verticalXTop / 100 * width, 0],
+        evidence_method: evidenceMethod,
+        ...(evidenceMethod === 'orthogonal_guides' ? {
+          reference_relation: relation,
+          group_a: groups[0].map((segment) => segment.map((point) => [point.x, point.y])) as [[[number, number], [number, number]], [[number, number], [number, number]]],
+          group_b: groups[1].map((segment) => segment.map((point) => [point.x, point.y])) as [[[number, number], [number, number]], [[number, number], [number, number]]],
+        } : { prior_source: 'centered_60_degree_default' }),
       })
       onDraftDirtyChange(false)
       onProjectChange(updated)
@@ -429,20 +409,52 @@ function SourceCalibrationPanel({
   }
 
   const chooseFoot = (event: ReactPointerEvent<HTMLDivElement>): void => {
-    if (busy || pending || media === null || sourceFrameRef.current === null) return
+    if (busy || pending || tool !== 'foot' || media === null || sourceFrameRef.current === null) return
     const point = toImagePoint(event, sourceFrameRef.current.getBoundingClientRect(), media)
     if (point !== null) setFootDraft(point)
   }
 
   const audit = workflow.subject_visibility_audit
+  const preview = media === null || evidenceMethod === 'automatic_prior'
+    ? { valid: true, fov: 60, horizon: null, gravity: [0, -1, 0] as [number, number, number], message: '没有足够透视证据时使用 60° 系统初值，仅供视觉预览。' }
+    : solvePerspectiveGuides(media, groups, relation)
+  const confirmedCalibration = workflow.source_perspective_calibration
+  const evidenceReady = evidenceMethod === 'automatic_prior' || guidesTouched
+  const previewRoll = preview.gravity === null ? null : Math.atan2(preview.gravity[0], -preview.gravity[1]) * 180 / Math.PI
+  const horizonStyle = media === null || preview.horizon === null || Math.abs(preview.horizon[1]) <= 1e-9
+    ? null
+    : (() => {
+        const [a, b, c] = preview.horizon
+        const start = imagePointToFramePercent({ x: 0, y: -c / b }, media)
+        const end = imagePointToFramePercent({ x: media.width - 1, y: -(a * (media.width - 1) + c) / b }, media)
+        return { left: `${start.x}%`, top: `${start.y}%`, width: `${Math.hypot(end.x - start.x, end.y - start.y)}%`, transform: `rotate(${Math.atan2(end.y - start.y, end.x - start.x) * 180 / Math.PI}deg)` }
+      })()
   return (
     <section aria-busy={busy} className="calibration-card" aria-labelledby="source-calibration-title">
       <div className="calibration-card-heading">
         <div><span className="step-kicker">A · 源画面</span><h3 id="source-calibration-title">透视与可见性校准</h3></div>
         <button disabled={busy || pending || segmentKey === null} onClick={() => void scan()} type="button">扫描全部 Alpha</button>
       </div>
-      <p className="technical-note">Alpha 只生成“完整下边界候选”，不会自动断言该处就是脚。半身、坐姿和遮挡素材可直接选纯透视模式。</p>
-      {audit === null ? <p>尚未扫描全片可见性。</p> : (
+      <p className="technical-note">把两组线分别贴到现实中平行、画面中汇聚的边缘。系统求解 FOV；没有足够证据时可使用明确标记的低置信度初值。</p>
+      <div className="source-calibration-grid">
+        <div className={`source-reference-frame tool-${tool}`} onPointerDown={chooseFoot} ref={sourceFrameRef}>
+          {sourceUrl === null ? <div className="viewport-empty">载入源锚定帧…</div> : <img alt="源透视锚定帧" draggable={false} src={sourceUrl} />}
+          {media === null || evidenceMethod !== 'orthogonal_guides' ? null : <PerspectiveGuides disabled={busy || pending || tool !== 'guides'} groups={groups} media={media} onChange={(value) => { setGroups(value); setGuidesTouched(true); onDraftDirtyChange(true) }} />}
+          {horizonStyle === null ? null : <span aria-hidden="true" className="reference-line solved-horizon" style={horizonStyle} />}
+          {footDraft !== null && media !== null ? <Marker point={footDraft} width={media.width} height={media.height} label="脚?" /> : null}
+        </div>
+        <div className="calibration-fields">
+          <div className="segmented-tools" role="group" aria-label="源画面工具"><button aria-pressed={tool === 'guides'} onClick={() => setTool('guides')} type="button">透视线段</button><button aria-pressed={tool === 'foot'} onClick={() => setTool('foot')} type="button">脚底候选</button></div>
+          <label>源锚定帧<input disabled={busy || pending} min="0" max={Math.max(0, (workflow.source_summary?.frame_count ?? 1) - 1)} onChange={(event) => { setAnchorFrame(Number(event.currentTarget.value)); onDraftDirtyChange(true) }} type="number" value={anchorFrame} /></label>
+          {audit?.recommended_anchor_frames.length ? <div className="anchor-suggestions">推荐：{audit.recommended_anchor_frames.map((frame) => <button disabled={busy || pending} key={frame} onClick={() => { setAnchorFrame(frame); onDraftDirtyChange(true) }} type="button">#{frame}</button>)}</div> : null}
+          <fieldset disabled={busy || pending}><legend>证据方法</legend><label><input checked={evidenceMethod === 'orthogonal_guides'} onChange={() => { setEvidenceMethod('orthogonal_guides'); onDraftDirtyChange(true) }} type="radio" />两组正交方向</label><label><input checked={evidenceMethod === 'automatic_prior'} onChange={() => { setEvidenceMethod('automatic_prior'); onDraftDirtyChange(true) }} type="radio" />系统初值（低置信度）</label></fieldset>
+          {evidenceMethod === 'orthogonal_guides' ? <fieldset disabled={busy || pending}><legend>参照关系</legend><label><input checked={relation === 'a_vertical_b_horizontal'} onChange={() => { setRelation('a_vertical_b_horizontal'); onDraftDirtyChange(true) }} type="radio" />A 为竖直，B 为水平</label><label><input checked={relation === 'both_horizontal_plane'} onChange={() => { setRelation('both_horizontal_plane'); onDraftDirtyChange(true) }} type="radio" />A/B 位于水平面</label></fieldset> : null}
+          <div className={`evidence-readout ${preview.valid && evidenceReady ? 'is-valid' : 'is-invalid'}`}><strong>{evidenceMethod === 'orthogonal_guides' ? (!guidesTouched ? '请先贴合画面线段' : preview.valid ? '高置信度几何证据' : '证据待修正') : '低置信度估计值'}</strong><span>垂直 FOV（只读） <b>{Number.isFinite(preview.fov) ? `${preview.fov.toFixed(1)}°` : '—'}</b></span><span>Roll（只读） <b>{previewRoll === null ? '—' : `${previewRoll.toFixed(1)}°`}</b></span><span>重力方向 <b>{preview.gravity === null ? '—' : preview.gravity.map((value) => value.toFixed(2)).join(', ')}</b></span><span>主点假设：画面中心 · 方形像素</span><small>{!guidesTouched && evidenceMethod === 'orthogonal_guides' ? '初始线段只是操作示例；拖动至少一个端点贴合真实边缘后才能确认。' : preview.message}</small></div>
+          <button disabled={busy || pending || media === null || media.frame_index !== anchorFrame || segmentKey === null || !preview.valid || !evidenceReady} onClick={() => void save()} type="button">确认源透视校准</button>
+          {confirmedCalibration === null ? null : <small>已保存：{confirmedCalibration.evidence_confidence === 'low' ? '估计值' : '几何校准'} · r{confirmedCalibration.revision}</small>}
+        </div>
+      </div>
+      <div className="source-secondary-panel"><h4>全片可见性与接触候选</h4>{audit === null ? <p>尚未扫描全片可见性。扫描只提供完整下边界候选，不会自动断言该处就是脚。</p> : (
         <><div className="audit-summary">
           <span>完整候选 {audit.fully_visible_ranges.length} 段</span>
           <span>底边裁切 {audit.bottom_cropped_ranges.length} 段</span>
@@ -454,34 +466,13 @@ function SourceCalibrationPanel({
             ['不确定', audit.uncertain_ranges],
           ] as const).map(([label, ranges]) => ranges.length === 0 ? null : <AuditReviewGroup backend={backend} busy={busy || pending} key={label} label={label} onError={onError} onSelect={(frame) => { setAnchorFrame(frame); onDraftDirtyChange(true) }} ranges={ranges} selectedFrame={anchorFrame} />)}
         </div></>
-      )}
-      <div className="source-calibration-grid">
-        <div className="source-reference-frame" onPointerDown={chooseFoot} ref={sourceFrameRef} style={media === null ? undefined : { aspectRatio: `${media.width} / ${media.height}` }}>
-          {sourceUrl === null ? <div className="viewport-empty">载入源锚定帧…</div> : <img alt="源透视锚定帧" draggable={false} src={sourceUrl} />}
-          {media === null ? null : <PerspectiveGrid fov={fov} height={media.height} horizonLeft={horizonLeft} horizonRight={horizonRight} width={media.width} />}
-          <span className="reference-line horizon-line" style={{ left: 0, top: `${horizonLeft}%`, width: '100%', transform: `rotate(${Math.atan2(horizonRight - horizonLeft, 100) * 180 / Math.PI}deg)` }} />
-          <span className="reference-line vertical-line" style={{ bottom: 0, left: `${verticalXBottom}%`, height: '100%', transform: `rotate(${Math.atan2(verticalXTop - verticalXBottom, 100) * -180 / Math.PI}deg)` }} />
-          {footDraft !== null && media !== null ? <Marker point={footDraft} width={media.width} height={media.height} label="脚?" /> : null}
-        </div>
-        <div className="calibration-fields">
-          <label>源锚定帧<input disabled={busy || pending} min="0" max={Math.max(0, (workflow.source_summary?.frame_count ?? 1) - 1)} onChange={(event) => { setAnchorFrame(Number(event.currentTarget.value)); onDraftDirtyChange(true) }} type="number" value={anchorFrame} /></label>
-          {audit?.recommended_anchor_frames.length ? <div className="anchor-suggestions">推荐：{audit.recommended_anchor_frames.map((frame) => <button disabled={busy || pending} key={frame} onClick={() => { setAnchorFrame(frame); onDraftDirtyChange(true) }} type="button">#{frame}</button>)}</div> : null}
-          <label>垂直 FOV<input disabled={busy || pending} min="20" max="100" onChange={(event) => { setFov(Number(event.currentTarget.value)); onDraftDirtyChange(true) }} type="range" value={fov} /><output>{fov.toFixed(0)}°</output></label>
-          <label>地平线左端<input disabled={busy || pending} min="0" max="100" onChange={(event) => { setHorizonLeft(Number(event.currentTarget.value)); onDraftDirtyChange(true) }} type="range" value={horizonLeft} /></label>
-          <label>地平线右端<input disabled={busy || pending} min="0" max="100" onChange={(event) => { setHorizonRight(Number(event.currentTarget.value)); onDraftDirtyChange(true) }} type="range" value={horizonRight} /></label>
-          <label>竖直线底端<input disabled={busy || pending} min="-200" max="300" onChange={(event) => { setVerticalXBottom(Number(event.currentTarget.value)); onDraftDirtyChange(true) }} type="range" value={verticalXBottom} /></label>
-          <label>竖直线顶端<input disabled={busy || pending} min="-200" max="300" onChange={(event) => { setVerticalXTop(Number(event.currentTarget.value)); onDraftDirtyChange(true) }} type="range" value={verticalXTop} /></label>
-          <button disabled={busy || pending || media === null || media.frame_index !== anchorFrame || segmentKey === null} onClick={() => void save()} type="button">确认源透视校准</button>
-          <button disabled={busy || pending || draftDirty || footDraft === null || workflow.source_perspective_calibration?.anchor_frame_index !== anchorFrame} onClick={() => void confirmFoot()} type="button">确认脚底候选</button>
-          <span>{confirmedFoot === null ? '未确认脚底；仍可使用纯透视模式' : `脚底候选 (${confirmedFoot.x}, ${confirmedFoot.y})`}</span>
-        </div>
-      </div>
+      )}<div className="secondary-actions"><button disabled={busy || pending || draftDirty || footDraft === null || workflow.source_perspective_calibration?.anchor_frame_index !== anchorFrame} onClick={() => void confirmFoot()} type="button">确认脚底候选</button><span>{confirmedFoot === null ? '脚底完全不可见时可跳过；纯透视模式仍可继续。' : `已确认脚底 (${confirmedFoot.x}, ${confirmedFoot.y})`}</span></div></div>
       <div hidden data-alpha-url={alphaUrl ?? ''} data-confirmed-foot={confirmedFoot === null ? '' : `${confirmedFoot.x},${confirmedFoot.y}`} id="source-calibration-authority" />
     </section>
   )
 }
 
-function ExplorationPanel({ backend, busy, project, onError, onProjectChange, onRefresh, mutationPending: pending, beginMutation, endMutation }: MutationWorkspaceProps) {
+function ExplorationPanel({ active, backend, busy, project, onError, onProjectChange, onRefresh, mutationPending: pending, beginMutation, endMutation }: MutationWorkspaceProps & { active: boolean }) {
   const [pose, setPose] = useState(() => matrixPose(project.workflow.exploration_camera))
   const [liveUrl, replaceLiveUrl] = useBlobUrl()
   const [frame, setFrame] = useState<PreviewFrameDto | null>(null)
@@ -495,6 +486,7 @@ function ExplorationPanel({ backend, busy, project, onError, onProjectChange, on
   const generation = useRef(project.workflow.preview?.generation ?? 0)
   const liveRequest = useRef(0)
   const dragging = useRef<{ x: number; y: number } | null>(null)
+  const repeatTimer = useRef<number | null>(null)
   const fingerprint = poseFingerprint(pose)
   const frozen = frame !== null && frameFingerprint === fingerprint
   const confirmed = frozen
@@ -502,7 +494,7 @@ function ExplorationPanel({ backend, busy, project, onError, onProjectChange, on
     && project.workflow.confirmed_preview_artifact_id === frame.artifact_id
 
   useEffect(() => {
-    if (busy) return
+    if (!active || busy) return
     const controller = new AbortController()
     const timeout = setTimeout(() => {
       const requestId = ++liveRequest.current
@@ -511,7 +503,7 @@ function ExplorationPanel({ backend, busy, project, onError, onProjectChange, on
         .catch((error) => { if (!controller.signal.aborted && requestId === liveRequest.current) onError(error) })
     }, 80)
     return () => { clearTimeout(timeout); controller.abort() }
-  }, [backend, busy, fingerprint])
+  }, [active, backend, busy, fingerprint])
 
   useEffect(() => { setCandidate(null); setPoints([]); setFlipNormal(false) }, [fingerprint])
 
@@ -526,6 +518,38 @@ function ExplorationPanel({ backend, busy, project, onError, onProjectChange, on
       }
     })
   }
+
+  useEffect(() => {
+    if (!active) return
+    const viewport = viewportRef.current
+    if (viewport === null) return
+    const onWheel = (event: WheelEvent): void => {
+      event.preventDefault()
+      event.stopPropagation()
+      if (!busy && !confirmed) moveLocal(0, 0, event.deltaY > 0 ? -0.25 : 0.25)
+    }
+    viewport.addEventListener('wheel', onWheel, { passive: false })
+    return () => viewport.removeEventListener('wheel', onWheel)
+  })
+
+  const stopMove = (): void => {
+    if (repeatTimer.current !== null) window.clearTimeout(repeatTimer.current)
+    repeatTimer.current = null
+  }
+  const startMove = (right: number, down: number, forward: number): void => {
+    stopMove(); moveLocal(right, down, forward)
+    repeatTimer.current = window.setTimeout(() => {
+      const repeat = (): void => {
+        moveLocal(right, down, forward)
+        repeatTimer.current = window.setTimeout(repeat, 70)
+      }
+      repeat()
+    }, 280)
+  }
+  useEffect(() => {
+    window.addEventListener('blur', stopMove)
+    return () => { window.removeEventListener('blur', stopMove); stopMove() }
+  }, [])
 
   const orbitGround = (deltaX: number, deltaY: number): void => {
     const ground = project.workflow.local_ground_anchor
@@ -646,28 +670,31 @@ function ExplorationPanel({ backend, busy, project, onError, onProjectChange, on
             else setPose((current) => ({ ...current, yaw: current.yaw + dx * 0.2, pitch: Math.max(-89, Math.min(89, current.pitch - dy * 0.2)) }))
           }}
           onPointerUp={() => { dragging.current = null }}
-          onWheel={(event) => { event.preventDefault(); if (!busy) moveLocal(0, 0, event.deltaY > 0 ? -0.25 : 0.25) }}
           ref={viewportRef}
         >
           {(frozen ? frameUrl : liveUrl) === null ? <div className="viewport-empty">准备 Gaussian 预览…</div> : <img alt={frozen ? '冻结的 Gaussian 三点标定帧' : 'Gaussian 实时探索预览'} draggable={false} src={(frozen ? frameUrl : liveUrl) ?? ''} />}
           {frame !== null ? points.map((point, index) => <Marker key={`${point.x}-${point.y}`} point={point} width={frame.width} height={frame.height} label={`P${index}`} />) : null}
           {frame !== null && candidate !== null ? <Marker point={candidate} width={frame.width} height={frame.height} label={`P${points.length}?`} /> : null}
           {frame !== null && planePoints !== null ? <svg aria-label="局部地面三角形与法线方向" className="ground-plane-overlay" preserveAspectRatio="none" viewBox={`0 0 ${frame.width} ${frame.height}`}><defs><marker id="ground-normal-arrow" markerHeight="7" markerWidth="7" orient="auto" refX="5" refY="3.5"><path d="M0,0 L7,3.5 L0,7 Z" /></marker></defs><polygon points={planePoints.map((point) => `${point.x + 0.5},${point.y + 0.5}`).join(' ')} />{normalArrow === null ? null : <line className="ground-normal-arrow" markerEnd="url(#ground-normal-arrow)" x1={normalArrow.start.x} x2={normalArrow.end.x} y1={normalArrow.start.y} y2={normalArrow.end.y} />}<text x={(planePoints[0].x + planePoints[1].x + planePoints[2].x) / 3} y={(planePoints[0].y + planePoints[1].y + planePoints[2].y) / 3}>{flipNormal ? 'N⊗' : 'N⊙'}</text></svg> : null}
+          {confirmed ? null : <div aria-label="探索移动方向键" className="game-movement-pad">
+            {([
+              ['前', 0, 0, .25, 'move-forward'], ['左', -.25, 0, 0, 'move-left'], ['后', 0, 0, -.25, 'move-back'], ['右', .25, 0, 0, 'move-right'], ['上', 0, -.25, 0, 'move-up'], ['下', 0, .25, 0, 'move-down'],
+            ] as const).map(([label, right, down, forward, className]) => <button className={className} disabled={busy} key={label} onClick={(event) => event.preventDefault()} onPointerCancel={stopMove} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); startMove(right, down, forward) }} onPointerUp={stopMove} type="button">{label}</button>)}
+          </div>}
         </div>
         <aside className="viewport-controls">
           <div className="camera-readout sixdof-readout">
-            {(['x', 'y', 'z', 'yaw', 'pitch', 'roll'] as const).map((key) => <label key={key}>{key.toUpperCase()}<input aria-label={`探索相机 ${key}`} disabled={busy || confirmed} onChange={(event) => updateNumber(key, Number(event.currentTarget.value))} step="0.1" type="number" value={Number(pose[key].toFixed(3))} /></label>)}
+            {(['x', 'y', 'z', 'yaw', 'pitch', 'roll'] as const).map((key) => <label key={key}>{key.toUpperCase()}<NumericField disabled={busy || confirmed} label={`探索相机 ${key}`} onCommit={(value) => updateNumber(key, value)} value={pose[key]} /></label>)}
           </div>
-          <label>探索 FOV<input disabled={busy || confirmed} min="20" max="100" onChange={(event) => updateNumber('fov', Number(event.currentTarget.value))} type="range" value={pose.fov} /><output>{pose.fov.toFixed(0)}°</output></label>
-          <div className="movement-pad"><button disabled={busy} onClick={() => moveLocal(-0.25, 0, 0)} type="button">左</button><button disabled={busy} onClick={() => moveLocal(0, 0, 0.25)} type="button">前</button><button disabled={busy} onClick={() => moveLocal(0.25, 0, 0)} type="button">右</button><button disabled={busy} onClick={() => moveLocal(0, -0.25, 0)} type="button">上</button><button disabled={busy} onClick={() => moveLocal(0, 0, -0.25)} type="button">后</button><button disabled={busy} onClick={() => moveLocal(0, 0.25, 0)} type="button">下</button></div>
+          <label>探索 FOV<div className="range-number"><input disabled={busy || confirmed} min="20" max="100" onChange={(event) => updateNumber('fov', Number(event.currentTarget.value))} type="range" value={pose.fov} /><NumericField disabled={busy || confirmed} label="探索相机 FOV 数值" onCommit={(value) => updateNumber('fov', Math.max(20, Math.min(100, value)))} value={pose.fov} /></div></label>
           <button disabled={busy || confirmed || project.workflow.local_ground_anchor === null} onClick={focusGround} type="button">聚焦局部地面 P0</button>
           <label><input checked={orbitP0} disabled={busy || confirmed || project.workflow.local_ground_anchor === null} onChange={(event) => setOrbitP0(event.currentTarget.checked)} type="checkbox" />拖拽时围绕 P0 Orbit</label>
           <button disabled={busy || confirmed} onClick={() => setPose(DEFAULT_POSE)} type="button">重置探索相机</button>
           <button disabled={busy || pending || confirmed} onClick={() => void freeze()} type="button">冻结当前探索视角</button>
           <button disabled={busy || pending || !frozen || confirmed} onClick={() => void confirmFreeze()} type="button">确认冻结视角</button>
-          <fieldset disabled={busy || pending}><legend>同一冻结帧的局部地面</legend><p>{points.length}/3 个点已确认</p><button disabled={!confirmed || candidate === null} onClick={confirmCandidate} type="button">确认 P{points.length} 候选</button><label><input checked={flipNormal} disabled={points.length !== 3} onChange={(event) => setFlipNormal(event.currentTarget.checked)} type="checkbox" />翻转法线（N⊙ / N⊗）</label><button disabled={points.length !== 3} onClick={() => void saveGround()} type="button">确认三点局部地面</button></fieldset>
         </aside>
       </div>
+      <div className="camera-secondary-panel"><fieldset disabled={busy || pending}><legend>同一冻结帧的三点局部地面</legend><p>{points.length}/3 个点已确认；移动相机会清理未确认候选。</p><div className="secondary-actions"><button disabled={!confirmed || candidate === null} onClick={confirmCandidate} type="button">确认 P{points.length} 候选</button><label><input checked={flipNormal} disabled={points.length !== 3} onChange={(event) => setFlipNormal(event.currentTarget.checked)} type="checkbox" />翻转法线（N⊙ / N⊗）</label><button disabled={points.length !== 3} onClick={() => void saveGround()} type="button">确认三点局部地面</button></div></fieldset></div>
     </section>
   )
 }
@@ -686,7 +713,7 @@ function fittedPreviewSize(width: number, height: number): { width: number; heig
   }
 }
 
-function SynthesisPanel({ backend, busy, project, onError, onProjectChange, calibrationDraftDirty, confirmedFoot, mutationPending: pending, beginMutation, endMutation }: SynthesisPanelProps) {
+function SynthesisPanel({ active, backend, busy, project, onError, onProjectChange, calibrationDraftDirty, confirmedFoot, mutationPending: pending, beginMutation, endMutation }: SynthesisPanelProps) {
   const workflow = project.workflow
   const calibration = workflow.source_perspective_calibration
   const ground = workflow.local_ground_anchor
@@ -700,6 +727,7 @@ function SynthesisPanel({ backend, busy, project, onError, onProjectChange, cali
   const [sourceUrl, replaceSourceUrl] = useBlobUrl()
   const [alphaUrl, replaceAlphaUrl] = useBlobUrl()
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const compositionDrag = useRef<{ x: number; y: number; offsetX: number; offsetY: number } | null>(null)
   const requestId = useRef(10_000)
   const previewSize = calibration === null
     ? { width: 960, height: 540 }
@@ -712,7 +740,7 @@ function SynthesisPanel({ backend, busy, project, onError, onProjectChange, cali
   useEffect(() => {
     replaceSourceUrl(null)
     replaceAlphaUrl(null)
-    if (calibration === null) return
+    if (!active || calibration === null) return
     let cancelled = false
     void Promise.all([
       backend.getSubjectMedia('proxy', calibration.anchor_frame_index),
@@ -722,21 +750,22 @@ function SynthesisPanel({ backend, busy, project, onError, onProjectChange, cali
       backend.fetchSubjectMediaArtifact('alpha', alpha.artifact_id, undefined, calibration.anchor_frame_index),
     ])).then(([proxy, alpha]) => { if (!cancelled) { replaceSourceUrl(proxy); replaceAlphaUrl(alpha) } }).catch((error) => { if (!cancelled) onError(error) })
     return () => { cancelled = true }
-  }, [backend, calibration?.revision, project.project_id, project.stages.segment?.cache_key])
+  }, [active, backend, calibration?.revision, project.project_id, project.stages.segment?.cache_key])
 
   useEffect(() => {
     requestId.current += 1
     replaceBackgroundUrl(null)
-    if (busy || existing === null) return
+    if (!active || busy || existing === null) return
     const controller = new AbortController()
     const current = ++requestId.current
     void backend.renderLivePreview({ expected_project_id: project.project_id, request_id: current, width: previewSize.width, height: previewSize.height, camera: { camera_to_world: existing.anchor_camera_to_world, fov_y_degrees: calibration?.vertical_fov ?? 50 } }, controller.signal)
       .then((blob) => { if (current === requestId.current) replaceBackgroundUrl(blob) })
       .catch((error) => { if (!controller.signal.aborted && current === requestId.current) onError(error) })
     return () => controller.abort()
-  }, [backend, busy, existing?.solver_cache_key, previewSize.width, previewSize.height, project.project_id, project.scene_ply_asset_id, project.scene_ply])
+  }, [active, backend, busy, existing?.solver_cache_key, previewSize.width, previewSize.height, project.project_id, project.scene_ply_asset_id, project.scene_ply])
 
   useEffect(() => {
+    if (!active) return
     const initialCanvas = canvasRef.current
     if (initialCanvas !== null) initialCanvas.getContext('2d')?.clearRect(0, 0, initialCanvas.width, initialCanvas.height)
     if (backgroundUrl === null || sourceUrl === null || alphaUrl === null || canvasRef.current === null) return
@@ -758,7 +787,7 @@ function SynthesisPanel({ backend, busy, project, onError, onProjectChange, cali
       fg.putImageData(pixels, 0, 0); context.drawImage(foreground, 0, 0)
     }).catch((error) => { if (!cancelled) onError(error) })
     return () => { cancelled = true }
-  }, [backgroundUrl, sourceUrl, alphaUrl, previewSize.width, previewSize.height])
+  }, [active, backgroundUrl, sourceUrl, alphaUrl, previewSize.width, previewSize.height])
 
   const solve = async (): Promise<void> => {
     if (calibrationDraftDirty || calibration === null || ground === null || (mode === 'contact' && confirmedFoot === null) || !beginMutation()) return
@@ -792,29 +821,31 @@ function SynthesisPanel({ backend, busy, project, onError, onProjectChange, cali
         : Math.abs(existing.composition_offset_local[0] - offsetX) <= 1e-9
           && Math.abs(existing.composition_offset_local[1] - offsetY) <= 1e-9
     )
+  const derivedPose = existing === null ? null : matrixPose({ camera_to_world: existing.anchor_camera_to_world, fov_y_degrees: calibration?.vertical_fov ?? 60 })
 
   return (
     <section aria-busy={busy} className="calibration-card" aria-labelledby="synthesis-title">
       <div className="calibration-card-heading"><div><span className="step-kicker">C · 合成机位</span><h3 id="synthesis-title">受约束放置与视觉微调</h3></div><span className={workflow.confirmed_synthesis_placement_revision === existing?.revision ? 'chip chip-ok' : 'chip'}>{workflow.confirmed_synthesis_placement_revision === existing?.revision ? `已确认 r${existing?.revision}` : '待确认'}</span></div>
       {calibration === null || ground === null ? <p>请先完成源透视校准和三点局部地面。</p> : (
-        <div className="synthesis-layout">
-          <div className="viewport-frame synthesis-preview" style={{ aspectRatio: `${previewSize.width} / ${previewSize.height}` }}>{existing === null ? <div className="viewport-empty">调整参数后生成静态合成预览</div> : <canvas aria-label="源人物与受约束 GS 背景合成预览" ref={canvasRef} />}</div>
+        <>{calibration.evidence_confidence === 'low' ? <p className="honest-state"><strong>源透视使用估计值。</strong> 当前结果适合视觉预览与微调，不代表镜头内参已可靠求解。</p> : null}<div className="synthesis-layout">
+          <div className={`viewport-frame synthesis-preview ${mode === 'perspective' ? 'is-draggable' : ''}`} onPointerDown={(event) => { if (mode === 'perspective' && !busy) { event.currentTarget.setPointerCapture(event.pointerId); compositionDrag.current = { x: event.clientX, y: event.clientY, offsetX, offsetY } } }} onPointerMove={(event) => { const drag = compositionDrag.current; if (drag === null || mode !== 'perspective') return; setOffsetX(drag.offsetX + (event.clientX - drag.x) * .01); setOffsetY(drag.offsetY - (event.clientY - drag.y) * .01) }} onPointerUp={() => { compositionDrag.current = null }} onPointerCancel={() => { compositionDrag.current = null }}>{existing === null ? <div className="viewport-empty">调整参数后生成静态合成预览</div> : <canvas aria-label="源人物与受约束 GS 背景合成预览" ref={canvasRef} />}</div>
           <aside className="viewport-controls">
             <fieldset disabled={busy || pending || calibrationDraftDirty}><legend>约束模式</legend><label><input checked={mode === 'perspective'} onChange={() => setMode('perspective')} type="radio" />纯透视（不声明接触）</label><label><input checked={mode === 'contact'} disabled={confirmedFoot === null} onChange={() => setMode('contact')} type="radio" />脚底接触 P0</label></fieldset>
             <label>场景方位角<input disabled={busy || pending || calibrationDraftDirty} max="179.9" min="-180" onChange={(event) => setAzimuth(Number(event.currentTarget.value))} step="0.1" type="number" value={azimuth} /></label>
-            <label>人物与场景比例<input disabled={busy || pending || calibrationDraftDirty} max="4" min="0.25" onChange={(event) => setScale(Number(event.currentTarget.value))} step="0.05" type="range" value={scale} /><output>{scale.toFixed(2)}×</output></label>
+            <label>人物与场景比例<div className="range-number"><input disabled={busy || pending || calibrationDraftDirty} max="4" min="0.25" onChange={(event) => setScale(Number(event.currentTarget.value))} step="0.05" type="range" value={scale} /><input aria-label="人物与场景比例数值" disabled={busy || pending || calibrationDraftDirty} max="4" min="0.25" onChange={(event) => setScale(Number(event.currentTarget.value))} step="0.01" type="number" value={scale} /></div></label>
             {mode === 'perspective' ? <><label>构图横移<input disabled={busy || pending || calibrationDraftDirty} onChange={(event) => setOffsetX(Number(event.currentTarget.value))} step="0.1" type="number" value={offsetX} /></label><label>构图纵移<input disabled={busy || pending || calibrationDraftDirty} onChange={(event) => setOffsetY(Number(event.currentTarget.value))} step="0.1" type="number" value={offsetY} /></label></> : <div className="confirmed-contact-readout">已确认脚底 <strong>({confirmedFoot?.x}, {confirmedFoot?.y})</strong></div>}
             <button disabled={busy || pending || calibrationDraftDirty || (mode === 'contact' && confirmedFoot === null)} onClick={() => void solve()} type="button">更新受约束合成预览</button>
             <button disabled={busy || pending || calibrationDraftDirty || !draftMatchesExisting} onClick={() => void confirm()} type="button">确认合成机位</button>
-            <p className="technical-note">相机自身 Yaw / Pitch / Roll 和 FOV 均由源透视、局部平面与场景方位角派生。</p>
+            {derivedPose === null ? null : <div className="derived-camera-readout"><span>Yaw <b>{derivedPose.yaw.toFixed(1)}°</b></span><span>Pitch <b>{derivedPose.pitch.toFixed(1)}°</b></span><span>Roll <b>{derivedPose.roll.toFixed(1)}°</b></span><span>FOV <b>{derivedPose.fov.toFixed(1)}°</b></span></div>}
+            <p className="technical-note">相机旋转和 FOV 均为派生只读值。纯透视模式可直接拖动画面调整构图；接触模式固定脚底到 P0。</p>
           </aside>
-        </div>
+        </div></>
       )}
     </section>
   )
 }
 
-export function ConstrainedCameraWorkspace(props: WorkspaceProps) {
+export function ConstrainedCameraWorkspace(props: CameraWorkspaceProps) {
   const [calibrationDraftDirty, setCalibrationDraftDirty] = useState(false)
   const [mutationPending, setMutationPending] = useState(false)
   const mutationLock = useRef(false)
@@ -833,9 +864,9 @@ export function ConstrainedCameraWorkspace(props: WorkspaceProps) {
   const confirmedFoot = foot === undefined ? null : { x: foot[0], y: foot[1] }
   return (
     <div className="constrained-camera-workspace">
-      <SourceCalibrationPanel {...props} {...mutationProps} confirmedFoot={confirmedFoot} draftDirty={calibrationDraftDirty} onDraftDirtyChange={setCalibrationDraftDirty} />
-      <ExplorationPanel {...props} {...mutationProps} />
-      <SynthesisPanel {...props} {...mutationProps} calibrationDraftDirty={calibrationDraftDirty} confirmedFoot={confirmedFoot} />
+      <div hidden={props.panel !== 'source'}><SourceCalibrationPanel {...props} {...mutationProps} active={props.panel === 'source'} confirmedFoot={confirmedFoot} draftDirty={calibrationDraftDirty} onDraftDirtyChange={setCalibrationDraftDirty} /></div>
+      <div hidden={props.panel !== 'scene'}><ExplorationPanel {...props} {...mutationProps} active={props.panel === 'scene'} /></div>
+      <div hidden={props.panel !== 'synthesis'}><SynthesisPanel {...props} {...mutationProps} active={props.panel === 'synthesis'} calibrationDraftDirty={calibrationDraftDirty} confirmedFoot={confirmedFoot} /></div>
     </div>
   )
 }

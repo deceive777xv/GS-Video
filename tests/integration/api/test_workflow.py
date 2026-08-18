@@ -470,16 +470,33 @@ def test_constrained_camera_flow_binds_source_ground_and_placement_authority(
             "anchor_frame_index": 2,
             "image_width": 16,
             "image_height": 9,
-            "vertical_fov": 60.0,
-            "horizon_start": [8.0, 4.5],
-            "horizon_end": [8.0, 4.5],
-            "vertical_bottom": [8.0, 8.0],
-            "vertical_top": [8.0, 1.0],
+            "evidence_method": "orthogonal_guides",
+            "reference_relation": "a_vertical_b_horizontal",
+            "group_a": [[[2.0, 1.0], [5.0, 2.0]], [[2.0, 4.0], [5.0, 5.0]]],
+            "group_b": [[[1.0, 2.0], [5.0, 2.0]], [[1.0, 5.0], [5.0, 5.0]]],
         },
         headers=auth_headers,
     )
     assert invalid_perspective.status_code == 422
     assert invalid_perspective.json()["code"] == "invalid_perspective_reference"
+
+    mixed_evidence = workflow_client.put(
+        "/api/v1/projects/current/source-perspective",
+        json={
+            "expected_project_id": project.project_id,
+            "expected_segment_cache_key": SEGMENT_CACHE_KEY,
+            "anchor_frame_index": 2,
+            "image_width": 16,
+            "image_height": 9,
+            "evidence_method": "automatic_prior",
+            "prior_source": "centered_60_degree_default",
+            "reference_relation": "a_vertical_b_horizontal",
+            "group_a": [[[2.0, 1.0], [5.0, 2.0]], [[2.0, 4.0], [5.0, 5.0]]],
+            "group_b": [[[1.0, 2.0], [5.0, 2.0]], [[1.0, 5.0], [5.0, 5.0]]],
+        },
+        headers=auth_headers,
+    )
+    assert mixed_evidence.status_code == 422
 
     calibrated = workflow_client.put(
         "/api/v1/projects/current/source-perspective",
@@ -489,17 +506,16 @@ def test_constrained_camera_flow_binds_source_ground_and_placement_authority(
             "anchor_frame_index": 2,
             "image_width": 16,
             "image_height": 9,
-            "vertical_fov": 60.0,
-            "horizon_start": [0.0, 4.5],
-            "horizon_end": [16.0, 4.5],
-            "vertical_bottom": [8.0, 8.0],
-            "vertical_top": [8.0, 1.0],
+            "evidence_method": "automatic_prior",
+            "prior_source": "centered_60_degree_default",
         },
         headers=auth_headers,
     )
     assert calibrated.status_code == 200, calibrated.text
     calibration = calibrated.json()["workflow"]["source_perspective_calibration"]
     assert calibration["anchor_frame_index"] == 2
+    assert calibration["evidence_method"] == "automatic_prior"
+    assert calibration["evidence_confidence"] == "low"
 
     camera_to_world = [
         [1.0, 0.0, 0.0, 0.0],
@@ -698,11 +714,8 @@ def test_constrained_camera_flow_binds_source_ground_and_placement_authority(
             "anchor_frame_index": 2,
             "image_width": 16,
             "image_height": 9,
-            "vertical_fov": 60.0,
-            "horizon_start": [0.0, 4.5],
-            "horizon_end": [16.0, 4.5],
-            "vertical_bottom": [8.0, 8.0],
-            "vertical_top": [8.0, 1.0],
+            "evidence_method": "automatic_prior",
+            "prior_source": "centered_60_degree_default",
         },
         headers=auth_headers,
     )

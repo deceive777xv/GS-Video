@@ -139,14 +139,17 @@ type AppView = 'home' | 'workflow' | 'assets-video' | 'assets-ply' | 'settings'
 interface WorkflowRoute {
   projectId: string
   step: WorkflowStep
+  cameraPanel?: 'source' | 'scene' | 'synthesis'
 }
 
 function workflowRouteFromHash(hash: string): WorkflowRoute | null {
-  const match = /^#\/projects\/([^/]+)\/workflow\/(import|subject|camera|preview|export)$/.exec(hash)
+  const match = /^#\/projects\/([^/]+)\/workflow\/(import|subject|camera|preview|export)(?:\/(source|scene|synthesis))?$/.exec(hash)
   if (match === null) return null
+  if (match[3] !== undefined && match[2] !== 'camera') return null
   return {
     projectId: decodeURIComponent(match[1] ?? ''),
     step: match[2] as WorkflowStep,
+    ...(match[3] === undefined ? {} : { cameraPanel: match[3] as 'source' | 'scene' | 'synthesis' }),
   }
 }
 
@@ -816,7 +819,7 @@ export function App({
       page = <SubjectPage backend={backend} busy={workflowBusy} onError={reportError} onProjectChange={acceptProject} onStartStage={runStage} project={project} />
       break
     case 'camera':
-      page = <CameraPage backend={backend} busy={workflowBusy} onError={reportCameraError} onProjectChange={acceptCameraProject} onRefresh={refreshProject} project={project} />
+      page = <CameraPage backend={backend} busy={workflowBusy} onError={reportCameraError} onProjectChange={acceptCameraProject} onRefresh={refreshProject} panel={workflowRoute?.cameraPanel} project={project} />
       break
     case 'preview':
       page = <PreviewPage

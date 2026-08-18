@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import cos, isfinite, radians, sin, tan
+from math import atan, cos, degrees, isfinite, radians, sin, tan
 
 import numpy as np
 import numpy.typing as npt
@@ -160,6 +160,110 @@ class SourcePerspective:
 
     def intrinsics(self) -> Float64Array:
         return _intrinsics(self.width, self.height, self.fov_y_degrees)
+
+    @classmethod
+    def from_orthogonal_guides(
+        cls,
+        *,
+        width: int,
+        height: int,
+        group_a: tuple[
+            tuple[tuple[float, float], tuple[float, float]],
+            tuple[tuple[float, float], tuple[float, float]],
+        ],
+        group_b: tuple[
+            tuple[tuple[float, float], tuple[float, float]],
+            tuple[tuple[float, float], tuple[float, float]],
+        ],
+        reference_relation: str,
+    ) -> SourcePerspective:
+        """Recover pinhole intrinsics and gravity from two orthogonal directions."""
+
+        if width <= 0 or height <= 0:
+            raise ValueError("image dimensions must be positive")
+
+        def image_line(
+            segment: tuple[tuple[float, float], tuple[float, float]],
+            *,
+            name: str,
+        ) -> Float64Array:
+            if len(segment) != 2 or any(len(point) != 2 for point in segment):
+                raise ValueError(f"{name} must contain two image points")
+            start = np.asarray((*segment[0], 1.0), dtype=np.float64)
+            end = np.asarray((*segment[1], 1.0), dtype=np.float64)
+            if not np.all(np.isfinite(start)) or not np.all(np.isfinite(end)):
+                raise ValueError(f"{name} endpoints must be finite")
+            if not (0 <= start[0] < width and 0 <= end[0] < width
+                    and 0 <= start[1] < height and 0 <= end[1] < height):
+                raise ValueError(f"{name} endpoints must lie inside the source frame")
+            line = np.cross(start, end)
+            if np.linalg.norm(line[:2]) < max(width, height) * 1e-4:
+                raise ValueError(f"{name} is too short")
+            return np.asarray(line / np.linalg.norm(line[:2]), dtype=np.float64)
+
+        def vanishing_point(
+            group: tuple[
+                tuple[tuple[float, float], tuple[float, float]],
+                tuple[tuple[float, float], tuple[float, float]],
+            ],
+            *,
+            name: str,
+        ) -> Float64Array:
+            if len(group) != 2:
+                raise ValueError(f"{name} must contain two line segments")
+            point = np.cross(
+                image_line(group[0], name=f"{name} line 1"),
+                image_line(group[1], name=f"{name} line 2"),
+            )
+            if not np.all(np.isfinite(point)) or abs(float(point[2])) <= 1e-4:
+                raise ValueError(f"{name} lines are parallel or nearly parallel")
+            return np.asarray(point / point[2], dtype=np.float64)
+
+        vanishing_a = vanishing_point(group_a, name="group A")
+        vanishing_b = vanishing_point(group_b, name="group B")
+        center_x = width / 2
+        center_y = height / 2
+        focal_squared = -float(
+            (vanishing_a[0] - center_x) * (vanishing_b[0] - center_x)
+            + (vanishing_a[1] - center_y) * (vanishing_b[1] - center_y)
+        )
+        if not isfinite(focal_squared) or focal_squared <= 1e-6:
+            raise ValueError(
+                "the selected directions do not produce a positive finite focal length"
+            )
+        focal = focal_squared ** 0.5
+        fov_y_degrees = degrees(2 * atan(height / (2 * focal)))
+        if not isfinite(fov_y_degrees) or not 5 <= fov_y_degrees <= 150:
+            raise ValueError("the recovered vertical FOV is outside the supported range")
+
+        intrinsics = _intrinsics(width, height, fov_y_degrees)
+        direction_a = _unit(
+            np.linalg.inv(intrinsics) @ vanishing_a,
+            name="group A direction",
+        )
+        direction_b = _unit(
+            np.linalg.inv(intrinsics) @ vanishing_b,
+            name="group B direction",
+        )
+        if reference_relation == "a_vertical_b_horizontal":
+            up_camera = direction_a
+        elif reference_relation == "both_horizontal_plane":
+            up_camera = _unit(
+                np.cross(direction_a, direction_b),
+                name="horizontal-plane normal",
+            )
+        else:
+            raise ValueError("unsupported orthogonal guide reference relation")
+        if up_camera[1] > 0:
+            up_camera = -up_camera
+        horizon = np.linalg.inv(intrinsics).T @ up_camera
+        return cls(
+            width=width,
+            height=height,
+            fov_y_degrees=fov_y_degrees,
+            up_camera=up_camera,
+            horizon_line=horizon,
+        )
 
 
 @dataclass(frozen=True)

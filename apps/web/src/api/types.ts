@@ -127,6 +127,12 @@ export interface SourcePerspectiveCalibrationDto {
   vertical_fov: number
   horizon_line: [number, number, number]
   gravity_direction_camera: [number, number, number]
+  evidence_method: 'orthogonal_guides' | 'calibrated_intrinsics' | 'automatic_prior'
+  reference_relation: 'a_vertical_b_horizontal' | 'both_horizontal_plane' | null
+  guide_groups: [[[[number, number], [number, number]], [[number, number], [number, number]]], [[[number, number], [number, number]], [[number, number], [number, number]]]] | null
+  evidence_confidence: 'high' | 'medium' | 'low'
+  evidence_diagnostics: string[]
+  camera_solution_cache_key: string | null
   revision: number
 }
 
@@ -457,11 +463,11 @@ export interface SourcePerspectiveCalibrationInput {
   anchor_frame_index: number
   image_width: number
   image_height: number
-  vertical_fov: number
-  horizon_start: [number, number]
-  horizon_end: [number, number]
-  vertical_bottom: [number, number]
-  vertical_top: [number, number]
+  evidence_method: 'orthogonal_guides' | 'automatic_prior'
+  reference_relation?: 'a_vertical_b_horizontal' | 'both_horizontal_plane'
+  group_a?: [[[number, number], [number, number]], [[number, number], [number, number]]]
+  group_b?: [[[number, number], [number, number]], [[number, number], [number, number]]]
+  prior_source?: 'centered_60_degree_default'
 }
 
 export interface LocalGroundAnchorInput {
