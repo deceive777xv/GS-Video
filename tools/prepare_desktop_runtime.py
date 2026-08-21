@@ -73,6 +73,12 @@ def _runtime_payload(
         root,
         allow_missing=allow_missing_resources,
     )
+    camera_python = _required_file(
+        runtime_root / "camera" / ".venv" / "Scripts" / "python.exe",
+        "ViPE camera worker Python",
+        root,
+        allow_missing=allow_missing_resources,
+    )
     model_config = _required_file(
         edgetam_root / "sam2" / "configs" / "edgetam.yaml",
         "EdgeTAM model config",
@@ -92,6 +98,7 @@ def _runtime_payload(
         "segmentation_worker_prefix": [str(segmentation_python)],
         "segmentation_model_config": str(model_config),
         "segmentation_checkpoint": str(checkpoint),
+        "camera_worker_prefix": [str(camera_python)],
         "renderer_worker_prefix": [str(renderer_python)],
         "renderer_sh_degree": 3,
         "available_vram_limit_mb": load_user_vram_limit(

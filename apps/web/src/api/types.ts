@@ -101,86 +101,32 @@ export interface ExplorationCameraDto extends MatrixCameraInput {
   revision: number
 }
 
-export interface VisibilityRangeDto {
-  start_frame: number
-  end_frame: number
-  review_frames: number[]
-}
-
-export interface SubjectVisibilityAuditDto {
-  source_asset_id: string
-  segment_cache_key: string
-  fully_visible_ranges: VisibilityRangeDto[]
-  bottom_cropped_ranges: VisibilityRangeDto[]
-  uncertain_ranges: VisibilityRangeDto[]
-  recommended_anchor_frames: number[]
-  revision: number
-}
-
-export interface SourcePerspectiveCalibrationDto {
-  source_asset_id: string
-  ingest_cache_key: string
-  segment_cache_key: string
-  anchor_frame_index: number
-  image_width: number
-  image_height: number
-  vertical_fov: number
-  horizon_line: [number, number, number]
-  gravity_direction_camera: [number, number, number]
-  evidence_method: 'orthogonal_guides' | 'calibrated_intrinsics' | 'automatic_prior'
-  reference_relation: 'a_vertical_b_horizontal' | 'both_horizontal_plane' | null
-  guide_groups: [[[[number, number], [number, number]], [[number, number], [number, number]]], [[[number, number], [number, number]], [[number, number], [number, number]]]] | null
-  evidence_confidence: 'high' | 'medium' | 'low'
-  evidence_diagnostics: string[]
-  camera_solution_cache_key: string | null
-  revision: number
-}
-
-export interface LocalGroundAnchorDto {
+export interface TargetGroundDto {
   scene_asset_id: string
+  hint_pixels: [[number, number], [number, number], [number, number]]
   p0_world: [number, number, number]
   p1_world: [number, number, number]
   p2_world: [number, number, number]
   plane_normal: [number, number, number]
   plane_offset: number
-  frozen_camera_to_world: Matrix4
-  frozen_camera_fingerprint: string
+  exploration_camera_to_world: Matrix4
+  camera_fingerprint: string
   preview_artifact_id: string
   camera_revision: number
   pick_buffer_revision: number
+  support_counts: [number, number, number]
+  weighted_inlier_ratio: number
+  rms_residual: number
+  confidence: number
   revision: number
+  confirmed: boolean
 }
 
-export interface SubjectContactConstraintDto {
-  source_asset_id: string
-  ingest_cache_key: string
-  segment_cache_key: string
-  source_calibration_revision: number
-  anchor_frame_index: number
-  foot_pixel: [number, number]
-  revision: number
-}
-
-export interface SynthesisPlacementDto {
-  source_calibration_revision: number
-  ground_anchor_revision: number
-  source_contact_revision: number | null
-  mode: 'contact' | 'perspective'
-  scene_azimuth: number
-  subject_to_scene_scale: number
-  composition_offset_local: [number, number]
-  anchor_camera_to_world: Matrix4
-  intrinsics: [[number, number, number], [number, number, number], [number, number, number]]
-  solver_cache_key: string
-  revision: number
-}
-
-export interface FootPointDto {
-  image: [number, number]
-  world: [number, number, number]
-  preview_artifact_id: string
-  camera_revision: number
-  pick_buffer_revision: number
+export interface OutputCropDto {
+  x: number
+  y: number
+  width: number
+  height: number
 }
 
 export interface PreviewDto {
@@ -213,16 +159,10 @@ export interface WorkflowDto {
   target_camera: CameraDto | null
   exploration_camera: ExplorationCameraDto | null
   preview_epoch: number
-  confirmed_camera_revision: number | null
-  confirmed_preview_artifact_id: string | null
-  foot_point: FootPointDto | null
-  subject_visibility_audit: SubjectVisibilityAuditDto | null
-  source_perspective_calibration: SourcePerspectiveCalibrationDto | null
-  local_ground_anchor: LocalGroundAnchorDto | null
-  subject_contact_constraint: SubjectContactConstraintDto | null
-  synthesis_placement: SynthesisPlacementDto | null
-  confirmed_synthesis_placement_revision: number | null
-  motion_scale: number
+  target_ground: TargetGroundDto | null
+  gs_scale: number
+  scene_azimuth: number
+  output_crop: OutputCropDto | null
   preview_height: number
   active_task_id: string | null
   preview: PreviewDto | null
@@ -400,7 +340,9 @@ export interface ProjectPatch {
   expected_ingest_cache_key?: string | null
   name?: string
   subject_prompt?: SubjectPromptDto | null
-  motion_scale?: number
+  gs_scale?: number
+  scene_azimuth?: number
+  output_crop?: OutputCropDto | null
   preview_height?: number
 }
 
@@ -457,43 +399,12 @@ export interface LivePreviewRequest {
   camera: CameraInput | MatrixCameraInput
 }
 
-export interface SourcePerspectiveCalibrationInput {
-  expected_project_id: string
-  expected_segment_cache_key: string
-  anchor_frame_index: number
-  image_width: number
-  image_height: number
-  evidence_method: 'orthogonal_guides' | 'automatic_prior'
-  reference_relation?: 'a_vertical_b_horizontal' | 'both_horizontal_plane'
-  group_a?: [[[number, number], [number, number]], [[number, number], [number, number]]]
-  group_b?: [[[number, number], [number, number]], [[number, number], [number, number]]]
-  prior_source?: 'centered_60_degree_default'
-}
-
-export interface LocalGroundAnchorInput {
+export interface TargetGroundCandidateInput {
   expected_project_id: string
   preview_artifact_id: string
   camera_revision: number
   pick_buffer_revision: number
-  points: [[number, number], [number, number], [number, number]]
-  flip_normal: boolean
-}
-
-export interface SourceContactConfirmationInput {
-  expected_project_id: string
-  source_calibration_revision: number
-  foot_pixel: [number, number]
-}
-
-export interface SynthesisPlacementInput {
-  expected_project_id: string
-  source_calibration_revision: number
-  ground_anchor_revision: number
-  mode: 'contact' | 'perspective'
-  scene_azimuth: number
-  subject_to_scene_scale: number
-  composition_offset_local: [number, number]
-  foot_pixel: [number, number] | null
+  hints: [[number, number], [number, number], [number, number]]
 }
 
 export interface PreviewFrameDto {
@@ -501,14 +412,6 @@ export interface PreviewFrameDto {
   generation: number
   width: number
   height: number
-  camera_revision: number
-  pick_buffer_revision: number
-}
-
-export interface PickRequest {
-  x: number
-  y: number
-  preview_artifact_id: string
   camera_revision: number
   pick_buffer_revision: number
 }

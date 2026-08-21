@@ -31,6 +31,7 @@ def test_production_assembly_builds_runnable_api_without_spawning_workers(
                 "segmentation_worker_prefix": [str(executable)],
                 "segmentation_model_config": str(config_file),
                 "segmentation_checkpoint": str(checkpoint),
+                "camera_worker_prefix": [str(executable)],
                 "renderer_worker_prefix": [str(executable)],
             }
         ),

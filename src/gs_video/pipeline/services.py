@@ -8,6 +8,7 @@ import stat
 from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
+from math import atan, degrees
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -16,8 +17,8 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image, UnidentifiedImageError
 
-from gs_video.camera.mapping import map_trajectory
-from gs_video.camera.opencv_solver import CameraSolution, OpenCvCameraSolver
+from gs_video.camera.mapping import map_ground_aligned_trajectory
+from gs_video.camera.solution import CameraSolution
 from gs_video.camera.serialization import (
     MappedTrajectory,
     read_camera_solution,
@@ -43,16 +44,13 @@ from gs_video.domain.models import (
     ArtifactCategory,
     ArtifactRef,
     ArtifactRole,
+    OutputCropState,
     Project,
     SceneSummary,
     StageName,
     StageState,
     StageStatus,
-    SubjectPromptState,
-    SubjectVisibilityAudit,
-    SynthesisConstraintMode,
     VideoSummary,
-    VisibilityRange,
 )
 from gs_video.media.export import ExportResult, export_mp4, probe_mp4
 from gs_video.media.ingest import extract_proxy_frames, extract_source_frames
@@ -64,18 +62,13 @@ from gs_video.resource_admission import cache_has_capacity, fits_vram_budget
 from gs_video.scene.worker_client import RendererWorkerIdentity
 from gs_video.scene.worker_protocol import RenderSequenceRequest
 from gs_video.segmentation.paths import has_reparse_component
-from gs_video.segmentation.visibility_audit import (
-    VisibilityAuditResult,
-    VisibilityCandidateRange,
-    audit_visibility_mask_paths,
-)
 from gs_video.storage.artifacts import ArtifactStore
 
 
 INGEST_IMPLEMENTATION_VERSION = "media-ingest-v1"
 SEGMENT_IMPLEMENTATION_VERSION = "segment-adapter-v1"
-CAMERA_IMPLEMENTATION_VERSION = "opencv-camera-adapter-v1"
-TRAJECTORY_IMPLEMENTATION_VERSION = "trajectory-map-anchor-v2"
+CAMERA_IMPLEMENTATION_VERSION = "vipe-camera-adapter-v1"
+TRAJECTORY_IMPLEMENTATION_VERSION = "ground-aligned-trajectory-v1"
 COMPOSITE_IMPLEMENTATION_VERSION = "full-resolution-composite-v1"
 EXPORT_IMPLEMENTATION_VERSION = "verified-export-v1"
 RENDER_IMPLEMENTATION_VERSION = "renderer-worker-adapter-v1"
@@ -139,6 +132,8 @@ class CameraSolverLike(Protocol):
     def solve(
         self,
         frame_paths: list[Path] | tuple[Path, ...],
+        mask_paths: list[Path] | tuple[Path, ...],
+        output_dir: Path,
         emit: ProgressEmitter,
         token: CancellationToken,
     ) -> CameraSolution: ...
@@ -1069,93 +1064,25 @@ class SegmentWorkflowService:
             expected_sizes=inventory.sizes,
             token=token,
         )
-        audit = audit_visibility_mask_paths(
-            output / f"{index:06d}.png" for index in range(1, inventory.count + 1)
-        )
-        self._persist_visibility_audit(
-            project,
-            ingest_cache_key=ingest_cache_key,
-            segment_cache_key=result_key,
-            prompt=prompt_state,
-            audit=audit,
-        )
         return StageResult(
             output_paths=(reference,),
             cache_key=result_key,
             artifacts={ArtifactRole.SUBJECT_MASKS: reference},
         )
 
-    def _persist_visibility_audit(
-        self,
-        project: Project,
-        *,
-        ingest_cache_key: str,
-        segment_cache_key: str,
-        prompt: SubjectPromptState,
-        audit: VisibilityAuditResult,
-    ) -> None:
-        source_asset_id = project.source_video_asset_id or project.source_video
-        if source_asset_id is None:
-            raise RepairableError("源视频 authority 不存在")
-
-        def persisted_range(value: VisibilityCandidateRange) -> VisibilityRange:
-            return VisibilityRange(
-                start_frame=value.start_frame,
-                end_frame=value.end_frame,
-                review_frames=value.review_frames,
-            )
-
-        def mutation(latest: Project) -> None:
-            latest_source = latest.source_video_asset_id or latest.source_video
-            latest_ingest = _stage_state(latest, StageName.INGEST)
-            if (
-                latest_source != source_asset_id
-                or latest_ingest.cache_key != ingest_cache_key
-                or latest.workflow.subject_prompt != prompt
-            ):
-                raise RepairableError("主体可见性审计期间源素材 authority 发生变化")
-            previous = latest.workflow.subject_visibility_audit
-            revision = 1 if previous is None else previous.revision + 1
-            latest.workflow.subject_visibility_audit = SubjectVisibilityAudit(
-                source_asset_id=source_asset_id,
-                segment_cache_key=segment_cache_key,
-                fully_visible_ranges=tuple(map(persisted_range, audit.fully_visible_ranges)),
-                bottom_cropped_ranges=tuple(map(persisted_range, audit.bottom_cropped_ranges)),
-                uncertain_ranges=tuple(map(persisted_range, audit.uncertain_ranges)),
-                recommended_anchor_frames=audit.recommended_anchor_frames,
-                revision=revision,
-            )
-            latest.workflow.source_perspective_calibration = None
-            latest.workflow.subject_contact_constraint = None
-            latest.workflow.synthesis_placement = None
-            latest.workflow.confirmed_synthesis_placement_revision = None
-            latest.workflow.export_result = None
-
-        if self.paths.update_project is not None:
-            self.paths.update_project(mutation)
-        mutation(project)
-
-
 class CameraSolveWorkflowService:
     def __init__(
         self,
         paths: WorkflowPaths,
-        solver: CameraSolverLike | None = None,
+        solver: CameraSolverLike,
         *,
         backend_identity: str | None = None,
     ) -> None:
         self.paths = paths
-        self.solver: CameraSolverLike
-        if solver is None:
-            self.solver = OpenCvCameraSolver()
-            self.backend_identity = backend_identity or "opencv-camera-solver-v1"
-        else:
-            if not backend_identity:
-                raise ValueError(
-                    "custom camera solver requires an explicit nonempty identity"
-                )
-            self.solver = solver
-            self.backend_identity = backend_identity
+        if not backend_identity:
+            raise ValueError("camera solver requires an explicit nonempty identity")
+        self.solver = solver
+        self.backend_identity = backend_identity
 
     def run(
         self,
@@ -1176,11 +1103,27 @@ class CameraSolveWorkflowService:
             label="代理",
             token=token,
         )
+        segment = _stage_state(project, StageName.SEGMENT)
+        mask_directory = _artifact_path(
+            self.paths, segment, ArtifactRole.SUBJECT_MASKS, ArtifactCategory.MASKS
+        )
+        masks = _frame_inventory(
+            mask_directory,
+            suffix="png",
+            image_format="PNG",
+            mode="L",
+            label="人物遮罩",
+            expected_count=proxies.count,
+            expected_sizes=proxies.sizes,
+            token=token,
+        )
         result_key = cache_key(
             StageName.SOLVE_CAMERA.value,
             {
                 "ingest_cache_key": ingest.cache_key,
                 "proxy_inventory": proxies.fingerprint,
+                "segment_cache_key": segment.cache_key,
+                "mask_inventory": masks.fingerprint,
             },
             {"backend_identity": self.backend_identity},
             CAMERA_IMPLEMENTATION_VERSION,
@@ -1188,10 +1131,16 @@ class CameraSolveWorkflowService:
 
         def build(staging: Path) -> None:
             token.raise_if_cancelled()
-            solution = self.solver.solve(list(proxies.paths), emit, token)
+            solution = self.solver.solve(
+                list(proxies.paths), list(masks.paths), staging, emit, token
+            )
             if len(solution.camera_to_world) != proxies.count:
                 raise RepairableError("相机求解轨迹帧数与代理帧数不一致")
+            if solution.source_ground is None:
+                raise RepairableError("相机求解没有可信的自动源地面")
             write_camera_solution(staging / "solution.json", solution)
+            if not (staging / "depth.zip").is_file():
+                raise RepairableError("相机求解没有发布逐帧深度")
             _assert_frame_snapshot(
                 proxy_directory,
                 proxies,
@@ -1201,19 +1150,32 @@ class CameraSolveWorkflowService:
                 label="代理",
                 token=token,
             )
+            _assert_frame_snapshot(
+                mask_directory,
+                masks,
+                suffix="png",
+                image_format="PNG",
+                mode="L",
+                label="人物遮罩",
+                token=token,
+            )
             token.raise_if_cancelled()
 
         directory_ref, output = self.paths.publish(
             project, ArtifactCategory.CAMERA, result_key, build
         )
         reference = self.paths.member(directory_ref, "solution.json")
+        depth_reference = self.paths.member(directory_ref, "depth.zip")
         restored = read_camera_solution(self.paths.resolve(reference, directory=False))
-        if len(restored.camera_to_world) != proxies.count:
-            raise RepairableError("缓存相机轨迹帧数与代理帧数不一致")
+        if len(restored.camera_to_world) != proxies.count or restored.source_ground is None:
+            raise RepairableError("缓存相机轨迹帧数或自动源地面无效")
         return StageResult(
-            output_paths=(reference,),
+            output_paths=(reference, depth_reference),
             cache_key=result_key,
-            artifacts={ArtifactRole.CAMERA_SOLUTION: reference},
+            artifacts={
+                ArtifactRole.CAMERA_SOLUTION: reference,
+                ArtifactRole.SOURCE_DEPTH: depth_reference,
+            },
         )
 
 
@@ -1239,49 +1201,32 @@ class TrajectoryMapWorkflowService:
         solution_snapshot = _file_snapshot(solution_path, "相机求解产物", token)
         solution = read_camera_solution(solution_path)
         workflow = project.workflow
-        calibration = workflow.source_perspective_calibration
-        ground = workflow.local_ground_anchor
-        contact = workflow.subject_contact_constraint
-        placement = workflow.synthesis_placement
-        if calibration is None or ground is None or placement is None:
-            raise RepairableError("源透视、局部地面和合成机位尚未完整设置")
-        ingest = _stage_state(project, StageName.INGEST)
-        segment = _stage_state(project, StageName.SEGMENT)
-        source_asset_id = project.source_video_asset_id or project.source_video
+        ground = workflow.target_ground
+        summary = workflow.source_summary
+        if solution.source_ground is None:
+            raise RepairableError("ViPE 解算未提供通过审计的源地面")
+        if ground is None or not ground.confirmed:
+            raise RepairableError("目标 GS 地面候选尚未确认")
+        if summary is None:
+            raise RepairableError("源视频像素坐标系不可用")
         scene_asset_id = project.scene_ply_asset_id or project.scene_ply
-        authority_matches = (
-            calibration.source_asset_id == source_asset_id
-            and calibration.ingest_cache_key == ingest.cache_key
-            and calibration.segment_cache_key == segment.cache_key
-            and ground.scene_asset_id == scene_asset_id
-            and placement.source_calibration_revision == calibration.revision
-            and placement.ground_anchor_revision == ground.revision
-            and workflow.confirmed_synthesis_placement_revision
-            == placement.revision
-        )
-        if placement.mode is SynthesisConstraintMode.CONTACT:
-            authority_matches = authority_matches and contact is not None and (
-                contact.source_asset_id == calibration.source_asset_id
-                and contact.ingest_cache_key == calibration.ingest_cache_key
-                and contact.segment_cache_key == calibration.segment_cache_key
-                and contact.source_calibration_revision == calibration.revision
-                and contact.anchor_frame_index == calibration.anchor_frame_index
-                and placement.source_contact_revision == contact.revision
-            )
-        elif contact is not None:
-            authority_matches = False
-        if not authority_matches:
-            raise RepairableError("合成机位与源透视或局部地面 authority 不一致")
+        if ground.scene_asset_id != scene_asset_id:
+            raise RepairableError("目标地面与当前 GS 场景 authority 不一致")
         if solution.confidence < 0.2:
             raise RepairableError("源相机轨迹置信度不足，无法安全映射")
-        target_camera_to_world = np.asarray(
-            placement.anchor_camera_to_world, dtype=np.float64
-        )
-        mapped = map_trajectory(
+        solution_intrinsics = solution.frame_intrinsics
+        if solution_intrinsics is None:
+            raise RepairableError("ViPE 解算缺少逐帧内参")
+        mapped = map_ground_aligned_trajectory(
             solution,
-            target_camera_to_world,
-            placement.subject_to_scene_scale * workflow.motion_scale,
-            calibration.anchor_frame_index,
+            target_p0=ground.p0_world,
+            target_p1=ground.p1_world,
+            target_normal=ground.plane_normal,
+            gs_scale=workflow.gs_scale,
+            scene_azimuth_degrees=workflow.scene_azimuth,
+        )
+        vertical_fov = degrees(
+            2 * atan(summary.height / (2 * float(solution_intrinsics[0][1, 1])))
         )
         token.raise_if_cancelled()
         result_key = cache_key(
@@ -1291,11 +1236,10 @@ class TrajectoryMapWorkflowService:
                 "camera_artifact_sha256": solution_snapshot.sha256,
             },
             {
-                "source_calibration": calibration.model_dump(mode="json"),
-                "local_ground": ground.model_dump(mode="json"),
-                "contact": None if contact is None else contact.model_dump(mode="json"),
-                "placement": placement.model_dump(mode="json"),
-                "motion_amplitude": workflow.motion_scale,
+                "target_ground": ground.model_dump(mode="json"),
+                "gs_scale": workflow.gs_scale,
+                "scene_azimuth": workflow.scene_azimuth,
+                "source_size": [summary.width, summary.height],
             },
             TRAJECTORY_IMPLEMENTATION_VERSION,
         )
@@ -1304,7 +1248,12 @@ class TrajectoryMapWorkflowService:
             token.raise_if_cancelled()
             write_mapped_trajectory(
                 staging / "trajectory.json",
-                MappedTrajectory(calibration.vertical_fov, mapped),
+                MappedTrajectory(
+                    vertical_fov,
+                    mapped,
+                    frame_intrinsics=solution.frame_intrinsics,
+                    source_size=(summary.width, summary.height),
+                ),
             )
             _assert_file_snapshot(
                 solution_path,
@@ -1322,12 +1271,22 @@ class TrajectoryMapWorkflowService:
             self.paths.resolve(reference, directory=False)
         )
         if (
-            restored.fov_y_degrees != calibration.vertical_fov
+            restored.fov_y_degrees != vertical_fov
             or len(restored.camera_to_world) != len(mapped)
+            or restored.source_size != (summary.width, summary.height)
+            or restored.frame_intrinsics is None
             or any(
                 not np.allclose(actual, expected, atol=1e-12)
                 for actual, expected in zip(
                     restored.camera_to_world, mapped, strict=True
+                )
+            )
+            or any(
+                not np.allclose(actual, expected, atol=1e-12)
+                for actual, expected in zip(
+                    restored.frame_intrinsics,
+                    solution_intrinsics,
+                    strict=True,
                 )
             )
         ):
@@ -1388,6 +1347,7 @@ class RendererWorkflowService:
         summary = project.workflow.source_summary
         if summary is None:
             raise RepairableError("源视频摘要不可用")
+        output_crop = _resolved_output_crop(project, summary)
         frame_count = len(trajectory.camera_to_world)
         if frame_count <= 0 or (
             summary.frame_count is not None and frame_count != summary.frame_count
@@ -1399,10 +1359,10 @@ class RendererWorkflowService:
             else max(1, (frame_count + 149) // 150)
         )
         if namespace_value == "final":
-            width, height = summary.width, summary.height
+            width, height = output_crop.width, output_crop.height
         else:
             width, height = _preview_size(
-                (summary.width, summary.height), project.workflow.preview_height
+                (output_crop.width, output_crop.height), project.workflow.preview_height
             )
         available_vram_limit_mb = resolve_vram_limit_mb(
             self.available_vram_limit_mb,
@@ -1427,6 +1387,7 @@ class RendererWorkflowService:
                 "height": height,
                 "sh_degree": self.sh_degree,
                 "preview_stride": preview_stride,
+                "output_crop": output_crop.model_dump(),
                 "worker": {
                     "torch": identity.torch,
                     "gsplat": identity.gsplat,
@@ -1440,11 +1401,29 @@ class RendererWorkflowService:
         def build(staging: Path) -> None:
             token.raise_if_cancelled()
             worker_output = staging / "worker-output"
+            if trajectory.frame_intrinsics is None:
+                raise RepairableError("映射轨迹缺少 ViPE 逐帧内参")
+            adjusted_intrinsics = []
+            for value in trajectory.frame_intrinsics:
+                intrinsic = np.asarray(value, dtype=np.float64).copy()
+                intrinsic[0, 2] -= output_crop.x
+                intrinsic[1, 2] -= output_crop.y
+                adjusted_intrinsics.append(intrinsic)
+            render_manifest = staging / "render-trajectory.json"
+            write_mapped_trajectory(
+                render_manifest,
+                MappedTrajectory(
+                    fov_y_degrees=trajectory.fov_y_degrees,
+                    camera_to_world=trajectory.camera_to_world,
+                    frame_intrinsics=adjusted_intrinsics,
+                    source_size=(output_crop.width, output_crop.height),
+                ),
+            )
             rendered = self.worker.render_sequence(
                 RenderSequenceRequest(
                     type="render_sequence",
                     scene_path=scene,
-                    camera_manifest=trajectory_path,
+                    camera_manifest=render_manifest,
                     output_dir=worker_output,
                     width=width,
                     height=height,
@@ -1455,6 +1434,7 @@ class RendererWorkflowService:
                 emit,
                 token,
             )
+            render_manifest.unlink()
             if (
                 rendered.frame_dir.absolute() != worker_output.absolute()
                 or rendered.frame_count != expected_count
@@ -1523,6 +1503,42 @@ def _preview_size(source: tuple[int, int], maximum_height: int) -> tuple[int, in
     return target_width, target_height
 
 
+def _resolved_output_crop(project: Project, summary: VideoSummary) -> OutputCropState:
+    return project.workflow.output_crop or OutputCropState(
+        x=0,
+        y=0,
+        width=summary.width,
+        height=summary.height,
+    )
+
+
+def _place_source_in_output(
+    foreground: NDArray[np.uint8],
+    alpha: NDArray[np.uint8],
+    crop: OutputCropState,
+) -> tuple[NDArray[np.uint8], NDArray[np.uint8]]:
+    canvas = np.zeros((crop.height, crop.width, 3), dtype=np.uint8)
+    alpha_canvas = np.zeros((crop.height, crop.width), dtype=np.uint8)
+    source_height, source_width = alpha.shape
+    source_x0 = max(0, crop.x)
+    source_y0 = max(0, crop.y)
+    source_x1 = min(source_width, crop.x + crop.width)
+    source_y1 = min(source_height, crop.y + crop.height)
+    if source_x1 <= source_x0 or source_y1 <= source_y0:
+        return canvas, alpha_canvas
+    output_x0 = source_x0 - crop.x
+    output_y0 = source_y0 - crop.y
+    output_x1 = output_x0 + source_x1 - source_x0
+    output_y1 = output_y0 + source_y1 - source_y0
+    canvas[output_y0:output_y1, output_x0:output_x1] = foreground[
+        source_y0:source_y1, source_x0:source_x1
+    ]
+    alpha_canvas[output_y0:output_y1, output_x0:output_x1] = alpha[
+        source_y0:source_y1, source_x0:source_x1
+    ]
+    return canvas, alpha_canvas
+
+
 class CompositeWorkflowService:
     def __init__(
         self,
@@ -1573,6 +1589,7 @@ class CompositeWorkflowService:
         ingest = _stage_state(project, StageName.INGEST)
         segment = _stage_state(project, StageName.SEGMENT)
         render = _stage_state(project, StageName.RENDER)
+        output_crop = _resolved_output_crop(project, summary)
         source_directory = _artifact_path(
             self.paths, ingest, ArtifactRole.SOURCE_FRAMES, ArtifactCategory.FRAMES
         )
@@ -1621,7 +1638,7 @@ class CompositeWorkflowService:
             mode="RGB",
             label="渲染",
             expected_count=sources.count,
-            expected_size=(summary.width, summary.height),
+            expected_size=(output_crop.width, output_crop.height),
             token=token,
         )
         result_key = cache_key(
@@ -1635,6 +1652,7 @@ class CompositeWorkflowService:
             },
             {
                 "edge_px": self.edge_px,
+                "output_crop": output_crop.model_dump(),
                 "preview_height": project.workflow.preview_height,
                 "preview_frame_limit": self.preview_frame_limit,
                 "exporter_identity": self.exporter_identity,
@@ -1664,6 +1682,9 @@ class CompositeWorkflowService:
                         (summary.width, summary.height),
                         interpolation=cv2.INTER_NEAREST,
                     ),
+                )
+                foreground, alpha = _place_source_in_output(
+                    foreground, alpha, output_crop
                 )
                 composite = composite_frame(
                     foreground, background, alpha, edge_px=self.edge_px
@@ -1718,12 +1739,12 @@ class CompositeWorkflowService:
             mode="RGB",
             label="合成",
             expected_count=sources.count,
-            expected_size=(summary.width, summary.height),
+            expected_size=(output_crop.width, output_crop.height),
             token=token,
         )
         preview_count = min(composites.count, self.preview_frame_limit)
         preview_size = _preview_size(
-            (summary.width, summary.height), project.workflow.preview_height
+            (output_crop.width, output_crop.height), project.workflow.preview_height
         )
 
         def build_preview(staging: Path) -> None:
@@ -1848,6 +1869,7 @@ class ExportWorkflowService:
             self.paths, project, token
         )
         composite = _stage_state(project, StageName.COMPOSITE)
+        output_crop = _resolved_output_crop(project, summary)
         composite_directory = _artifact_path(
             self.paths,
             composite,
@@ -1861,7 +1883,7 @@ class ExportWorkflowService:
             mode="RGB",
             label="合成",
             expected_count=summary.frame_count,
-            expected_size=(summary.width, summary.height),
+            expected_size=(output_crop.width, output_crop.height),
             token=token,
         )
         result_key = cache_key(
@@ -1876,6 +1898,7 @@ class ExportWorkflowService:
                 "source_size": summary.size,
                 "source_sha256": summary.sha256,
                 "has_audio": summary.has_audio,
+                "output_crop": output_crop.model_dump(),
                 "exporter_identity": self.exporter_identity,
             },
             EXPORT_IMPLEMENTATION_VERSION,

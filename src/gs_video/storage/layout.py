@@ -684,15 +684,7 @@ class StorageLayoutManager:
                         stage.error_code = None
                 project.workflow.export_result = None
                 project.workflow.preview = None
-                project.workflow.foot_point = None
-                project.workflow.confirmed_camera_revision = None
-                project.workflow.confirmed_preview_artifact_id = None
-                project.workflow.subject_visibility_audit = None
-                project.workflow.source_perspective_calibration = None
-                project.workflow.local_ground_anchor = None
-                project.workflow.subject_contact_constraint = None
-                project.workflow.synthesis_placement = None
-                project.workflow.confirmed_synthesis_placement_revision = None
+                project.workflow.target_ground = None
 
             repository.update(invalidate)
 

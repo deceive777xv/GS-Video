@@ -11,50 +11,19 @@ import type {
   MatrixCameraInput,
   PreviewFrameDto,
   ProjectDto,
-  SubjectMediaDto,
 } from '../../api/types'
 import { toImagePoint, type ImagePoint } from '../coordinates/image-point'
-import {
-  defaultGuideGroups,
-  imagePointToFramePercent,
-  PerspectiveGuides,
-  solvePerspectiveGuides,
-  type GuideGroups,
-  type ReferenceRelation,
-} from './perspective-guides'
 
-interface WorkspaceProps {
+export type CameraPanel = 'source' | 'scene' | 'synthesis'
+
+interface CameraWorkspaceProps {
   backend: BackendClient
   busy: boolean
   project: ProjectDto
   onError(value: unknown): void
   onProjectChange(project: ProjectDto): void
   onRefresh(): Promise<ProjectDto>
-}
-
-export type CameraPanel = 'source' | 'scene' | 'synthesis'
-
-interface CameraWorkspaceProps extends WorkspaceProps {
   panel: CameraPanel
-}
-
-interface MutationWorkspaceProps extends WorkspaceProps {
-  mutationPending: boolean
-  beginMutation(): boolean
-  endMutation(): void
-}
-
-interface SourceCalibrationPanelProps extends MutationWorkspaceProps {
-  active: boolean
-  confirmedFoot: ImagePoint | null
-  draftDirty: boolean
-  onDraftDirtyChange(value: boolean): void
-}
-
-interface SynthesisPanelProps extends MutationWorkspaceProps {
-  active: boolean
-  calibrationDraftDirty: boolean
-  confirmedFoot: ImagePoint | null
 }
 
 interface EulerPose {
@@ -67,9 +36,17 @@ interface EulerPose {
   fov: number
 }
 
-const DEFAULT_POSE: EulerPose = { x: 0, y: 0, z: -4, yaw: 0, pitch: 0, roll: 0, fov: 50 }
-
 type Matrix3 = [[number, number, number], [number, number, number], [number, number, number]]
+
+const DEFAULT_POSE: EulerPose = {
+  x: 0,
+  y: 0,
+  z: -4,
+  yaw: 0,
+  pitch: 0,
+  roll: 0,
+  fov: 50,
+}
 
 function multiply3(left: Matrix3, right: Matrix3): Matrix3 {
   const value = (row: 0 | 1 | 2, column: 0 | 1 | 2): number => (
@@ -111,7 +88,9 @@ function matrixPose(camera: MatrixCameraInput | null): EulerPose {
   const matrix = camera.camera_to_world
   const pitch = Math.asin(Math.max(-1, Math.min(1, -matrix[1][2])))
   return {
-    x: matrix[0][3], y: matrix[1][3], z: matrix[2][3],
+    x: matrix[0][3],
+    y: matrix[1][3],
+    z: matrix[2][3],
     yaw: Math.atan2(matrix[0][2], matrix[2][2]) * 180 / Math.PI,
     pitch: pitch * 180 / Math.PI,
     roll: Math.atan2(matrix[1][0], matrix[1][1]) * 180 / Math.PI,
@@ -123,750 +102,217 @@ function cameraInput(pose: EulerPose): MatrixCameraInput {
   return { camera_to_world: poseMatrix(pose), fov_y_degrees: pose.fov }
 }
 
-function poseFingerprint(pose: EulerPose): string {
-  return [pose.x, pose.y, pose.z, pose.yaw, pose.pitch, pose.roll, pose.fov]
-    .map((value) => value.toFixed(6)).join('|')
+function Marker({ point, frame, label }: {
+  point: ImagePoint
+  frame: PreviewFrameDto
+  label: string
+}) {
+  const scale = Math.min(16 / frame.width, 9 / frame.height)
+  const left = ((16 - frame.width * scale) / 2 + (point.x + 0.5) * scale) / 16 * 100
+  const top = ((9 - frame.height * scale) / 2 + (point.y + 0.5) * scale) / 9 * 100
+  return <span className="ground-point-marker" style={{ left: `${left}%`, top: `${top}%` }}>{label}</span>
 }
 
-function useBlobUrl(): [string | null, (blob: Blob | null) => void] {
-  const [url, setUrl] = useState<string | null>(null)
-  const current = useRef<string | null>(null)
-  const replace = (blob: Blob | null): void => {
-    if (current.current !== null) URL.revokeObjectURL(current.current)
-    current.current = blob === null ? null : URL.createObjectURL(blob)
-    setUrl(current.current)
-  }
-  useEffect(() => () => { if (current.current !== null) URL.revokeObjectURL(current.current) }, [])
-  return [url, replace]
-}
-
-function Marker({ point, width, height, label }: { point: ImagePoint; width: number; height: number; label: string }) {
-  const scale = Math.min(16 / width, 9 / height)
-  const left = ((16 - width * scale) / 2 + (point.x + .5) * scale) / 16 * 100
-  const top = ((9 - height * scale) / 2 + (point.y + .5) * scale) / 9 * 100
-  return (
-    <span
-      className="ground-point-marker"
-      style={{ left: `${left}%`, top: `${top}%` }}
-    >{label}</span>
-  )
-}
-
-function NumericField({ disabled, label, onCommit, step = .1, value }: {
+function NumberField({ disabled, label, value, onChange, min, max, step = 0.1 }: {
   disabled: boolean
   label: string
-  onCommit(value: number): void
-  step?: number
   value: number
+  onChange(value: number): void
+  min?: number
+  max?: number
+  step?: number
 }) {
-  const [text, setText] = useState(String(Number(value.toFixed(3))))
-  const inputRef = useRef<HTMLInputElement>(null)
-  useEffect(() => {
-    if (document.activeElement !== inputRef.current) setText(String(Number(value.toFixed(3))))
-  }, [value])
-  const commit = (): void => {
-    const parsed = Number(text)
-    if (text.trim() !== '' && Number.isFinite(parsed)) onCommit(parsed)
-    else setText(String(Number(value.toFixed(3))))
-  }
-  return <input aria-label={label} disabled={disabled} onBlur={commit} onChange={(event) => setText(event.currentTarget.value)} onKeyDown={(event) => {
-    if (event.key === 'Enter') { event.preventDefault(); commit(); event.currentTarget.blur() }
-    if (event.key === 'Escape') { event.preventDefault(); setText(String(Number(value.toFixed(3)))); event.currentTarget.blur() }
-  }} ref={inputRef} step={step} type="number" value={text} />
-}
-
-type Vector3 = [number, number, number]
-
-function dot3(left: Vector3, right: Vector3): number {
-  return left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
-}
-
-function cross3(left: Vector3, right: Vector3): Vector3 {
-  return [
-    left[1] * right[2] - left[2] * right[1],
-    left[2] * right[0] - left[0] * right[2],
-    left[0] * right[1] - left[1] * right[0],
-  ]
-}
-
-function unit3(value: Vector3): Vector3 | null {
-  const length = Math.hypot(...value)
-  return length <= 1e-9 ? null : [value[0] / length, value[1] / length, value[2] / length]
-}
-
-function rotate3(value: Vector3, axisValue: Vector3, angle: number): Vector3 {
-  const axis = unit3(axisValue)
-  if (axis === null) return value
-  const cosine = Math.cos(angle); const sine = Math.sin(angle)
-  const cross = cross3(axis, value); const dot = dot3(axis, value)
-  return [
-    value[0] * cosine + cross[0] * sine + axis[0] * dot * (1 - cosine),
-    value[1] * cosine + cross[1] * sine + axis[1] * dot * (1 - cosine),
-    value[2] * cosine + cross[2] * sine + axis[2] * dot * (1 - cosine),
-  ]
-}
-
-function projectWorldPoint(point: Vector3, cameraToWorld: Matrix4, fov: number, width: number, height: number): ImagePoint | null {
-  const delta: Vector3 = [
-    point[0] - cameraToWorld[0][3],
-    point[1] - cameraToWorld[1][3],
-    point[2] - cameraToWorld[2][3],
-  ]
-  const camera: Vector3 = [
-    cameraToWorld[0][0] * delta[0] + cameraToWorld[1][0] * delta[1] + cameraToWorld[2][0] * delta[2],
-    cameraToWorld[0][1] * delta[0] + cameraToWorld[1][1] * delta[1] + cameraToWorld[2][1] * delta[2],
-    cameraToWorld[0][2] * delta[0] + cameraToWorld[1][2] * delta[1] + cameraToWorld[2][2] * delta[2],
-  ]
-  if (camera[2] <= 1e-6) return null
-  const focal = 0.5 * height / Math.tan(fov * Math.PI / 360)
-  return { x: focal * camera[0] / camera[2] + width / 2, y: focal * camera[1] / camera[2] + height / 2 }
-}
-
-function ReviewThumbnail({ backend, busy, frame, selected, onError, onSelect }: {
-  backend: BackendClient
-  busy: boolean
-  frame: number
-  selected: boolean
-  onError(value: unknown): void
-  onSelect(): void
-}) {
-  const [url, replaceUrl] = useBlobUrl()
-  useEffect(() => {
-    let cancelled = false
-    void backend.getSubjectMedia('proxy', frame)
-      .then((descriptor) => backend.fetchSubjectMediaArtifact('proxy', descriptor.artifact_id, undefined, frame))
-      .then((blob) => { if (!cancelled) replaceUrl(blob) })
-      .catch((error) => { if (!cancelled) onError(error) })
-    return () => { cancelled = true }
-  }, [backend, frame])
   return (
-    <button
-      aria-label={`选择代表帧 ${frame}`}
-      className={selected ? 'audit-thumbnail is-selected' : 'audit-thumbnail'}
-      disabled={busy}
-      onClick={onSelect}
-      type="button"
-    >
-      {url === null ? <span>#{frame}</span> : <img alt="" src={url} />}
-      <small>#{frame}</small>
-    </button>
+    <label>{label}<input
+      aria-label={label}
+      disabled={disabled}
+      max={max}
+      min={min}
+      onChange={(event) => {
+        const next = Number(event.currentTarget.value)
+        if (Number.isFinite(next)) onChange(next)
+      }}
+      step={step}
+      type="number"
+      value={value}
+    /></label>
   )
 }
 
-interface ReviewRange {
-  start_frame: number
-  end_frame: number
-  review_frames: number[]
-}
-
-function AuditReviewGroup({ backend, busy, label, ranges, selectedFrame, onError, onSelect }: {
-  backend: BackendClient
-  busy: boolean
-  label: string
-  ranges: ReviewRange[]
-  selectedFrame: number
-  onError(value: unknown): void
-  onSelect(frame: number): void
-}) {
-  const [open, setOpen] = useState(false)
-  const reviewFrames = [...new Set(ranges.flatMap((range) => range.review_frames))]
-  const visibleFrames = reviewFrames.slice(0, 12)
-  return (
-    <details name="visibility-audit-review" onToggle={(event) => setOpen(event.currentTarget.open)}>
-      <summary>{label}代表帧 · {ranges.length} 段</summary>
-      {open ? <div className="audit-thumbnail-strip">
-        {visibleFrames.map((frame) => <ReviewThumbnail backend={backend} busy={busy} frame={frame} key={frame} onError={onError} onSelect={() => onSelect(frame)} selected={selectedFrame === frame} />)}
-        {reviewFrames.length > visibleFrames.length ? <small>仅显示前 {visibleFrames.length} 个代表帧，可用锚定帧编号查看其余帧。</small> : null}
-      </div> : null}
-    </details>
-  )
-}
-
-function SourceCalibrationPanel({
+export function ConstrainedCameraWorkspace({
   backend,
-  active,
   busy,
   project,
   onError,
   onProjectChange,
-  confirmedFoot,
-  draftDirty,
-  onDraftDirtyChange,
-  mutationPending: pending,
-  beginMutation,
-  endMutation,
-}: SourceCalibrationPanelProps) {
-  const workflow = project.workflow
-  const segmentKey = project.stages.segment?.cache_key ?? null
-  const initialAnchor = workflow.source_perspective_calibration?.anchor_frame_index
-    ?? workflow.subject_visibility_audit?.recommended_anchor_frames[0]
-    ?? workflow.subject_prompt?.frame_index
-    ?? 0
-  const [anchorFrame, setAnchorFrame] = useState(initialAnchor)
-  const [media, setMedia] = useState<SubjectMediaDto | null>(null)
-  const [sourceUrl, replaceSourceUrl] = useBlobUrl()
-  const [alphaUrl, replaceAlphaUrl] = useBlobUrl()
-  const storedGroups = workflow.source_perspective_calibration?.guide_groups
-  const [groups, setGroups] = useState<GuideGroups>(() => storedGroups === null || storedGroups === undefined
-    ? defaultGuideGroups(960, 540)
-    : storedGroups.map((group) => group.map((segment) => segment.map(([x, y]) => ({ x, y })))) as GuideGroups)
-  const [relation, setRelation] = useState<ReferenceRelation>(workflow.source_perspective_calibration?.reference_relation ?? 'a_vertical_b_horizontal')
-  const [guidesTouched, setGuidesTouched] = useState(storedGroups !== null && storedGroups !== undefined)
-  const [evidenceMethod, setEvidenceMethod] = useState<'orthogonal_guides' | 'automatic_prior'>(
-    workflow.source_perspective_calibration === null || workflow.source_perspective_calibration.evidence_method === 'orthogonal_guides' ? 'orthogonal_guides' : 'automatic_prior',
-  )
-  const [tool, setTool] = useState<'guides' | 'foot'>('guides')
-  const [footDraft, setFootDraft] = useState<ImagePoint | null>(null)
-  const sourceFrameRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    const calibration = workflow.source_perspective_calibration
-    if (calibration === null) return
-    setAnchorFrame(calibration.anchor_frame_index)
-    setRelation(calibration.reference_relation ?? 'a_vertical_b_horizontal')
-    setEvidenceMethod(calibration.evidence_method === 'orthogonal_guides' ? 'orthogonal_guides' : 'automatic_prior')
-    if (calibration.guide_groups !== null) {
-      setGroups(calibration.guide_groups.map((group) => group.map((segment) => segment.map(([x, y]) => ({ x, y })))) as GuideGroups)
-      setGuidesTouched(true)
-    }
-    onDraftDirtyChange(false)
-  }, [onDraftDirtyChange, workflow.source_perspective_calibration?.revision])
-
-  useEffect(() => {
-    if (!active) return
-    let cancelled = false
-    setMedia(null)
-    replaceSourceUrl(null)
-    replaceAlphaUrl(null)
-    setFootDraft(null)
-    const load = async (): Promise<void> => {
-      try {
-        const descriptor = await backend.getSubjectMedia('proxy', anchorFrame)
-        const [source, alpha] = await Promise.all([
-          backend.fetchSubjectMediaArtifact('proxy', descriptor.artifact_id, undefined, anchorFrame),
-          backend.getSubjectMedia('alpha', anchorFrame).then((item) => (
-            backend.fetchSubjectMediaArtifact('alpha', item.artifact_id, undefined, anchorFrame)
-          )),
-        ])
-        if (cancelled) return
-        setMedia(descriptor)
-        if (workflow.source_perspective_calibration?.guide_groups === null
-          || workflow.source_perspective_calibration?.guide_groups === undefined) {
-          setGroups(defaultGuideGroups(descriptor.width, descriptor.height))
-          setGuidesTouched(false)
-        }
-        replaceSourceUrl(source)
-        replaceAlphaUrl(alpha)
-        setFootDraft(null)
-      } catch (error) {
-        if (!cancelled) onError(error)
-      }
-    }
-    void load()
-    return () => { cancelled = true }
-  }, [active, anchorFrame, backend, project.project_id, segmentKey, workflow.source_perspective_calibration?.revision])
-
-  const scan = async (): Promise<void> => {
-    if (segmentKey === null || !beginMutation()) return
-    try {
-      onProjectChange(await backend.scanSubjectVisibility(project.project_id, segmentKey))
-    } catch (error) { onError(error) } finally { endMutation() }
-  }
-
-  const save = async (): Promise<void> => {
-    if (media === null || media.frame_index !== anchorFrame || segmentKey === null || !beginMutation()) return
-    try {
-      const height = media.height
-      const width = media.width
-      const updated = await backend.calibrateSourcePerspective({
-        expected_project_id: project.project_id,
-        expected_segment_cache_key: segmentKey,
-        anchor_frame_index: anchorFrame,
-        image_width: width,
-        image_height: height,
-        evidence_method: evidenceMethod,
-        ...(evidenceMethod === 'orthogonal_guides' ? {
-          reference_relation: relation,
-          group_a: groups[0].map((segment) => segment.map((point) => [point.x, point.y])) as [[[number, number], [number, number]], [[number, number], [number, number]]],
-          group_b: groups[1].map((segment) => segment.map((point) => [point.x, point.y])) as [[[number, number], [number, number]], [[number, number], [number, number]]],
-        } : { prior_source: 'centered_60_degree_default' }),
-      })
-      onDraftDirtyChange(false)
-      onProjectChange(updated)
-    } catch (error) { onError(error) } finally { endMutation() }
-  }
-
-  const confirmFoot = async (): Promise<void> => {
-    const calibration = workflow.source_perspective_calibration
-    if (draftDirty || footDraft === null || calibration === null || calibration.anchor_frame_index !== anchorFrame || !beginMutation()) return
-    try {
-      onProjectChange(await backend.confirmSourceContact({
-        expected_project_id: project.project_id,
-        source_calibration_revision: calibration.revision,
-        foot_pixel: [footDraft.x, footDraft.y],
-      }))
-    } catch (error) { onError(error) } finally { endMutation() }
-  }
-
-  const chooseFoot = (event: ReactPointerEvent<HTMLDivElement>): void => {
-    if (busy || pending || tool !== 'foot' || media === null || sourceFrameRef.current === null) return
-    const point = toImagePoint(event, sourceFrameRef.current.getBoundingClientRect(), media)
-    if (point !== null) setFootDraft(point)
-  }
-
-  const audit = workflow.subject_visibility_audit
-  const preview = media === null || evidenceMethod === 'automatic_prior'
-    ? { valid: true, fov: 60, horizon: null, gravity: [0, -1, 0] as [number, number, number], message: '没有足够透视证据时使用 60° 系统初值，仅供视觉预览。' }
-    : solvePerspectiveGuides(media, groups, relation)
-  const confirmedCalibration = workflow.source_perspective_calibration
-  const evidenceReady = evidenceMethod === 'automatic_prior' || guidesTouched
-  const previewRoll = preview.gravity === null ? null : Math.atan2(preview.gravity[0], -preview.gravity[1]) * 180 / Math.PI
-  const horizonStyle = media === null || preview.horizon === null || Math.abs(preview.horizon[1]) <= 1e-9
-    ? null
-    : (() => {
-        const [a, b, c] = preview.horizon
-        const start = imagePointToFramePercent({ x: 0, y: -c / b }, media)
-        const end = imagePointToFramePercent({ x: media.width - 1, y: -(a * (media.width - 1) + c) / b }, media)
-        return { left: `${start.x}%`, top: `${start.y}%`, width: `${Math.hypot(end.x - start.x, end.y - start.y)}%`, transform: `rotate(${Math.atan2(end.y - start.y, end.x - start.x) * 180 / Math.PI}deg)` }
-      })()
-  return (
-    <section aria-busy={busy} className="calibration-card" aria-labelledby="source-calibration-title">
-      <div className="calibration-card-heading">
-        <div><span className="step-kicker">A · 源画面</span><h3 id="source-calibration-title">透视与可见性校准</h3></div>
-        <button disabled={busy || pending || segmentKey === null} onClick={() => void scan()} type="button">扫描全部 Alpha</button>
-      </div>
-      <p className="technical-note">把两组线分别贴到现实中平行、画面中汇聚的边缘。系统求解 FOV；没有足够证据时可使用明确标记的低置信度初值。</p>
-      <div className="source-calibration-grid">
-        <div className={`source-reference-frame tool-${tool}`} onPointerDown={chooseFoot} ref={sourceFrameRef}>
-          {sourceUrl === null ? <div className="viewport-empty">载入源锚定帧…</div> : <img alt="源透视锚定帧" draggable={false} src={sourceUrl} />}
-          {media === null || evidenceMethod !== 'orthogonal_guides' ? null : <PerspectiveGuides disabled={busy || pending || tool !== 'guides'} groups={groups} media={media} onChange={(value) => { setGroups(value); setGuidesTouched(true); onDraftDirtyChange(true) }} />}
-          {horizonStyle === null ? null : <span aria-hidden="true" className="reference-line solved-horizon" style={horizonStyle} />}
-          {footDraft !== null && media !== null ? <Marker point={footDraft} width={media.width} height={media.height} label="脚?" /> : null}
-        </div>
-        <div className="calibration-fields">
-          <div className="segmented-tools" role="group" aria-label="源画面工具"><button aria-pressed={tool === 'guides'} onClick={() => setTool('guides')} type="button">透视线段</button><button aria-pressed={tool === 'foot'} onClick={() => setTool('foot')} type="button">脚底候选</button></div>
-          <label>源锚定帧<input disabled={busy || pending} min="0" max={Math.max(0, (workflow.source_summary?.frame_count ?? 1) - 1)} onChange={(event) => { setAnchorFrame(Number(event.currentTarget.value)); onDraftDirtyChange(true) }} type="number" value={anchorFrame} /></label>
-          {audit?.recommended_anchor_frames.length ? <div className="anchor-suggestions">推荐：{audit.recommended_anchor_frames.map((frame) => <button disabled={busy || pending} key={frame} onClick={() => { setAnchorFrame(frame); onDraftDirtyChange(true) }} type="button">#{frame}</button>)}</div> : null}
-          <fieldset disabled={busy || pending}><legend>证据方法</legend><label><input checked={evidenceMethod === 'orthogonal_guides'} onChange={() => { setEvidenceMethod('orthogonal_guides'); onDraftDirtyChange(true) }} type="radio" />两组正交方向</label><label><input checked={evidenceMethod === 'automatic_prior'} onChange={() => { setEvidenceMethod('automatic_prior'); onDraftDirtyChange(true) }} type="radio" />系统初值（低置信度）</label></fieldset>
-          {evidenceMethod === 'orthogonal_guides' ? <fieldset disabled={busy || pending}><legend>参照关系</legend><label><input checked={relation === 'a_vertical_b_horizontal'} onChange={() => { setRelation('a_vertical_b_horizontal'); onDraftDirtyChange(true) }} type="radio" />A 为竖直，B 为水平</label><label><input checked={relation === 'both_horizontal_plane'} onChange={() => { setRelation('both_horizontal_plane'); onDraftDirtyChange(true) }} type="radio" />A/B 位于水平面</label></fieldset> : null}
-          <div className={`evidence-readout ${preview.valid && evidenceReady ? 'is-valid' : 'is-invalid'}`}><strong>{evidenceMethod === 'orthogonal_guides' ? (!guidesTouched ? '请先贴合画面线段' : preview.valid ? '高置信度几何证据' : '证据待修正') : '低置信度估计值'}</strong><span>垂直 FOV（只读） <b>{Number.isFinite(preview.fov) ? `${preview.fov.toFixed(1)}°` : '—'}</b></span><span>Roll（只读） <b>{previewRoll === null ? '—' : `${previewRoll.toFixed(1)}°`}</b></span><span>重力方向 <b>{preview.gravity === null ? '—' : preview.gravity.map((value) => value.toFixed(2)).join(', ')}</b></span><span>主点假设：画面中心 · 方形像素</span><small>{!guidesTouched && evidenceMethod === 'orthogonal_guides' ? '初始线段只是操作示例；拖动至少一个端点贴合真实边缘后才能确认。' : preview.message}</small></div>
-          <button disabled={busy || pending || media === null || media.frame_index !== anchorFrame || segmentKey === null || !preview.valid || !evidenceReady} onClick={() => void save()} type="button">确认源透视校准</button>
-          {confirmedCalibration === null ? null : <small>已保存：{confirmedCalibration.evidence_confidence === 'low' ? '估计值' : '几何校准'} · r{confirmedCalibration.revision}</small>}
-        </div>
-      </div>
-      <div className="source-secondary-panel"><h4>全片可见性与接触候选</h4>{audit === null ? <p>尚未扫描全片可见性。扫描只提供完整下边界候选，不会自动断言该处就是脚。</p> : (
-        <><div className="audit-summary">
-          <span>完整候选 {audit.fully_visible_ranges.length} 段</span>
-          <span>底边裁切 {audit.bottom_cropped_ranges.length} 段</span>
-          <span>不确定 {audit.uncertain_ranges.length} 段</span>
-        </div><div className="audit-review" aria-label="可见性时间段代表帧复核">
-          {([
-            ['完整候选', audit.fully_visible_ranges],
-            ['底边裁切', audit.bottom_cropped_ranges],
-            ['不确定', audit.uncertain_ranges],
-          ] as const).map(([label, ranges]) => ranges.length === 0 ? null : <AuditReviewGroup backend={backend} busy={busy || pending} key={label} label={label} onError={onError} onSelect={(frame) => { setAnchorFrame(frame); onDraftDirtyChange(true) }} ranges={ranges} selectedFrame={anchorFrame} />)}
-        </div></>
-      )}<div className="secondary-actions"><button disabled={busy || pending || draftDirty || footDraft === null || workflow.source_perspective_calibration?.anchor_frame_index !== anchorFrame} onClick={() => void confirmFoot()} type="button">确认脚底候选</button><span>{confirmedFoot === null ? '脚底完全不可见时可跳过；纯透视模式仍可继续。' : `已确认脚底 (${confirmedFoot.x}, ${confirmedFoot.y})`}</span></div></div>
-      <div hidden data-alpha-url={alphaUrl ?? ''} data-confirmed-foot={confirmedFoot === null ? '' : `${confirmedFoot.x},${confirmedFoot.y}`} id="source-calibration-authority" />
-    </section>
-  )
-}
-
-function ExplorationPanel({ active, backend, busy, project, onError, onProjectChange, onRefresh, mutationPending: pending, beginMutation, endMutation }: MutationWorkspaceProps & { active: boolean }) {
+  onRefresh,
+  panel,
+}: CameraWorkspaceProps) {
+  void panel
   const [pose, setPose] = useState(() => matrixPose(project.workflow.exploration_camera))
-  const [liveUrl, replaceLiveUrl] = useBlobUrl()
   const [frame, setFrame] = useState<PreviewFrameDto | null>(null)
-  const [frameUrl, replaceFrameUrl] = useBlobUrl()
-  const [frameFingerprint, setFrameFingerprint] = useState<string | null>(null)
-  const [points, setPoints] = useState<ImagePoint[]>([])
-  const [candidate, setCandidate] = useState<ImagePoint | null>(null)
-  const [flipNormal, setFlipNormal] = useState(false)
-  const [orbitP0, setOrbitP0] = useState(false)
+  const [frameUrl, setFrameUrl] = useState<string | null>(null)
+  const [hints, setHints] = useState<ImagePoint[]>([])
+  const [pending, setPending] = useState(false)
+  const [scaleText, setScaleText] = useState(String(project.workflow.gs_scale))
+  const [azimuthText, setAzimuthText] = useState(String(project.workflow.scene_azimuth))
   const viewportRef = useRef<HTMLDivElement>(null)
   const generation = useRef(project.workflow.preview?.generation ?? 0)
-  const liveRequest = useRef(0)
-  const dragging = useRef<{ x: number; y: number } | null>(null)
-  const repeatTimer = useRef<number | null>(null)
-  const fingerprint = poseFingerprint(pose)
-  const frozen = frame !== null && frameFingerprint === fingerprint
-  const confirmed = frozen
-    && project.workflow.confirmed_camera_revision === frame.camera_revision
-    && project.workflow.confirmed_preview_artifact_id === frame.artifact_id
+  const frameUrlRef = useRef<string | null>(null)
+  const targetGround = project.workflow.target_ground
+  const candidateMatchesFrame = frame !== null
+    && targetGround !== null
+    && targetGround.preview_artifact_id === frame.artifact_id
+    && targetGround.camera_revision === frame.camera_revision
+    && targetGround.pick_buffer_revision === frame.pick_buffer_revision
 
-  useEffect(() => {
-    if (!active || busy) return
-    const controller = new AbortController()
-    const timeout = setTimeout(() => {
-      const requestId = ++liveRequest.current
-      void backend.renderLivePreview({ expected_project_id: project.project_id, request_id: requestId, width: 960, height: 540, camera: cameraInput(pose) }, controller.signal)
-        .then((blob) => { if (requestId === liveRequest.current) replaceLiveUrl(blob) })
-        .catch((error) => { if (!controller.signal.aborted && requestId === liveRequest.current) onError(error) })
-    }, 80)
-    return () => { clearTimeout(timeout); controller.abort() }
-  }, [active, backend, busy, fingerprint])
+  const replaceFrameUrl = (next: string | null): void => {
+    if (frameUrlRef.current !== null) URL.revokeObjectURL(frameUrlRef.current)
+    frameUrlRef.current = next
+    setFrameUrl(next)
+  }
+  useEffect(() => () => replaceFrameUrl(null), [])
 
-  useEffect(() => { setCandidate(null); setPoints([]); setFlipNormal(false) }, [fingerprint])
-
-  const moveLocal = (right: number, down: number, forward: number): void => {
-    setPose((current) => {
-      const matrix = poseMatrix(current)
-      return {
-        ...current,
-        x: current.x + matrix[0][0] * right + matrix[0][1] * down + matrix[0][2] * forward,
-        y: current.y + matrix[1][0] * right + matrix[1][1] * down + matrix[1][2] * forward,
-        z: current.z + matrix[2][0] * right + matrix[2][1] * down + matrix[2][2] * forward,
-      }
-    })
+  const updatePose = (key: keyof EulerPose, value: number): void => {
+    setPose((current) => ({ ...current, [key]: value }))
+    setFrame(null)
+    replaceFrameUrl(null)
+    setHints([])
   }
 
-  useEffect(() => {
-    if (!active) return
-    const viewport = viewportRef.current
-    if (viewport === null) return
-    const onWheel = (event: WheelEvent): void => {
-      event.preventDefault()
-      event.stopPropagation()
-      if (!busy && !confirmed) moveLocal(0, 0, event.deltaY > 0 ? -0.25 : 0.25)
-    }
-    viewport.addEventListener('wheel', onWheel, { passive: false })
-    return () => viewport.removeEventListener('wheel', onWheel)
-  })
-
-  const stopMove = (): void => {
-    if (repeatTimer.current !== null) window.clearTimeout(repeatTimer.current)
-    repeatTimer.current = null
-  }
-  const startMove = (right: number, down: number, forward: number): void => {
-    stopMove(); moveLocal(right, down, forward)
-    repeatTimer.current = window.setTimeout(() => {
-      const repeat = (): void => {
-        moveLocal(right, down, forward)
-        repeatTimer.current = window.setTimeout(repeat, 70)
-      }
-      repeat()
-    }, 280)
-  }
-  useEffect(() => {
-    window.addEventListener('blur', stopMove)
-    return () => { window.removeEventListener('blur', stopMove); stopMove() }
-  }, [])
-
-  const orbitGround = (deltaX: number, deltaY: number): void => {
-    const ground = project.workflow.local_ground_anchor
-    if (ground === null) return
-    setPose((current) => {
-      const pivot = ground.p0_world
-      const offset: Vector3 = [current.x - pivot[0], current.y - pivot[1], current.z - pivot[2]]
-      const yawed = rotate3(offset, ground.plane_normal, -deltaX * Math.PI / 900)
-      const matrix = poseMatrix(current)
-      const pitched = rotate3(yawed, [matrix[0][0], matrix[1][0], matrix[2][0]], -deltaY * Math.PI / 900)
-      const x = pivot[0] + pitched[0]; const y = pivot[1] + pitched[1]; const z = pivot[2] + pitched[2]
-      const dx = pivot[0] - x; const dy = pivot[1] - y; const dz = pivot[2] - z
-      const distance = Math.hypot(dx, dy, dz)
-      return {
-        ...current, x, y, z,
-        yaw: Math.atan2(dx, dz) * 180 / Math.PI,
-        pitch: Math.asin(Math.max(-1, Math.min(1, -dy / distance))) * 180 / Math.PI,
-      }
-    })
-  }
-
-  const freeze = async (): Promise<void> => {
-    if (!beginMutation()) return
+  const renderSelectionView = async (): Promise<void> => {
+    if (pending || busy) return
+    setPending(true)
     try {
       generation.current += 1
-      const result = await backend.renderPreview({ expected_project_id: project.project_id, generation: generation.current, width: 960, height: 540, camera: cameraInput(pose) })
-      const blob = await backend.fetchPreviewArtifact(result.artifact_id)
-      setFrame(result); setFrameFingerprint(fingerprint); replaceFrameUrl(blob)
+      const rendered = await backend.renderPreview({
+        expected_project_id: project.project_id,
+        generation: generation.current,
+        width: 960,
+        height: 540,
+        camera: cameraInput(pose),
+      })
+      const blob = await backend.fetchPreviewArtifact(rendered.artifact_id)
+      replaceFrameUrl(URL.createObjectURL(blob))
+      setFrame(rendered)
+      setHints([])
       onProjectChange(await onRefresh())
-    } catch (error) { onError(error) } finally { endMutation() }
+    } catch (error) {
+      onError(error)
+    } finally {
+      setPending(false)
+    }
   }
 
-  const confirmFreeze = async (): Promise<void> => {
-    if (frame === null || !beginMutation()) return
-    try { onProjectChange(await backend.confirmCamera(project.project_id, frame.camera_revision)) } catch (error) { onError(error) } finally { endMutation() }
-  }
-
-  const choosePoint = (event: ReactPointerEvent<HTMLDivElement>): void => {
-    if (!confirmed || frame === null || viewportRef.current === null || points.length >= 3) return
+  const addHint = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (frame === null || viewportRef.current === null || hints.length >= 3 || pending || busy) return
     const point = toImagePoint(event, viewportRef.current.getBoundingClientRect(), frame)
-    if (point !== null) setCandidate(point)
+    if (point === null || hints.some((item) => item.x === point.x && item.y === point.y)) return
+    setHints((current) => [...current, point])
   }
 
-  const confirmCandidate = (): void => {
-    if (candidate === null) return
-    setPoints((current) => [...current, candidate]); setCandidate(null)
-  }
-
-  const saveGround = async (): Promise<void> => {
-    if (frame === null || points.length !== 3 || !beginMutation()) return
+  const fitGround = async (): Promise<void> => {
+    if (frame === null || hints.length !== 3 || pending || busy) return
+    setPending(true)
     try {
-      onProjectChange(await backend.calibrateLocalGround({
+      const [p0, p1, p2] = hints
+      if (p0 === undefined || p1 === undefined || p2 === undefined) return
+      onProjectChange(await backend.fitTargetGround({
         expected_project_id: project.project_id,
         preview_artifact_id: frame.artifact_id,
         camera_revision: frame.camera_revision,
         pick_buffer_revision: frame.pick_buffer_revision,
-        points: points.map((point) => [point.x, point.y]) as [[number, number], [number, number], [number, number]],
-        flip_normal: flipNormal,
+        hints: [[p0.x, p0.y], [p1.x, p1.y], [p2.x, p2.y]],
       }))
-    } catch (error) { onError(error) } finally { endMutation() }
+    } catch (error) {
+      onError(error)
+    } finally {
+      setPending(false)
+    }
   }
 
-  const updateNumber = (key: keyof EulerPose, value: number): void => {
-    if (Number.isFinite(value)) setPose((current) => ({ ...current, [key]: value }))
+  const confirmGround = async (): Promise<void> => {
+    if (targetGround === null || targetGround.confirmed || pending || busy) return
+    setPending(true)
+    try {
+      onProjectChange(await backend.confirmTargetGround(project.project_id, targetGround.revision))
+    } catch (error) {
+      onError(error)
+    } finally {
+      setPending(false)
+    }
   }
-  const focusGround = (): void => {
-    const ground = project.workflow.local_ground_anchor
-    if (ground === null) return
-    setPose((current) => {
-      const dx = ground.p0_world[0] - current.x
-      const dy = ground.p0_world[1] - current.y
-      const dz = ground.p0_world[2] - current.z
-      const distance = Math.hypot(dx, dy, dz)
-      if (distance <= 1e-9) return current
-      return {
-        ...current,
-        yaw: Math.atan2(dx, dz) * 180 / Math.PI,
-        pitch: Math.asin(Math.max(-1, Math.min(1, -dy / distance))) * 180 / Math.PI,
-      }
-    })
+
+  const saveAlignment = async (): Promise<void> => {
+    const gsScale = Number(scaleText)
+    const sceneAzimuth = Number(azimuthText)
+    if (!Number.isFinite(gsScale) || gsScale < 0.001 || gsScale > 1000
+      || !Number.isFinite(sceneAzimuth) || sceneAzimuth < -180 || sceneAzimuth >= 180) return
+    setPending(true)
+    try {
+      onProjectChange(await backend.updateProject({
+        expected_project_id: project.project_id,
+        gs_scale: gsScale,
+        scene_azimuth: sceneAzimuth,
+      }))
+    } catch (error) {
+      onError(error)
+    } finally {
+      setPending(false)
+    }
   }
-  const planePoints = points.length === 3
-    ? points as [ImagePoint, ImagePoint, ImagePoint]
-    : null
-  const confirmedGround = project.workflow.local_ground_anchor
-  const normalArrow = frame === null || confirmedGround === null
-    || confirmedGround.preview_artifact_id !== frame.artifact_id
-    ? null
-    : (() => {
-        const p0 = confirmedGround.p0_world
-        const scale = Math.max(
-          Math.hypot(confirmedGround.p1_world[0] - p0[0], confirmedGround.p1_world[1] - p0[1], confirmedGround.p1_world[2] - p0[2]),
-          Math.hypot(confirmedGround.p2_world[0] - p0[0], confirmedGround.p2_world[1] - p0[1], confirmedGround.p2_world[2] - p0[2]),
-        ) * 0.6
-        const endpoint: Vector3 = [
-          p0[0] + confirmedGround.plane_normal[0] * scale,
-          p0[1] + confirmedGround.plane_normal[1] * scale,
-          p0[2] + confirmedGround.plane_normal[2] * scale,
-        ]
-        const start = projectWorldPoint(p0, confirmedGround.frozen_camera_to_world, pose.fov, frame.width, frame.height)
-        const end = projectWorldPoint(endpoint, confirmedGround.frozen_camera_to_world, pose.fov, frame.width, frame.height)
-        return start === null || end === null ? null : { start, end }
-      })()
+
+  const shownHints = candidateMatchesFrame && targetGround !== null
+    ? targetGround.hint_pixels.map(([x, y]) => ({ x, y }))
+    : hints
 
   return (
-    <section aria-busy={busy} className="calibration-card" aria-labelledby="exploration-title">
-      <div className="calibration-card-heading"><div><span className="step-kicker">B · GS 场景</span><h3 id="exploration-title">6DoF 探索与三点局部地面</h3></div><span className={project.workflow.local_ground_anchor === null ? 'chip' : 'chip chip-ok'}>{project.workflow.local_ground_anchor === null ? '地面未标定' : `地面 r${project.workflow.local_ground_anchor.revision}`}</span></div>
+    <section aria-busy={busy || pending} className="calibration-card" aria-labelledby="target-ground-title">
+      <div className="calibration-card-heading">
+        <div><span className="step-kicker">GS · 自动地面对齐</span><h3 id="target-ground-title">探索场景并给出三个地面提示</h3></div>
+        <span className={targetGround?.confirmed === true ? 'chip chip-ok' : 'chip'}>
+          {targetGround === null ? '尚无候选' : targetGround.confirmed ? `已确认 r${targetGround.revision}` : `候选 r${targetGround.revision}`}
+        </span>
+      </div>
+      <p>三个点击只是近似提示。系统会在各自邻域中检查 Opacity、深度连续性和 GS 表面支持，自动拟合真正的地面。</p>
       <div className="viewport-layout">
         <div
-          aria-label="Gaussian 6DoF 探索视口"
+          aria-label="Gaussian 地面提示视口"
           className="viewport-frame preview-surface exploration-viewport"
-          onPointerDown={(event) => { if (!busy) { dragging.current = { x: event.clientX, y: event.clientY }; choosePoint(event) } }}
-          onPointerMove={(event) => {
-            if (busy || dragging.current === null || confirmed) return
-            const dx = event.clientX - dragging.current.x; const dy = event.clientY - dragging.current.y
-            dragging.current = { x: event.clientX, y: event.clientY }
-            if (orbitP0) orbitGround(dx, dy)
-            else setPose((current) => ({ ...current, yaw: current.yaw + dx * 0.2, pitch: Math.max(-89, Math.min(89, current.pitch - dy * 0.2)) }))
-          }}
-          onPointerUp={() => { dragging.current = null }}
+          onPointerDown={addHint}
           ref={viewportRef}
         >
-          {(frozen ? frameUrl : liveUrl) === null ? <div className="viewport-empty">准备 Gaussian 预览…</div> : <img alt={frozen ? '冻结的 Gaussian 三点标定帧' : 'Gaussian 实时探索预览'} draggable={false} src={(frozen ? frameUrl : liveUrl) ?? ''} />}
-          {frame !== null ? points.map((point, index) => <Marker key={`${point.x}-${point.y}`} point={point} width={frame.width} height={frame.height} label={`P${index}`} />) : null}
-          {frame !== null && candidate !== null ? <Marker point={candidate} width={frame.width} height={frame.height} label={`P${points.length}?`} /> : null}
-          {frame !== null && planePoints !== null ? <svg aria-label="局部地面三角形与法线方向" className="ground-plane-overlay" preserveAspectRatio="none" viewBox={`0 0 ${frame.width} ${frame.height}`}><defs><marker id="ground-normal-arrow" markerHeight="7" markerWidth="7" orient="auto" refX="5" refY="3.5"><path d="M0,0 L7,3.5 L0,7 Z" /></marker></defs><polygon points={planePoints.map((point) => `${point.x + 0.5},${point.y + 0.5}`).join(' ')} />{normalArrow === null ? null : <line className="ground-normal-arrow" markerEnd="url(#ground-normal-arrow)" x1={normalArrow.start.x} x2={normalArrow.end.x} y1={normalArrow.start.y} y2={normalArrow.end.y} />}<text x={(planePoints[0].x + planePoints[1].x + planePoints[2].x) / 3} y={(planePoints[0].y + planePoints[1].y + planePoints[2].y) / 3}>{flipNormal ? 'N⊗' : 'N⊙'}</text></svg> : null}
-          {confirmed ? null : <div aria-label="探索移动方向键" className="game-movement-pad">
-            {([
-              ['前', 0, 0, .25, 'move-forward'], ['左', -.25, 0, 0, 'move-left'], ['后', 0, 0, -.25, 'move-back'], ['右', .25, 0, 0, 'move-right'], ['上', 0, -.25, 0, 'move-up'], ['下', 0, .25, 0, 'move-down'],
-            ] as const).map(([label, right, down, forward, className]) => <button className={className} disabled={busy} key={label} onClick={(event) => event.preventDefault()} onPointerCancel={stopMove} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); startMove(right, down, forward) }} onPointerUp={stopMove} type="button">{label}</button>)}
-          </div>}
+          {frameUrl === null ? <div className="viewport-empty">调整探索相机后，生成可点选视图</div> : <img alt="Gaussian 地面选择视图" draggable={false} src={frameUrl} />}
+          {frame === null ? null : shownHints.map((point, index) => <Marker frame={frame} key={`${point.x}:${point.y}:${index}`} label={`H${index}`} point={point} />)}
+          {frame !== null && shownHints.length === 3 ? <svg aria-label="自动地面候选范围" className="ground-plane-overlay" preserveAspectRatio="none" viewBox={`0 0 ${frame.width} ${frame.height}`}><polygon points={shownHints.map((point) => `${point.x + 0.5},${point.y + 0.5}`).join(' ')} /></svg> : null}
         </div>
         <aside className="viewport-controls">
           <div className="camera-readout sixdof-readout">
-            {(['x', 'y', 'z', 'yaw', 'pitch', 'roll'] as const).map((key) => <label key={key}>{key.toUpperCase()}<NumericField disabled={busy || confirmed} label={`探索相机 ${key}`} onCommit={(value) => updateNumber(key, value)} value={pose[key]} /></label>)}
+            {(['x', 'y', 'z', 'yaw', 'pitch', 'roll'] as const).map((key) => <NumberField disabled={busy || pending} key={key} label={`探索相机 ${key.toUpperCase()}`} onChange={(value) => updatePose(key, value)} value={pose[key]} />)}
           </div>
-          <label>探索 FOV<div className="range-number"><input disabled={busy || confirmed} min="20" max="100" onChange={(event) => updateNumber('fov', Number(event.currentTarget.value))} type="range" value={pose.fov} /><NumericField disabled={busy || confirmed} label="探索相机 FOV 数值" onCommit={(value) => updateNumber('fov', Math.max(20, Math.min(100, value)))} value={pose.fov} /></div></label>
-          <button disabled={busy || confirmed || project.workflow.local_ground_anchor === null} onClick={focusGround} type="button">聚焦局部地面 P0</button>
-          <label><input checked={orbitP0} disabled={busy || confirmed || project.workflow.local_ground_anchor === null} onChange={(event) => setOrbitP0(event.currentTarget.checked)} type="checkbox" />拖拽时围绕 P0 Orbit</label>
-          <button disabled={busy || confirmed} onClick={() => setPose(DEFAULT_POSE)} type="button">重置探索相机</button>
-          <button disabled={busy || pending || confirmed} onClick={() => void freeze()} type="button">冻结当前探索视角</button>
-          <button disabled={busy || pending || !frozen || confirmed} onClick={() => void confirmFreeze()} type="button">确认冻结视角</button>
+          <NumberField disabled={busy || pending} label="探索相机 FOV" max={120} min={10} onChange={(value) => updatePose('fov', value)} value={pose.fov} />
+          <button disabled={busy || pending} onClick={() => { setPose(DEFAULT_POSE); setFrame(null); replaceFrameUrl(null); setHints([]) }} type="button">重置探索相机</button>
+          <button disabled={busy || pending} onClick={() => void renderSelectionView()} type="button">更新地面选择视图</button>
         </aside>
       </div>
-      <div className="camera-secondary-panel"><fieldset disabled={busy || pending}><legend>同一冻结帧的三点局部地面</legend><p>{points.length}/3 个点已确认；移动相机会清理未确认候选。</p><div className="secondary-actions"><button disabled={!confirmed || candidate === null} onClick={confirmCandidate} type="button">确认 P{points.length} 候选</button><label><input checked={flipNormal} disabled={points.length !== 3} onChange={(event) => setFlipNormal(event.currentTarget.checked)} type="checkbox" />翻转法线（N⊙ / N⊗）</label><button disabled={points.length !== 3} onClick={() => void saveGround()} type="button">确认三点局部地面</button></div></fieldset></div>
+      <div className="camera-secondary-panel">
+        <p>{shownHints.length}/3 个地面提示。重新生成视图会清除未拟合提示。</p>
+        <div className="secondary-actions">
+          <button disabled={busy || pending || hints.length === 0} onClick={() => setHints([])} type="button">重选三点</button>
+          <button disabled={busy || pending || frame === null || hints.length !== 3} onClick={() => void fitGround()} type="button">自动寻找真正地面</button>
+          <button disabled={busy || pending || targetGround === null || targetGround.confirmed} onClick={() => void confirmGround()} type="button">确认地面</button>
+        </div>
+        {targetGround === null ? null : <p className="technical-note">置信度 {(targetGround.confidence * 100).toFixed(1)}%，三邻域支持 {targetGround.support_counts.join(' / ')}，RMS {targetGround.rms_residual.toPrecision(3)}。</p>}
+      </div>
+      <div className="camera-secondary-panel">
+        <h4>轨迹映射</h4>
+        <p>P0 对应源锚帧相机在源地面上的垂直投影；这里没有人物位置、脚底接触或独立人物缩放。</p>
+        <div className="secondary-actions">
+          <label>GS 比例<input aria-label="GS 比例" disabled={busy || pending} min="0.001" max="1000" onChange={(event) => setScaleText(event.currentTarget.value)} step="0.01" type="number" value={scaleText} /></label>
+          <label>场景方位角<input aria-label="场景方位角" disabled={busy || pending} min="-180" max="179.999" onChange={(event) => setAzimuthText(event.currentTarget.value)} step="1" type="number" value={azimuthText} /></label>
+          <button disabled={busy || pending || targetGround?.confirmed !== true} onClick={() => void saveAlignment()} type="button">保存轨迹对齐</button>
+        </div>
+      </div>
     </section>
-  )
-}
-
-function loadImage(url: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const image = new Image(); image.onload = () => resolve(image); image.onerror = reject; image.src = url
-  })
-}
-
-function fittedPreviewSize(width: number, height: number): { width: number; height: number } {
-  const scale = Math.min(1, 960 / width, 540 / height)
-  return {
-    width: Math.max(1, Math.round(width * scale)),
-    height: Math.max(1, Math.round(height * scale)),
-  }
-}
-
-function SynthesisPanel({ active, backend, busy, project, onError, onProjectChange, calibrationDraftDirty, confirmedFoot, mutationPending: pending, beginMutation, endMutation }: SynthesisPanelProps) {
-  const workflow = project.workflow
-  const calibration = workflow.source_perspective_calibration
-  const ground = workflow.local_ground_anchor
-  const existing = workflow.synthesis_placement
-  const [mode, setMode] = useState<'contact' | 'perspective'>(existing?.mode ?? 'perspective')
-  const [azimuth, setAzimuth] = useState(existing?.scene_azimuth ?? 0)
-  const [scale, setScale] = useState(existing?.subject_to_scene_scale ?? 1)
-  const [offsetX, setOffsetX] = useState(existing?.composition_offset_local[0] ?? 0)
-  const [offsetY, setOffsetY] = useState(existing?.composition_offset_local[1] ?? 0)
-  const [backgroundUrl, replaceBackgroundUrl] = useBlobUrl()
-  const [sourceUrl, replaceSourceUrl] = useBlobUrl()
-  const [alphaUrl, replaceAlphaUrl] = useBlobUrl()
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const compositionDrag = useRef<{ x: number; y: number; offsetX: number; offsetY: number } | null>(null)
-  const requestId = useRef(10_000)
-  const previewSize = calibration === null
-    ? { width: 960, height: 540 }
-    : fittedPreviewSize(calibration.image_width, calibration.image_height)
-
-  useEffect(() => {
-    if (confirmedFoot === null && mode === 'contact') setMode('perspective')
-  }, [confirmedFoot, mode])
-
-  useEffect(() => {
-    replaceSourceUrl(null)
-    replaceAlphaUrl(null)
-    if (!active || calibration === null) return
-    let cancelled = false
-    void Promise.all([
-      backend.getSubjectMedia('proxy', calibration.anchor_frame_index),
-      backend.getSubjectMedia('alpha', calibration.anchor_frame_index),
-    ]).then(async ([proxy, alpha]) => Promise.all([
-      backend.fetchSubjectMediaArtifact('proxy', proxy.artifact_id, undefined, calibration.anchor_frame_index),
-      backend.fetchSubjectMediaArtifact('alpha', alpha.artifact_id, undefined, calibration.anchor_frame_index),
-    ])).then(([proxy, alpha]) => { if (!cancelled) { replaceSourceUrl(proxy); replaceAlphaUrl(alpha) } }).catch((error) => { if (!cancelled) onError(error) })
-    return () => { cancelled = true }
-  }, [active, backend, calibration?.revision, project.project_id, project.stages.segment?.cache_key])
-
-  useEffect(() => {
-    requestId.current += 1
-    replaceBackgroundUrl(null)
-    if (!active || busy || existing === null) return
-    const controller = new AbortController()
-    const current = ++requestId.current
-    void backend.renderLivePreview({ expected_project_id: project.project_id, request_id: current, width: previewSize.width, height: previewSize.height, camera: { camera_to_world: existing.anchor_camera_to_world, fov_y_degrees: calibration?.vertical_fov ?? 50 } }, controller.signal)
-      .then((blob) => { if (current === requestId.current) replaceBackgroundUrl(blob) })
-      .catch((error) => { if (!controller.signal.aborted && current === requestId.current) onError(error) })
-    return () => controller.abort()
-  }, [active, backend, busy, existing?.solver_cache_key, previewSize.width, previewSize.height, project.project_id, project.scene_ply_asset_id, project.scene_ply])
-
-  useEffect(() => {
-    if (!active) return
-    const initialCanvas = canvasRef.current
-    if (initialCanvas !== null) initialCanvas.getContext('2d')?.clearRect(0, 0, initialCanvas.width, initialCanvas.height)
-    if (backgroundUrl === null || sourceUrl === null || alphaUrl === null || canvasRef.current === null) return
-    let cancelled = false
-    void Promise.all([loadImage(backgroundUrl), loadImage(sourceUrl), loadImage(alphaUrl)]).then(([background, source, alpha]) => {
-      if (cancelled || canvasRef.current === null) return
-      const canvas = canvasRef.current; canvas.width = previewSize.width; canvas.height = previewSize.height
-      const context = canvas.getContext('2d'); if (context === null) return
-      context.drawImage(background, 0, 0, canvas.width, canvas.height)
-      const foreground = document.createElement('canvas'); foreground.width = canvas.width; foreground.height = canvas.height
-      const fg = foreground.getContext('2d'); if (fg === null) return
-      fg.drawImage(source, 0, 0, canvas.width, canvas.height)
-      const pixels = fg.getImageData(0, 0, canvas.width, canvas.height)
-      const maskCanvas = document.createElement('canvas'); maskCanvas.width = canvas.width; maskCanvas.height = canvas.height
-      const maskContext = maskCanvas.getContext('2d'); if (maskContext === null) return
-      maskContext.drawImage(alpha, 0, 0, canvas.width, canvas.height)
-      const mask = maskContext.getImageData(0, 0, canvas.width, canvas.height)
-      for (let index = 0; index < pixels.data.length; index += 4) pixels.data[index + 3] = mask.data[index] ?? 0
-      fg.putImageData(pixels, 0, 0); context.drawImage(foreground, 0, 0)
-    }).catch((error) => { if (!cancelled) onError(error) })
-    return () => { cancelled = true }
-  }, [active, backgroundUrl, sourceUrl, alphaUrl, previewSize.width, previewSize.height])
-
-  const solve = async (): Promise<void> => {
-    if (calibrationDraftDirty || calibration === null || ground === null || (mode === 'contact' && confirmedFoot === null) || !beginMutation()) return
-    try {
-      onProjectChange(await backend.solveSynthesisPlacement({
-        expected_project_id: project.project_id,
-        source_calibration_revision: calibration.revision,
-        ground_anchor_revision: ground.revision,
-        mode,
-        scene_azimuth: normalizedAzimuth,
-        subject_to_scene_scale: scale,
-        composition_offset_local: mode === 'perspective' ? [offsetX, offsetY] : [0, 0],
-        foot_pixel: mode === 'contact' && confirmedFoot !== null ? [confirmedFoot.x, confirmedFoot.y] : null,
-      }))
-    } catch (error) { onError(error) } finally { endMutation() }
-  }
-
-  const confirm = async (): Promise<void> => {
-    if (calibrationDraftDirty || existing === null || !beginMutation()) return
-    try { onProjectChange(await backend.confirmSynthesisPlacement(project.project_id, existing.revision)) } catch (error) { onError(error) } finally { endMutation() }
-  }
-  const normalizedAzimuth = ((azimuth + 180) % 360 + 360) % 360 - 180
-  const draftMatchesExisting = existing !== null
-    && existing.mode === mode
-    && Math.abs(existing.scene_azimuth - normalizedAzimuth) <= 1e-9
-    && Math.abs(existing.subject_to_scene_scale - scale) <= 1e-9
-    && (
-      mode === 'contact'
-        ? confirmedFoot !== null
-          && existing.source_contact_revision === workflow.subject_contact_constraint?.revision
-        : Math.abs(existing.composition_offset_local[0] - offsetX) <= 1e-9
-          && Math.abs(existing.composition_offset_local[1] - offsetY) <= 1e-9
-    )
-  const derivedPose = existing === null ? null : matrixPose({ camera_to_world: existing.anchor_camera_to_world, fov_y_degrees: calibration?.vertical_fov ?? 60 })
-
-  return (
-    <section aria-busy={busy} className="calibration-card" aria-labelledby="synthesis-title">
-      <div className="calibration-card-heading"><div><span className="step-kicker">C · 合成机位</span><h3 id="synthesis-title">受约束放置与视觉微调</h3></div><span className={workflow.confirmed_synthesis_placement_revision === existing?.revision ? 'chip chip-ok' : 'chip'}>{workflow.confirmed_synthesis_placement_revision === existing?.revision ? `已确认 r${existing?.revision}` : '待确认'}</span></div>
-      {calibration === null || ground === null ? <p>请先完成源透视校准和三点局部地面。</p> : (
-        <>{calibration.evidence_confidence === 'low' ? <p className="honest-state"><strong>源透视使用估计值。</strong> 当前结果适合视觉预览与微调，不代表镜头内参已可靠求解。</p> : null}<div className="synthesis-layout">
-          <div className={`viewport-frame synthesis-preview ${mode === 'perspective' ? 'is-draggable' : ''}`} onPointerDown={(event) => { if (mode === 'perspective' && !busy) { event.currentTarget.setPointerCapture(event.pointerId); compositionDrag.current = { x: event.clientX, y: event.clientY, offsetX, offsetY } } }} onPointerMove={(event) => { const drag = compositionDrag.current; if (drag === null || mode !== 'perspective') return; setOffsetX(drag.offsetX + (event.clientX - drag.x) * .01); setOffsetY(drag.offsetY - (event.clientY - drag.y) * .01) }} onPointerUp={() => { compositionDrag.current = null }} onPointerCancel={() => { compositionDrag.current = null }}>{existing === null ? <div className="viewport-empty">调整参数后生成静态合成预览</div> : <canvas aria-label="源人物与受约束 GS 背景合成预览" ref={canvasRef} />}</div>
-          <aside className="viewport-controls">
-            <fieldset disabled={busy || pending || calibrationDraftDirty}><legend>约束模式</legend><label><input checked={mode === 'perspective'} onChange={() => setMode('perspective')} type="radio" />纯透视（不声明接触）</label><label><input checked={mode === 'contact'} disabled={confirmedFoot === null} onChange={() => setMode('contact')} type="radio" />脚底接触 P0</label></fieldset>
-            <label>场景方位角<input disabled={busy || pending || calibrationDraftDirty} max="179.9" min="-180" onChange={(event) => setAzimuth(Number(event.currentTarget.value))} step="0.1" type="number" value={azimuth} /></label>
-            <label>人物与场景比例<div className="range-number"><input disabled={busy || pending || calibrationDraftDirty} max="4" min="0.25" onChange={(event) => setScale(Number(event.currentTarget.value))} step="0.05" type="range" value={scale} /><input aria-label="人物与场景比例数值" disabled={busy || pending || calibrationDraftDirty} max="4" min="0.25" onChange={(event) => setScale(Number(event.currentTarget.value))} step="0.01" type="number" value={scale} /></div></label>
-            {mode === 'perspective' ? <><label>构图横移<input disabled={busy || pending || calibrationDraftDirty} onChange={(event) => setOffsetX(Number(event.currentTarget.value))} step="0.1" type="number" value={offsetX} /></label><label>构图纵移<input disabled={busy || pending || calibrationDraftDirty} onChange={(event) => setOffsetY(Number(event.currentTarget.value))} step="0.1" type="number" value={offsetY} /></label></> : <div className="confirmed-contact-readout">已确认脚底 <strong>({confirmedFoot?.x}, {confirmedFoot?.y})</strong></div>}
-            <button disabled={busy || pending || calibrationDraftDirty || (mode === 'contact' && confirmedFoot === null)} onClick={() => void solve()} type="button">更新受约束合成预览</button>
-            <button disabled={busy || pending || calibrationDraftDirty || !draftMatchesExisting} onClick={() => void confirm()} type="button">确认合成机位</button>
-            {derivedPose === null ? null : <div className="derived-camera-readout"><span>Yaw <b>{derivedPose.yaw.toFixed(1)}°</b></span><span>Pitch <b>{derivedPose.pitch.toFixed(1)}°</b></span><span>Roll <b>{derivedPose.roll.toFixed(1)}°</b></span><span>FOV <b>{derivedPose.fov.toFixed(1)}°</b></span></div>}
-            <p className="technical-note">相机旋转和 FOV 均为派生只读值。纯透视模式可直接拖动画面调整构图；接触模式固定脚底到 P0。</p>
-          </aside>
-        </div></>
-      )}
-    </section>
-  )
-}
-
-export function ConstrainedCameraWorkspace(props: CameraWorkspaceProps) {
-  const [calibrationDraftDirty, setCalibrationDraftDirty] = useState(false)
-  const [mutationPending, setMutationPending] = useState(false)
-  const mutationLock = useRef(false)
-  const beginMutation = (): boolean => {
-    if (mutationLock.current) return false
-    mutationLock.current = true
-    setMutationPending(true)
-    return true
-  }
-  const endMutation = (): void => {
-    mutationLock.current = false
-    setMutationPending(false)
-  }
-  const mutationProps = { mutationPending, beginMutation, endMutation }
-  const foot = props.project.workflow.subject_contact_constraint?.foot_pixel
-  const confirmedFoot = foot === undefined ? null : { x: foot[0], y: foot[1] }
-  return (
-    <div className="constrained-camera-workspace">
-      <div hidden={props.panel !== 'source'}><SourceCalibrationPanel {...props} {...mutationProps} active={props.panel === 'source'} confirmedFoot={confirmedFoot} draftDirty={calibrationDraftDirty} onDraftDirtyChange={setCalibrationDraftDirty} /></div>
-      <div hidden={props.panel !== 'scene'}><ExplorationPanel {...props} {...mutationProps} active={props.panel === 'scene'} /></div>
-      <div hidden={props.panel !== 'synthesis'}><SynthesisPanel {...props} {...mutationProps} active={props.panel === 'synthesis'} calibrationDraftDirty={calibrationDraftDirty} confirmedFoot={confirmedFoot} /></div>
-    </div>
   )
 }

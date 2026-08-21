@@ -150,14 +150,17 @@ def test_video_summary_duration_must_be_finite() -> None:
         PickBuffer(
             rgb=np.zeros((9, 16, 4), dtype=np.uint8),
             expected_depth=np.ones((9, 16), dtype=np.float32),
+            opacity=np.ones((9, 16), dtype=np.float32),
         ),
         PickBuffer(
             rgb=np.zeros((9, 16, 3), dtype=np.uint8),
             expected_depth=np.ones((8, 16), dtype=np.float32),
+            opacity=np.ones((9, 16), dtype=np.float32),
         ),
         PickBuffer(
             rgb=np.zeros((9, 16, 3), dtype=np.uint8),
             expected_depth=np.full((9, 16), np.nan, dtype=np.float32),
+            opacity=np.ones((9, 16), dtype=np.float32),
         ),
     ],
 )
@@ -336,6 +339,7 @@ def test_preview_artifacts_are_bounded_while_preserving_authoritative_file(
     buffer = PickBuffer(
         rgb=np.zeros((2, 2, 3), dtype=np.uint8),
         expected_depth=np.ones((2, 2), dtype=np.float32),
+        opacity=np.ones((2, 2), dtype=np.float32),
     )
 
     first, size, digest = store.publish(buffer)

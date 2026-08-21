@@ -557,15 +557,6 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 }
 
 .source-reference-frame img, .synthesis-preview canvas { display: block; height: 100%; object-fit: contain; width: 100%; }
-.source-reference-frame.tool-foot { cursor: crosshair; }
-.perspective-guides { inset: 0; position: absolute; touch-action: none; z-index: 4; }
-.guide-segment { height: 3px; position: absolute; transform-origin: left center; }
-.guide-a { background: #b7f63d; box-shadow: 0 0 10px rgba(183,246,61,.55); }
-.guide-b { background: #55d6c2; box-shadow: 0 0 10px rgba(85,214,194,.55); }
-.guide-handle { background: currentColor; border: 2px solid #08100a; border-radius: 50%; color: inherit; height: 18px; min-height: 18px; padding: 0; position: absolute; top: 50%; transform: translate(-50%, -50%); width: 18px; }
-.guide-a .guide-handle { color: #b7f63d; }
-.guide-b .guide-handle { color: #55d6c2; }
-.guide-handle:focus-visible { outline-offset: 3px; }
 .segmented-tools { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .segmented-tools button { background: transparent; border-color: #364149; color: #aab6b0; }
 .segmented-tools button[aria-pressed="true"] { background: var(--acid-soft); border-color: var(--acid); color: var(--acid); }
@@ -584,8 +575,6 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 .source-secondary-panel p { color: var(--muted); font-size: .72rem; }
 .reference-line { background: var(--acid); box-shadow: 0 0 0 1px #0008, 0 0 10px color-mix(in srgb, var(--acid) 70%, transparent); display: block; height: 2px; pointer-events: none; position: absolute; transform-origin: left center; z-index: 3; }
 .vertical-line { height: 100%; width: 2px; transform-origin: bottom center; }
-.perspective-ground-grid { inset: 0; pointer-events: none; position: absolute; width: 100%; height: 100%; z-index: 2; }
-.perspective-ground-grid polyline { fill: none; stroke: rgba(183,246,61,.34); stroke-width: 1; vector-effect: non-scaling-stroke; }
 .calibration-fields { display: grid; gap: 10px; }
 .calibration-fields label, .sixdof-readout label { display: grid; gap: 5px; }
 .camera-workbench-page .calibration-fields { color: #a5b1ab; font-size: .68rem; }

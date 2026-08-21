@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 from gs_video.domain.models import ArtifactCategory
 
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 8
 
 
 def _canonical_project_id(value: object) -> str:
@@ -169,6 +169,51 @@ def migrate_project_dict(raw: dict[str, object]) -> dict[str, object]:
                     stage["input_generation"] = int(stage.get("input_generation", 0)) + 1
             data["schema_version"] = 6
             version = 6
+        elif version == 6:
+            workflow_value = data.setdefault("workflow", {})
+            if not isinstance(workflow_value, dict):
+                raise ValueError("项目工作流状态必须是对象")
+            for removed_key in (
+                "confirmed_camera_revision",
+                "confirmed_preview_artifact_id",
+                "foot_point",
+                "subject_visibility_audit",
+                "source_calibration_generation",
+                "source_contact_generation",
+                "local_ground_generation",
+                "synthesis_placement_generation",
+                "source_perspective_calibration",
+                "local_ground_anchor",
+                "subject_contact_constraint",
+                "synthesis_placement",
+                "confirmed_synthesis_placement_revision",
+                "motion_scale",
+            ):
+                workflow_value.pop(removed_key, None)
+            workflow_value.setdefault("target_ground_generation", 0)
+            workflow_value.setdefault("target_ground", None)
+            workflow_value.setdefault("gs_scale", 1.0)
+            workflow_value.setdefault("scene_azimuth", 0.0)
+            stages = data.setdefault("stages", {})
+            if not isinstance(stages, dict):
+                raise ValueError("项目阶段状态必须是对象")
+            for stage_name in ("map_trajectory", "render", "composite", "export"):
+                stage = stages.get(stage_name)
+                if isinstance(stage, dict):
+                    stage["status"] = "stale"
+                    stage["cache_key"] = None
+                    stage["error_code"] = None
+                    stage["run_id"] = None
+                    stage["input_generation"] = int(stage.get("input_generation", 0)) + 1
+            data["schema_version"] = 7
+            version = 7
+        elif version == 7:
+            workflow_value = data.setdefault("workflow", {})
+            if not isinstance(workflow_value, dict):
+                raise ValueError("项目工作流状态必须是对象")
+            workflow_value.setdefault("output_crop", None)
+            data["schema_version"] = 8
+            version = 8
         else:
             raise ValueError(f"不支持的项目版本: {version}")
 

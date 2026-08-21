@@ -63,6 +63,10 @@
       "target": "renderer/.venv"
     },
     {
+      "type": "create_venv",
+      "target": "camera/.venv"
+    },
+    {
       "type": "install_packages",
       "target": "segmentation/.venv",
       "packages": ["torch==2.6.0+cu126"],
@@ -76,8 +80,20 @@
     },
     {
       "type": "install_packages",
+      "target": "camera/.venv",
+      "packages": ["torch", "torchvision"],
+      "index_url": "https://download.pytorch.org/whl/cu128"
+    },
+    {
+      "type": "install_packages",
       "target": "renderer/.venv",
       "packages": ["gsplat==1.5.3"],
+      "index_url": "https://pypi.org/simple"
+    },
+    {
+      "type": "install_packages",
+      "target": "camera/.venv",
+      "packages": ["nvidia-vipe==1.2.0"],
       "index_url": "https://pypi.org/simple"
     },
     {
@@ -93,6 +109,10 @@
     {
       "type": "install_editable",
       "target": "renderer/.venv"
+    },
+    {
+      "type": "install_editable",
+      "target": "camera/.venv"
     }
   ]
 }

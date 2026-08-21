@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from gs_video.camera.classify import CameraKind
-from gs_video.camera.opencv_solver import CameraSolution
+from gs_video.camera.solution import CameraSolution
 from gs_video.camera.serialization import (
     MappedTrajectory,
     read_camera_solution,
@@ -49,10 +49,12 @@ def test_camera_solution_json_round_trip_preserves_matrices(tmp_path: Path) -> N
     assert set(json.loads(destination.read_text(encoding="utf-8"))) == {
         "version",
         "intrinsics",
+        "frame_intrinsics",
         "camera_to_world",
         "kind",
         "confidence",
         "diagnostics",
+        "source_ground",
     }
 
 
@@ -82,11 +84,44 @@ def test_mapped_trajectory_json_round_trip_preserves_fov_and_poses(
     }
 
 
+def test_mapped_trajectory_round_trip_preserves_per_frame_intrinsics(
+    tmp_path: Path,
+) -> None:
+    trajectory = MappedTrajectory(
+        fov_y_degrees=60.0,
+        camera_to_world=(np.eye(4), np.eye(4)),
+        frame_intrinsics=(
+            np.array([[800.0, 0.0, 610.0], [0.0, 805.0, 350.0], [0.0, 0.0, 1.0]]),
+            np.array([[820.0, 0.0, 612.0], [0.0, 825.0, 352.0], [0.0, 0.0, 1.0]]),
+        ),
+        source_size=(1280, 720),
+    )
+    destination = tmp_path / "camera" / "mapped-v2.json"
+
+    write_mapped_trajectory(destination, trajectory)
+    restored = read_mapped_trajectory(destination)
+
+    assert restored.source_size == (1280, 720)
+    assert restored.frame_intrinsics is not None
+    for actual, expected in zip(
+        restored.frame_intrinsics, trajectory.frame_intrinsics, strict=True
+    ):
+        np.testing.assert_allclose(actual, expected)
+    assert set(json.loads(destination.read_text(encoding="utf-8"))) == {
+        "version",
+        "fov_y_degrees",
+        "camera_to_world",
+        "frame_intrinsics",
+        "source_width",
+        "source_height",
+    }
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
         lambda payload: payload.__setitem__("unexpected", True),
-        lambda payload: payload.__setitem__("version", 2),
+        lambda payload: payload.__setitem__("version", 3),
         lambda payload: payload["intrinsics"][0].__setitem__(0, float("nan")),
         lambda payload: payload["intrinsics"][0].__setitem__(0, "900.0"),
         lambda payload: payload["intrinsics"][0].__setitem__(0, True),

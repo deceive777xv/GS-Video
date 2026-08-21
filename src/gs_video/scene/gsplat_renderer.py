@@ -556,7 +556,7 @@ class GsplatRenderer:
                     settings,
                     "RGB",
                 )
-                render_array, _alpha_array = self._validate_outputs(
+                render_array, alpha_array = self._validate_outputs(
                     render, alpha, width=width, height=height, channels=3
                 )
                 return np.ascontiguousarray(self._rgb8(render_array))
@@ -592,7 +592,7 @@ class GsplatRenderer:
                 prepared.metrics.release_frame()
                 released = True
                 raster_done = perf_counter()
-                render_array, _alpha_array = self._validate_outputs(
+                render_array, alpha_array = self._validate_outputs(
                     render, alpha, width=width, height=height, channels=3
                 )
                 rgb = np.ascontiguousarray(self._rgb8(render_array))
@@ -629,7 +629,7 @@ class GsplatRenderer:
                     settings,
                     "RGB+ED",
                 )
-                render_array, _alpha_array = self._validate_outputs(
+                render_array, alpha_array = self._validate_outputs(
                     render, alpha, width=width, height=height, channels=4
                 )
                 if np.any(render_array[0, ..., 3] < 0.0):
@@ -639,6 +639,7 @@ class GsplatRenderer:
                     expected_depth=np.ascontiguousarray(
                         render_array[0, ..., 3], dtype=np.float32
                     ),
+                    opacity=np.ascontiguousarray(alpha_array[0, ..., 0], dtype=np.float32),
                 )
             finally:
                 del render, alpha, meta
@@ -661,7 +662,7 @@ class GsplatRenderer:
             render, alpha, meta = self._call(
                 rasterizer, runtime, camera, settings, "RGB+ED"
             )
-            render_array, _alpha_array = self._validate_outputs(
+            render_array, alpha_array = self._validate_outputs(
                 render, alpha, width=width, height=height, channels=4
             )
             if np.any(render_array[0, ..., 3] < 0.0):
@@ -669,6 +670,7 @@ class GsplatRenderer:
             return PickBuffer(
                 rgb=self._rgb8(render_array),
                 expected_depth=np.ascontiguousarray(render_array[0, ..., 3], dtype=np.float32),
+                opacity=np.ascontiguousarray(alpha_array[0, ..., 0], dtype=np.float32),
             )
         finally:
             del render, alpha, meta

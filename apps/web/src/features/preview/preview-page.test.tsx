@@ -11,13 +11,11 @@ it('does not admit a second composite task while the authoritative owner is acti
   const project = {
     stages: { composite: { status: 'running' } },
     workflow: {
-      motion_scale: 1,
+      gs_scale: 1,
+      scene_azimuth: 0,
+      target_ground: null,
       preview: null,
       target_camera: null,
-      foot_point: {
-        image: [1, 1], world: [0, 0, 0], preview_artifact_id: 'preview',
-        camera_revision: 1, pick_buffer_revision: 1,
-      },
     },
   } as unknown as ProjectDto
   const task: TaskDto = {
@@ -52,8 +50,11 @@ const failedProject = (target: TaskDto['target_stage'] = 'composite') => ({
     [target]: { status: 'failed', cache_key: null, output_paths: [], error_code: `${target}_failed`, artifacts: {} },
   },
   workflow: {
-    motion_scale: 1, preview: null, target_camera: null,
-    foot_point: { image: [1, 1], world: [0, 0, 0], preview_artifact_id: 'preview', camera_revision: 1, pick_buffer_revision: 1 },
+    gs_scale: 1,
+    scene_azimuth: 0,
+    target_ground: null,
+    preview: null,
+    target_camera: null,
   },
 }) as unknown as ProjectDto
 

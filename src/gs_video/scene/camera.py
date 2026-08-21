@@ -116,3 +116,45 @@ class OrbitCamera:
             ],
             dtype=np.float64,
         )
+
+
+@dataclass(frozen=True)
+class MatrixCamera:
+    """Renderer-compatible camera with an authoritative camera-to-world pose."""
+
+    camera_to_world_matrix: Float64Array
+    fov_y_degrees: float
+
+    def __post_init__(self) -> None:
+        matrix = np.asarray(self.camera_to_world_matrix, dtype=np.float64)
+        rotation = matrix[:3, :3] if matrix.shape == (4, 4) else np.empty((0, 0))
+        if (
+            matrix.shape != (4, 4)
+            or not np.all(np.isfinite(matrix))
+            or not np.allclose(matrix[3], (0.0, 0.0, 0.0, 1.0), atol=1e-8)
+            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6)
+            or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-6)
+        ):
+            raise ValueError("camera_to_world_matrix must be a finite rigid transform")
+        if not isfinite(self.fov_y_degrees) or not 0 < self.fov_y_degrees < 180:
+            raise ValueError("fov_y_degrees must be finite and between 0 and 180")
+        object.__setattr__(self, "camera_to_world_matrix", matrix.copy())
+
+    def camera_to_world(self) -> Float64Array:
+        return np.array(self.camera_to_world_matrix, copy=True)
+
+    def view_matrix(self) -> Float64Array:
+        return np.asarray(np.linalg.inv(self.camera_to_world_matrix), dtype=np.float64)
+
+    def intrinsics(self, width: int, height: int) -> Float64Array:
+        if width <= 0 or height <= 0:
+            raise ValueError("image dimensions must be positive")
+        focal_length = 0.5 * height / tan(radians(self.fov_y_degrees) * 0.5)
+        return np.array(
+            [
+                [focal_length, 0.0, width / 2],
+                [0.0, focal_length, height / 2],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )

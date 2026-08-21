@@ -28,7 +28,6 @@ import { StorageSettingsPage } from '../features/settings/storage-settings-page'
 import {
   canAdvance,
   canVisitStep,
-  creativeInteractionCount,
   stageSucceeded,
   type WorkflowStep,
   WORKFLOW_STEPS,
@@ -39,7 +38,7 @@ import './app.css'
 const STEP_LABELS: Record<WorkflowStep, { number: string; title: string; detail: string }> = {
   import: { number: '01', title: '导入', detail: '视频 + PLY' },
   subject: { number: '02', title: '人物', detail: '一次提示' },
-  camera: { number: '03', title: '机位', detail: '透视 + 局部地面' },
+  camera: { number: '03', title: '场景对齐', detail: 'ViPE 轨迹 + 自动 GS 地面' },
   preview: { number: '04', title: '预览', detail: '运动与合成' },
   export: { number: '05', title: '导出', detail: '验证 MP4' },
 }
@@ -746,7 +745,6 @@ export function App({
     return null
   }
 
-  const interactionCount = creativeInteractionCount(project)
   const currentIndex = WORKFLOW_STEPS.indexOf(step)
   const previous = WORKFLOW_STEPS[currentIndex - 1]
   const next = WORKFLOW_STEPS[currentIndex + 1]
@@ -881,11 +879,6 @@ export function App({
               )
             })}
           </ol>
-          <div aria-label={`创作交互 ${interactionCount} / 4`} className="interaction-meter">
-            <div><span>创作交互</span><strong>{interactionCount} / 4</strong></div>
-            <div className="meter-track"><span style={{ width: `${interactionCount / 4 * 100}%` }} /></div>
-            <p>只统计后端已持久化的人物、源透视、局部地面与合成机位。</p>
-          </div>
         </nav>
 
         <main className="workflow-main" id="workflow-main">

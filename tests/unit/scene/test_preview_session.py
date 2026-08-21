@@ -59,6 +59,9 @@ class ReactiveStdin:
                     expected_depth=np.full(
                         (command["height"], command["width"]), 2.0, dtype=np.float32
                     ),
+                    opacity=np.ones(
+                        (command["height"], command["width"]), dtype=np.float32
+                    ),
                 )
         self.process.stdout.push(
             {

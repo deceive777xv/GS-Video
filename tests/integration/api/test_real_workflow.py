@@ -15,7 +15,7 @@ from gs_video.api.routes import ApiServices
 from gs_video.api.schemas import ApiSettings
 from gs_video.app import create_app
 from gs_video.camera.classify import CameraKind
-from gs_video.camera.opencv_solver import CameraSolution
+from gs_video.camera.solution import CameraSolution, SourceGroundEstimate
 from gs_video.camera.serialization import read_mapped_trajectory
 from gs_video.domain.contracts import (
     MaskSequence,
@@ -30,6 +30,7 @@ from gs_video.domain.models import (
     SceneSummary,
     StageName,
     StageStatus,
+    TargetGroundState,
     VideoSummary,
 )
 from gs_video.environment.doctor import EnvironmentReport
@@ -155,9 +156,14 @@ class FakeCameraSolver:
     def solve(
         self,
         frame_paths: list[Path] | tuple[Path, ...],
+        mask_paths: list[Path] | tuple[Path, ...],
+        output_dir: Path,
         emit: ProgressEmitter,
         token: CancellationToken,
     ) -> CameraSolution:
+        assert len(mask_paths) == len(frame_paths)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "depth.zip").write_bytes(b"fake-depth")
         poses: list[np.ndarray] = []
         for index, _path in enumerate(frame_paths, start=1):
             token.raise_if_cancelled()
@@ -170,6 +176,14 @@ class FakeCameraSolver:
             poses,
             CameraKind.SIX_DOF,
             0.9,
+            source_ground=SourceGroundEstimate(
+                normal=(0.0, 1.0, 0.0),
+                offset=0.0,
+                anchor_frame_index=0,
+                confidence=0.9,
+                support_ratio=0.9,
+                rms_residual=0.01,
+            ),
         )
 
 
@@ -296,6 +310,7 @@ class FakePreviewService:
         return PickBuffer(
             rgb=np.full((height, width, 3), 96, dtype=np.uint8),
             expected_depth=np.full((height, width), 2.0, dtype=np.float32),
+            opacity=np.ones((height, width), dtype=np.float32),
         )
 
 
@@ -442,29 +457,6 @@ class ProductionHarness:
             assert _wait_for_task(client, solved_source.json()["id"], headers)[
                 "status"
             ] == "succeeded"
-            authoritative = client.get(
-                "/api/v1/projects/current", headers=headers
-            ).json()
-            calibrated = client.put(
-                "/api/v1/projects/current/source-perspective",
-                json={
-                    "expected_project_id": project.project_id,
-                    "expected_segment_cache_key": authoritative["stages"]["segment"][
-                        "cache_key"
-                    ],
-                    "anchor_frame_index": 0,
-                    "image_width": 4,
-                    "image_height": 3,
-                    "evidence_method": "automatic_prior",
-                    "prior_source": "centered_60_degree_default",
-                },
-                headers=headers,
-            )
-            assert calibrated.status_code == 200, calibrated.text
-            calibration = calibrated.json()["workflow"][
-                "source_perspective_calibration"
-            ]
-
             preview = client.post(
                 "/api/v1/projects/current/preview",
                 json={
@@ -486,56 +478,37 @@ class ProductionHarness:
             )
             assert preview.status_code == 201, preview.json()
             preview_descriptor = preview.json()
-            confirmed = client.post(
-                "/api/v1/projects/current/camera/confirm",
-                json={
-                    "expected_project_id": project.project_id,
-                    "camera_revision": preview_descriptor["camera_revision"],
-                },
-                headers=headers,
-            )
-            assert confirmed.status_code == 200
-            anchored = client.put(
-                "/api/v1/projects/current/local-ground",
-                json={
-                    "expected_project_id": project.project_id,
-                    "preview_artifact_id": preview_descriptor["artifact_id"],
-                    "camera_revision": preview_descriptor["camera_revision"],
-                    "pick_buffer_revision": preview_descriptor[
-                        "pick_buffer_revision"
-                    ],
-                    "points": [[4, 7], [11, 7], [8, 5]],
-                    "flip_normal": False,
-                },
-                headers=headers,
-            )
-            assert anchored.status_code == 200, anchored.text
-            ground = anchored.json()["workflow"]["local_ground_anchor"]
-            placed = client.put(
-                "/api/v1/projects/current/synthesis-placement",
-                json={
-                    "expected_project_id": project.project_id,
-                    "source_calibration_revision": calibration["revision"],
-                    "ground_anchor_revision": ground["revision"],
-                    "mode": "perspective",
-                    "scene_azimuth": 0.0,
-                    "subject_to_scene_scale": 1.0,
-                    "composition_offset_local": [0.0, 0.0],
-                    "foot_pixel": None,
-                },
-                headers=headers,
-            )
-            assert placed.status_code == 200, placed.text
-            placement = placed.json()["workflow"]["synthesis_placement"]
-            placement_confirmed = client.post(
-                "/api/v1/projects/current/synthesis-placement/confirm",
-                json={
-                    "expected_project_id": project.project_id,
-                    "placement_revision": placement["revision"],
-                },
-                headers=headers,
-            )
-            assert placement_confirmed.status_code == 200
+
+            def confirm_test_ground(current: Project) -> None:
+                scene_asset_id = current.scene_ply_asset_id or current.scene_ply
+                assert scene_asset_id is not None
+                current.workflow.target_ground = TargetGroundState(
+                    scene_asset_id=scene_asset_id,
+                    hint_pixels=((4, 7), (11, 7), (8, 5)),
+                    p0_world=(0.0, 0.0, 0.0),
+                    p1_world=(0.0, 0.0, 1.0),
+                    p2_world=(1.0, 0.0, 0.0),
+                    plane_normal=(0.0, -1.0, 0.0),
+                    plane_offset=0.0,
+                    exploration_camera_to_world=(
+                        (1.0, 0.0, 0.0, 0.0),
+                        (0.0, 1.0, 0.0, -2.0),
+                        (0.0, 0.0, 1.0, -5.0),
+                        (0.0, 0.0, 0.0, 1.0),
+                    ),
+                    camera_fingerprint="f" * 64,
+                    preview_artifact_id=preview_descriptor["artifact_id"],
+                    camera_revision=preview_descriptor["camera_revision"],
+                    pick_buffer_revision=preview_descriptor["pick_buffer_revision"],
+                    support_counts=(20, 20, 20),
+                    weighted_inlier_ratio=0.9,
+                    rms_residual=0.01,
+                    confidence=0.9,
+                    revision=1,
+                    confirmed=True,
+                )
+
+            repository.update(confirm_test_ground)
 
             exported = client.post(
                 "/api/v1/tasks",

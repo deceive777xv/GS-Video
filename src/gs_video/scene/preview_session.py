@@ -26,7 +26,7 @@ from gs_video.environment.vram import (
 )
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.scene.camera import OrbitCamera, matrix4_tuple
-from gs_video.scene.synthesis_camera import MatrixCamera
+from gs_video.scene.camera import MatrixCamera
 from gs_video.scene.preview_protocol import (
     CompleteEvent,
     ErrorEvent,
@@ -508,9 +508,10 @@ class PreviewSession(RendererWorkerClient):
                 limits = {
                     "rgb.npy": width * height * 3 + 4096,
                     "expected_depth.npy": width * height * 4 + 4096,
+                    "opacity.npy": width * height * 4 + 4096,
                 }
                 if (
-                    len(members) != 2
+                    len(members) != 3
                     or {member.filename for member in members} != set(limits)
                     or any(
                         member.flag_bits & 0x1
@@ -522,10 +523,11 @@ class PreviewSession(RendererWorkerClient):
                     raise GsVideoError("preview pick NPZ member inventory is invalid")
                 stream.seek(0)
                 with np.load(stream, allow_pickle=False) as archive:
-                    if set(archive.files) != {"rgb", "expected_depth"}:
+                    if set(archive.files) != {"rgb", "expected_depth", "opacity"}:
                         raise GsVideoError("preview pick fields are invalid")
                     rgb = archive["rgb"]
                     depth = archive["expected_depth"]
+                    opacity = archive["opacity"]
                 if _file_identity(os.fstat(stream.fileno())) != before:
                     raise GsVideoError("preview pick identity changed during validation")
         except (OSError, ValueError) as error:
@@ -540,9 +542,14 @@ class PreviewSession(RendererWorkerClient):
             raise GsVideoError("preview pick depth dimensions are invalid")
         if not np.isfinite(depth).all() or np.any(depth < 0):
             raise GsVideoError("preview pick depth is invalid")
+        if opacity.dtype != np.float32 or opacity.shape != (height, width):
+            raise GsVideoError("preview pick opacity dimensions are invalid")
+        if not np.isfinite(opacity).all() or np.any((opacity < 0) | (opacity > 1)):
+            raise GsVideoError("preview pick opacity is invalid")
         return PickBuffer(
             rgb=np.ascontiguousarray(rgb),
             expected_depth=np.ascontiguousarray(depth),
+            opacity=np.ascontiguousarray(opacity),
         )
 
     def _render_live_serial(

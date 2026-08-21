@@ -38,7 +38,14 @@ def completed_project() -> Project:
         ("SOURCE_VIDEO", set(StageName)),
         (
             "SUBJECT_PROMPT",
-            {StageName.SEGMENT, StageName.COMPOSITE, StageName.EXPORT},
+            {
+                StageName.SEGMENT,
+                StageName.SOLVE_CAMERA,
+                StageName.MAP_TRAJECTORY,
+                StageName.RENDER,
+                StageName.COMPOSITE,
+                StageName.EXPORT,
+            },
         ),
         (
             "TARGET_CAMERA",
@@ -50,9 +57,17 @@ def completed_project() -> Project:
             },
         ),
         (
-            "MOTION_SCALE",
+            "GS_ALIGNMENT",
             {
                 StageName.MAP_TRAJECTORY,
+                StageName.RENDER,
+                StageName.COMPOSITE,
+                StageName.EXPORT,
+            },
+        ),
+        (
+            "OUTPUT_CROP",
+            {
                 StageName.RENDER,
                 StageName.COMPOSITE,
                 StageName.EXPORT,

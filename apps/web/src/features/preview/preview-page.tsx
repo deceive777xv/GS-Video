@@ -26,23 +26,49 @@ export function PreviewPage({
     artifactId: string
     url: string
   } | null>(null)
-  const [motionScale, setMotionScale] = useState(String(project.workflow.motion_scale))
   const [running, setRunning] = useState(false)
+  const source = project.workflow.source_summary
+  const authoritativeCrop = project.workflow.output_crop ?? (
+    source == null ? null : { x: 0, y: 0, width: source.width, height: source.height }
+  )
+  const [cropText, setCropText] = useState(() => ({
+    x: String(authoritativeCrop?.x ?? 0),
+    y: String(authoritativeCrop?.y ?? 0),
+    width: String(authoritativeCrop?.width ?? 1920),
+    height: String(authoritativeCrop?.height ?? 1080),
+  }))
   const frameObjectUrl = useRef<string | null>(null)
   const compositeObjectUrl = useRef<string | null>(null)
   const compositeRequest = useRef(0)
   const descriptorAuthority = useRef<string | null>(null)
   const preview = project.workflow.preview
   const composite = project.stages.composite
-  const synthesisPlacement = project.workflow.synthesis_placement ?? null
-  const placementConfirmed = synthesisPlacement !== null
-    && project.workflow.confirmed_synthesis_placement_revision
-      === synthesisPlacement.revision
+  const groundConfirmed = project.workflow.target_ground?.confirmed === true
   const compositeAuthority = composite?.status === 'succeeded'
     && composite.cache_key !== null
     && composite.cache_key !== undefined
     ? composite.cache_key
     : null
+  const cropDraft = {
+    x: Number(cropText.x), y: Number(cropText.y),
+    width: Number(cropText.width), height: Number(cropText.height),
+  }
+  const cropValid = Number.isInteger(cropDraft.x) && Number.isInteger(cropDraft.y)
+    && Number.isInteger(cropDraft.width) && cropDraft.width >= 2 && cropDraft.width <= 3840
+    && cropDraft.width % 2 === 0
+    && Number.isInteger(cropDraft.height) && cropDraft.height >= 2 && cropDraft.height <= 2160
+    && cropDraft.height % 2 === 0
+  const cropSaved = authoritativeCrop !== null && cropValid
+    && cropDraft.x === authoritativeCrop.x && cropDraft.y === authoritativeCrop.y
+    && cropDraft.width === authoritativeCrop.width && cropDraft.height === authoritativeCrop.height
+
+  useEffect(() => {
+    if (authoritativeCrop === null) return
+    setCropText({
+      x: String(authoritativeCrop.x), y: String(authoritativeCrop.y),
+      width: String(authoritativeCrop.width), height: String(authoritativeCrop.height),
+    })
+  }, [authoritativeCrop?.x, authoritativeCrop?.y, authoritativeCrop?.width, authoritativeCrop?.height])
 
   useEffect(() => {
     if (frameObjectUrl.current !== null) {
@@ -131,22 +157,27 @@ export function PreviewPage({
     }
   }, [backend, compositeAuthority, onError])
 
-  const patchMotion = async (): Promise<void> => {
-    const value = Number(motionScale)
-    if (!Number.isFinite(value) || value <= 0 || value > 4) {
-      onError('运动幅度必须大于 0 且不超过 4。')
-      return
-    }
-    try { onProjectChange(await backend.updateProject({ motion_scale: value })) }
-    catch (error) { onError(error instanceof Error ? error : '运动幅度更新失败。') }
-  }
-
   const generate = async (): Promise<void> => {
-    if (busy) return
+    if (busy || !cropSaved) return
     setRunning(true)
     try { await onStartStage('composite') }
     catch (error) { onError(error instanceof Error ? error : '预览合成任务失败。') }
     finally { setRunning(false) }
+  }
+
+  const saveCrop = async (): Promise<void> => {
+    if (!cropValid || busy || running) return
+    setRunning(true)
+    try {
+      onProjectChange(await backend.updateProject({
+        expected_project_id: project.project_id,
+        output_crop: cropDraft,
+      }))
+    } catch (error) {
+      onError(error instanceof Error ? error : '无法保存固定输出裁剪。')
+    } finally {
+      setRunning(false)
+    }
   }
 
   const displayedComposite = compositeVideo?.authority === compositeAuthority
@@ -186,7 +217,7 @@ export function PreviewPage({
       <div className="page-heading">
         <p className="eyebrow">04 · PREVIEW</p>
         <h2 id="preview-title">检查构图与运动</h2>
-        <p>调整只会让后端定向失效轨迹、渲染、合成和导出阶段，不会重新分割人物。</p>
+        <p>人物像素固定在解算相机画面中；这里检查自动地面对齐后的完整低分辨率合成。</p>
       </div>
       <div className="preview-layout">
         <article className="preview-card">
@@ -211,18 +242,20 @@ export function PreviewPage({
           </div>
           <div className="preview-caption">
             <span>{compositeAuthority === null ? '相机参考 · 非合成视频' : '后端验证 · 低分辨率合成'}</span>
-            <span>源垂直 FOV {project.workflow.source_perspective_calibration?.vertical_fov.toFixed(0) ?? '—'}°</span>
-            <span>受约束机位 r{project.workflow.synthesis_placement?.revision ?? '—'}</span>
+            <span>ViPE 逐帧内参</span>
+            <span>目标地面 r{project.workflow.target_ground?.revision ?? '—'}</span>
           </div>
         </article>
         <aside className="control-card">
-          <h3>运动迁移</h3>
-          <label>运动幅度
-            <input aria-label="运动幅度" max="4" min="0.1" onChange={(event) => setMotionScale(event.currentTarget.value)} step="0.05" type="range" value={motionScale} />
-            <output>{Number(motionScale).toFixed(2)}×</output>
-          </label>
-          <button className="button-secondary" onClick={() => void patchMotion()} type="button">应用运动幅度</button>
-          <button disabled={busy || running || compositeRunning || !placementConfirmed} onClick={() => void generate()} type="button">{busy || running || compositeRunning ? '生成中…' : '生成预览'}</button>
+          <h3>全片合成</h3>
+          <p>GS 比例 {project.workflow.gs_scale.toFixed(3)}× · 方位角 {project.workflow.scene_azimuth.toFixed(1)}°</p>
+          <fieldset disabled={busy || running}>
+            <legend>固定输出裁剪</legend>
+            {(['x', 'y', 'width', 'height'] as const).map((key) => <label key={key}>{key.toUpperCase()}<input aria-label={`输出裁剪 ${key.toUpperCase()}`} onChange={(event) => setCropText((current) => ({ ...current, [key]: event.currentTarget.value }))} step={key === 'width' || key === 'height' ? 2 : 1} type="number" value={cropText[key]} /></label>)}
+          </fieldset>
+          <p className="technical-note">X/Y 使用源画面像素坐标，可为负数；裁剪框允许超出源视频范围，外部区域由 GS 背景填充。宽高须为偶数，最大 3840×2160。</p>
+          <button disabled={busy || running || !cropValid || cropSaved} onClick={() => void saveCrop()} type="button">保存固定裁剪</button>
+          <button disabled={busy || running || compositeRunning || !groundConfirmed || !cropSaved} onClick={() => void generate()} type="button">{busy || running || compositeRunning ? '生成中…' : '生成预览'}</button>
           <div className="stage-list" aria-label="预览阶段缓存状态">
             {stageRows.map((name) => <div key={name}><span>{name}</span><strong>{project.stages[name]?.status ?? 'pending'}</strong></div>)}
           </div>

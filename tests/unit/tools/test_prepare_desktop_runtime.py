@@ -15,6 +15,7 @@ def create_runtime_layout(root: Path) -> None:
     required = (
         root / ".venv" / "Scripts" / "python.exe",
         root / ".runtime" / "segmentation" / ".venv" / "Scripts" / "python.exe",
+        root / ".runtime" / "camera" / ".venv" / "Scripts" / "python.exe",
         root / ".runtime" / "renderer" / ".venv" / "Scripts" / "python.exe",
         root / ".runtime" / "segmentation" / "EdgeTAM" / "sam2" / "configs" / "edgetam.yaml",
         root / ".runtime" / "segmentation" / "EdgeTAM" / "checkpoints" / "edgetam.pt",
@@ -49,6 +50,9 @@ def test_prepare_desktop_runtime_writes_confined_absolute_configuration(
         "segmentation_checkpoint": str(
             runtime_root / "segmentation" / "EdgeTAM" / "checkpoints" / "edgetam.pt"
         ),
+        "camera_worker_prefix": [
+            str(runtime_root / "camera" / ".venv" / "Scripts" / "python.exe")
+        ],
         "renderer_worker_prefix": [
             str(runtime_root / "renderer" / ".venv" / "Scripts" / "python.exe")
         ],

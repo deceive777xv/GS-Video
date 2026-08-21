@@ -17,7 +17,7 @@ from PIL import Image
 
 from gs_video.domain.errors import UnsupportedMaterialError
 from gs_video.scene.camera import OrbitCamera
-from gs_video.scene.synthesis_camera import MatrixCamera
+from gs_video.scene.camera import MatrixCamera
 from gs_video.scene.gsplat_renderer import GsplatRenderer, PreparedPreviewScene
 from gs_video.scene.ply import load_gaussian_ply
 from gs_video.scene.preview_protocol import (
@@ -170,7 +170,12 @@ def _render_pick(
             prepared, _camera(command.camera), command.width, command.height
         )
         with temporary.open("xb") as stream:
-            np.savez(stream, rgb=pick.rgb, expected_depth=pick.expected_depth)
+            np.savez(
+                stream,
+                rgb=pick.rgb,
+                expected_depth=pick.expected_depth,
+                opacity=pick.opacity,
+            )
             stream.flush()
             os.fsync(stream.fileno())
         _publish(temporary, command.output_path)

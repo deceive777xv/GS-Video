@@ -91,6 +91,8 @@ def _require_owned_output(path: Path, *, directory: bool) -> None:
 class _MatrixCamera:
     camera_to_world_matrix: Any
     fov_y_degrees: float
+    intrinsics_matrix: Any | None = None
+    source_size: tuple[int, int] | None = None
 
     def view_matrix(self) -> Any:
         import numpy as np
@@ -100,6 +102,14 @@ class _MatrixCamera:
     def intrinsics(self, width: int, height: int) -> Any:
         import numpy as np
 
+        if self.intrinsics_matrix is not None:
+            if self.source_size is None:
+                raise ValueError("per-frame intrinsics require a source size")
+            source_width, source_height = self.source_size
+            matrix = np.asarray(self.intrinsics_matrix, dtype=np.float64).copy()
+            matrix[0, :] *= width / source_width
+            matrix[1, :] *= height / source_height
+            return matrix
         focal = 0.5 * height / tan(radians(self.fov_y_degrees) * 0.5)
         return np.asarray(
             [[focal, 0.0, width / 2], [0.0, focal, height / 2], [0.0, 0.0, 1.0]],
@@ -121,8 +131,13 @@ def _render_sequence(request: RenderSequenceRequest) -> CompleteEvent:
     _require_owned_output(request.output_dir, directory=True)
     trajectory = read_mapped_trajectory(request.camera_manifest)
     cameras = tuple(
-        _MatrixCamera(pose, trajectory.fov_y_degrees)
-        for pose in trajectory.camera_to_world
+        _MatrixCamera(
+            pose,
+            trajectory.fov_y_degrees,
+            None if trajectory.frame_intrinsics is None else trajectory.frame_intrinsics[index],
+            trajectory.source_size,
+        )
+        for index, pose in enumerate(trajectory.camera_to_world)
     )
     renderer = GsplatRenderer()
     sequence = renderer.render(
@@ -154,7 +169,7 @@ def _render_pick(request: RenderPickRequest) -> CompleteEvent:
     from gs_video.scene.gsplat_renderer import GsplatRenderer
     from gs_video.scene.ply import load_gaussian_ply
     from gs_video.scene.worker_protocol import MatrixCameraPayload
-    from gs_video.scene.synthesis_camera import MatrixCamera
+    from gs_video.scene.camera import MatrixCamera
     from gs_video.scene.camera import OrbitCamera
 
     _require_input_file(request.scene_path, "Gaussian scene")
@@ -178,7 +193,12 @@ def _render_pick(request: RenderPickRequest) -> CompleteEvent:
     )
     try:
         with temporary.open("xb") as stream:
-            np.savez(stream, rgb=pick.rgb, expected_depth=pick.expected_depth)
+            np.savez(
+                stream,
+                rgb=pick.rgb,
+                expected_depth=pick.expected_depth,
+                opacity=pick.opacity,
+            )
             stream.flush()
             os.fsync(stream.fileno())
         metadata = temporary.lstat()

@@ -9,8 +9,6 @@ import type {
   PreviewFrameDto,
   LivePreviewRequest,
   PreviewRequest,
-  PickRequest,
-  FootPointDto,
   StageName,
   TaskDto,
   UploadInit,
@@ -29,10 +27,7 @@ import type {
   StorageLayoutUpdate,
   CacheCleanupResultDto,
   CacheCleanupPlanDto,
-  SourcePerspectiveCalibrationInput,
-  SourceContactConfirmationInput,
-  LocalGroundAnchorInput,
-  SynthesisPlacementInput,
+  TargetGroundCandidateInput,
 } from './types'
 
 export interface BackendClient {
@@ -75,14 +70,8 @@ export interface BackendClient {
   renderLivePreview(input: LivePreviewRequest, signal?: AbortSignal): Promise<Blob>
   closeLivePreview(): Promise<void>
   fetchPreviewArtifact(id: string, signal?: AbortSignal): Promise<Blob>
-  pickFootPoint(input: PickRequest): Promise<FootPointDto>
-  confirmCamera(expectedProjectId: string, cameraRevision: number): Promise<ProjectDto>
-  scanSubjectVisibility(expectedProjectId: string, expectedSegmentCacheKey: string): Promise<ProjectDto>
-  calibrateSourcePerspective(input: SourcePerspectiveCalibrationInput): Promise<ProjectDto>
-  confirmSourceContact(input: SourceContactConfirmationInput): Promise<ProjectDto>
-  calibrateLocalGround(input: LocalGroundAnchorInput): Promise<ProjectDto>
-  solveSynthesisPlacement(input: SynthesisPlacementInput): Promise<ProjectDto>
-  confirmSynthesisPlacement(expectedProjectId: string, placementRevision: number): Promise<ProjectDto>
+  fitTargetGround(input: TargetGroundCandidateInput): Promise<ProjectDto>
+  confirmTargetGround(expectedProjectId: string, targetGroundRevision: number): Promise<ProjectDto>
   getVerifiedExport(): Promise<VerifiedExportDto>
   fetchExportArtifact(id: string, signal?: AbortSignal): Promise<Blob>
   getCompositePreview(signal?: AbortSignal): Promise<CompositePreviewDto>

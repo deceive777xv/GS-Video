@@ -24,6 +24,7 @@ from gs_video.api.assets import AssetInspector
 from gs_video.api.routes import ApiServices
 from gs_video.api.schemas import ApiSettings
 from gs_video.api.workflow import PreviewArtifactStore, WorkerPreviewService
+from gs_video.camera.vipe_solver import VipeCameraSolver
 from gs_video.domain.contracts import SegmentationBackend
 from gs_video.domain.errors import GsVideoError
 from gs_video.environment.doctor import EnvironmentDoctor
@@ -123,6 +124,7 @@ class WorkflowRuntimeConfig(BaseModel):
     segmentation_worker_prefix: tuple[str, ...]
     segmentation_model_config: Path
     segmentation_checkpoint: Path
+    camera_worker_prefix: tuple[str, ...]
     renderer_worker_prefix: tuple[str, ...]
     renderer_sh_degree: int = Field(default=3, ge=0, le=3)
     available_vram_limit_mb: int = Field(default=8192, ge=1024)
@@ -143,7 +145,9 @@ class WorkflowRuntimeConfig(BaseModel):
             raise ValueError("runtime paths must be absolute")
         return value
 
-    @field_validator("segmentation_worker_prefix", "renderer_worker_prefix")
+    @field_validator(
+        "segmentation_worker_prefix", "camera_worker_prefix", "renderer_worker_prefix"
+    )
     @classmethod
     def worker_argv(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if (
@@ -176,7 +180,7 @@ class WorkflowRuntimeConfig(BaseModel):
             raise ValueError("worker executable path must be absolute")
         return value
 
-    @field_validator("renderer_worker_prefix")
+    @field_validator("camera_worker_prefix", "renderer_worker_prefix")
     @classmethod
     def renderer_worker_argv(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if not Path(value[0]).is_absolute():
@@ -274,6 +278,16 @@ def _validate_loaded_config(
         _ordinary_file(renderer_executable, "renderer worker")
     elif not allow_missing_resources:
         raise ValueError("renderer worker is unavailable")
+    camera_executable = _resolved_inside(
+        Path(config.camera_worker_prefix[0]),
+        workspace,
+        "camera worker",
+        strict=not allow_missing_resources,
+    )
+    if camera_executable.exists():
+        _ordinary_file(camera_executable, "camera worker")
+    elif not allow_missing_resources:
+        raise ValueError("camera worker is unavailable")
 
 
 def load_runtime_config(
@@ -497,6 +511,12 @@ def assemble_api_services(
         log_path=log_root / "renderer-worker.log",
         gpu_gate=gpu_gate,
     )
+    camera_solver = VipeCameraSolver(
+        config.camera_worker_prefix,
+        gpu_gate=gpu_gate,
+        cache_root=runtime_root / "camera" / ".cache",
+        log_path=log_root / "vipe-worker.log",
+    )
     identity_lock = Lock()
     identity_attempted = False
     renderer_identity: object | None = None
@@ -549,7 +569,11 @@ def assemble_api_services(
             workflow_services = WorkflowServices(
                 media_ingest=MediaIngestService(paths),
                 segmenter=SegmentWorkflowService(paths, segmentation),
-                camera_solver=CameraSolveWorkflowService(paths),
+                camera_solver=CameraSolveWorkflowService(
+                    paths,
+                    camera_solver,
+                    backend_identity=camera_solver.identity,
+                ),
                 trajectory_mapper=TrajectoryMapWorkflowService(paths),
                 renderer=RendererWorkflowService(
                     paths,

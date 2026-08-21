@@ -11,8 +11,6 @@ import type {
   PreviewFrameDto,
   LivePreviewRequest,
   PreviewRequest,
-  PickRequest,
-  FootPointDto,
   SessionConfig,
   StageName,
   TaskDto,
@@ -32,10 +30,7 @@ import type {
   StorageLayoutUpdate,
   CacheCleanupResultDto,
   CacheCleanupPlanDto,
-  SourcePerspectiveCalibrationInput,
-  SourceContactConfirmationInput,
-  LocalGroundAnchorInput,
-  SynthesisPlacementInput,
+  TargetGroundCandidateInput,
 } from './types'
 
 const API_PREFIX = '/api/v1'
@@ -365,20 +360,6 @@ export class HttpBackendClient implements BackendClient {
     )
   }
 
-  pickFootPoint(input: PickRequest): Promise<FootPointDto> {
-    return this.#request('/projects/current/pick', {
-      method: 'POST',
-      json: input,
-    })
-  }
-
-  confirmCamera(expectedProjectId: string, cameraRevision: number): Promise<ProjectDto> {
-    return this.#request('/projects/current/camera/confirm', {
-      method: 'POST',
-      json: { expected_project_id: expectedProjectId, camera_revision: cameraRevision },
-    })
-  }
-
   getVerifiedExport(): Promise<VerifiedExportDto> {
     return this.#request('/projects/current/export')
   }
@@ -435,35 +416,19 @@ export class HttpBackendClient implements BackendClient {
     )
   }
 
-  calibrateSourcePerspective(input: SourcePerspectiveCalibrationInput): Promise<ProjectDto> {
-    return this.#request('/projects/current/source-perspective', { method: 'PUT', json: input })
-  }
-
-  confirmSourceContact(input: SourceContactConfirmationInput): Promise<ProjectDto> {
-    return this.#request('/projects/current/source-contact', { method: 'PUT', json: input })
-  }
-
-  calibrateLocalGround(input: LocalGroundAnchorInput): Promise<ProjectDto> {
-    return this.#request('/projects/current/local-ground', { method: 'PUT', json: input })
-  }
-
-  solveSynthesisPlacement(input: SynthesisPlacementInput): Promise<ProjectDto> {
-    return this.#request('/projects/current/synthesis-placement', { method: 'PUT', json: input })
-  }
-
-  confirmSynthesisPlacement(expectedProjectId: string, placementRevision: number): Promise<ProjectDto> {
-    return this.#request('/projects/current/synthesis-placement/confirm', {
-      method: 'POST',
-      json: { expected_project_id: expectedProjectId, placement_revision: placementRevision },
+  fitTargetGround(input: TargetGroundCandidateInput): Promise<ProjectDto> {
+    return this.#request('/projects/current/target-ground/candidate', {
+      method: 'PUT',
+      json: input,
     })
   }
 
-  scanSubjectVisibility(expectedProjectId: string, expectedSegmentCacheKey: string): Promise<ProjectDto> {
-    return this.#request('/projects/current/visibility-audit', {
+  confirmTargetGround(expectedProjectId: string, targetGroundRevision: number): Promise<ProjectDto> {
+    return this.#request('/projects/current/target-ground/confirm', {
       method: 'POST',
       json: {
         expected_project_id: expectedProjectId,
-        expected_segment_cache_key: expectedSegmentCacheKey,
+        target_ground_revision: targetGroundRevision,
       },
     })
   }

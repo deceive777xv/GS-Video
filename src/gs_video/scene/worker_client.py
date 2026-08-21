@@ -649,11 +649,14 @@ class RendererWorkerClient:
                 except zipfile.BadZipFile as exc:
                     raise GsVideoError("pick buffer is not a valid NPZ archive") from exc
                 names = tuple(member.filename for member in members)
-                if len(members) != 2 or set(names) != {"rgb.npy", "expected_depth.npy"}:
+                if len(members) != 3 or set(names) != {
+                    "rgb.npy", "expected_depth.npy", "opacity.npy"
+                }:
                     raise GsVideoError("pick buffer member inventory is invalid")
                 member_limits = {
                     "rgb.npy": request.width * request.height * 3 + 4096,
                     "expected_depth.npy": request.width * request.height * 4 + 4096,
+                    "opacity.npy": request.width * request.height * 4 + 4096,
                 }
                 if any(
                     member.flag_bits & 0x1
@@ -664,10 +667,11 @@ class RendererWorkerClient:
                     raise GsVideoError("pick buffer member size or flags are invalid")
                 stream.seek(0)
                 with np.load(stream, allow_pickle=False) as archive:
-                    if set(archive.files) != {"rgb", "expected_depth"}:
+                    if set(archive.files) != {"rgb", "expected_depth", "opacity"}:
                         raise GsVideoError("pick buffer fields are invalid")
                     rgb = archive["rgb"]
                     depth = archive["expected_depth"]
+                    opacity = archive["opacity"]
                 if _file_identity(os.fstat(stream.fileno())) != before:
                     raise GsVideoError("pick buffer identity changed during validation")
         except (OSError, ValueError) as exc:
@@ -682,9 +686,14 @@ class RendererWorkerClient:
             raise GsVideoError("pick depth dtype or dimensions are invalid")
         if not np.isfinite(depth).all() or np.any(depth < 0):
             raise GsVideoError("pick depth must contain finite nonnegative values")
+        if opacity.dtype != np.float32 or opacity.shape != (request.height, request.width):
+            raise GsVideoError("pick opacity dtype or dimensions are invalid")
+        if not np.isfinite(opacity).all() or np.any((opacity < 0) | (opacity > 1)):
+            raise GsVideoError("pick opacity must remain in the unit interval")
         return PickBuffer(
             rgb=np.ascontiguousarray(rgb),
             expected_depth=np.ascontiguousarray(depth),
+            opacity=np.ascontiguousarray(opacity),
         )
 
     def probe(

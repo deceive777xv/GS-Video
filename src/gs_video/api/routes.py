@@ -29,7 +29,6 @@ from gs_video.api.schemas import (
     AssetListItem,
     AssetResponse,
     BootstrapResponse,
-    CameraConfirmationRequest,
     CacheCleanupRequest,
     CacheCleanupPlanRequest,
     CameraInput,
@@ -37,21 +36,14 @@ from gs_video.api.schemas import (
     EnvironmentRepairSnapshot,
     HealthResponse,
     LivePreviewRequest,
-    LocalGroundAnchorRequest,
-    PickRequest,
-    PickResponse,
     PreviewFrameRequest,
     PreviewFrameResponse,
     ProjectPatch,
     ProjectAssetSelection,
     ProjectCreate,
     ProjectRename,
-    SourceContactConfirmationRequest,
-    SourcePerspectiveCalibrationRequest,
-    SubjectMediaRole,
-    SynthesisPlacementConfirmationRequest,
-    SynthesisPlacementRequest,
-    VisibilityAuditRequest,
+    TargetGroundCandidateRequest,
+    TargetGroundConfirmationRequest,
     TaskCreateRequest,
     TaskSnapshot,
     StorageLayoutUpdate,
@@ -68,8 +60,6 @@ from gs_video.api.workflow import (
     PreviewCoordinator,
     PreviewRequestFingerprint,
     PreviewServiceLike,
-    audit_subject_visibility,
-    resolve_subject_media,
     validate_pick_buffer,
     validate_subject_prompt,
 )
@@ -79,21 +69,15 @@ from gs_video.domain.contracts import PickBuffer
 from gs_video.domain.models import (
     CameraPose,
     ExplorationCameraPose,
-    FootPointState,
-    LocalGroundAnchor,
+    OutputCropState,
     PreviewState,
     Project,
     SceneSummary,
     StageName,
     StageState,
     SubjectPromptState,
-    SubjectVisibilityAudit,
-    SourcePerspectiveCalibration,
-    SubjectContactConstraint,
-    SynthesisConstraintMode,
-    SynthesisPlacement,
+    TargetGroundState,
     VideoSummary,
-    VisibilityRange,
 )
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.environment.cache import EnvironmentReportCache
@@ -120,18 +104,13 @@ from gs_video.project.manager import (
     ActiveProjectRequiredError,
 )
 from gs_video.scene.camera import (
+    MatrixCamera,
     Matrix4Tuple,
     OrbitCamera,
-    matrix3_tuple,
     matrix4_tuple,
 )
-from gs_video.scene.synthesis_camera import (
-    LocalGroundPlane,
-    MatrixCamera,
-    SourcePerspective,
-    SynthesisCameraRig,
-)
-from gs_video.segmentation.visibility_audit import VisibilityCandidateRange
+from gs_video.scene.ground_fit import fit_ground_from_gaussians
+from gs_video.scene.ply import load_gaussian_ply
 from gs_video.storage.artifacts import ArtifactStore
 from gs_video.storage.layout import (
     CacheCleanupPlan,
@@ -814,24 +793,16 @@ def _require_task_cache_admission(
 
 def _clear_preview_authority(project: Project) -> None:
     project.workflow.preview_epoch += 1
-    project.workflow.confirmed_camera_revision = None
-    project.workflow.confirmed_preview_artifact_id = None
-    project.workflow.foot_point = None
     project.workflow.preview = None
 
 
 def _clear_source_synthesis_authority(project: Project) -> None:
-    project.workflow.subject_visibility_audit = None
-    project.workflow.source_perspective_calibration = None
-    project.workflow.subject_contact_constraint = None
-    project.workflow.synthesis_placement = None
-    project.workflow.confirmed_synthesis_placement_revision = None
+    project.workflow.output_crop = None
+    project.workflow.export_result = None
 
 
 def _clear_scene_synthesis_authority(project: Project) -> None:
-    project.workflow.local_ground_anchor = None
-    project.workflow.synthesis_placement = None
-    project.workflow.confirmed_synthesis_placement_revision = None
+    project.workflow.target_ground = None
 
 
 def build_router() -> APIRouter:
@@ -1242,9 +1213,23 @@ def build_router() -> APIRouter:
                     _clear_source_synthesis_authority(project)
                     invalidate_for_change(project, ChangeKind.SUBJECT_PROMPT)
                     project.workflow.export_result = None
-                if patch.motion_scale is not None:
-                    project.workflow.motion_scale = patch.motion_scale
-                    invalidate_for_change(project, ChangeKind.MOTION_SCALE)
+                if patch.gs_scale is not None:
+                    project.workflow.gs_scale = patch.gs_scale
+                    invalidate_for_change(project, ChangeKind.GS_ALIGNMENT)
+                    project.workflow.export_result = None
+                if patch.scene_azimuth is not None:
+                    project.workflow.scene_azimuth = patch.scene_azimuth
+                    invalidate_for_change(project, ChangeKind.GS_ALIGNMENT)
+                    project.workflow.export_result = None
+                if "output_crop" in patch.model_fields_set:
+                    project.workflow.output_crop = (
+                        None
+                        if patch.output_crop is None
+                        else OutputCropState.model_validate(
+                            patch.output_crop.model_dump()
+                        )
+                    )
+                    invalidate_for_change(project, ChangeKind.OUTPUT_CROP)
                     project.workflow.export_result = None
                 if patch.preview_height is not None:
                     project.workflow.preview_height = patch.preview_height
@@ -1618,9 +1603,6 @@ def build_router() -> APIRouter:
                     **preview.camera.model_dump(), revision=revision
                 )
                 latest.workflow.exploration_camera = None
-            latest.workflow.foot_point = None
-            latest.workflow.confirmed_camera_revision = None
-            latest.workflow.confirmed_preview_artifact_id = None
             latest.workflow.preview = PreviewState(
                 artifact_id=artifact_id,
                 artifact_size=artifact_size,
@@ -1673,768 +1655,170 @@ def build_router() -> APIRouter:
             },
         )
 
-    @protected.post(
-        "/api/v1/projects/current/camera/confirm", response_model=Project
-    )
-    async def confirm_camera(
-        request: Request, confirmation: CameraConfirmationRequest
-    ) -> Project:
-        repository = _services(request).project_repository
-
-        def persist(project: Project) -> None:
-            camera = (
-                project.workflow.exploration_camera
-                or project.workflow.target_camera
-            )
-            preview = project.workflow.preview
-            if project.project_id != confirmation.expected_project_id:
-                raise ApiError(
-                    409,
-                    code="project_context_changed",
-                    category="conflict",
-                    message="The active project changed before camera confirmation.",
-                )
-            if (
-                camera is None
-                or preview is None
-                or camera.revision != confirmation.camera_revision
-                or preview.camera_revision != confirmation.camera_revision
-            ):
-                raise ApiError(
-                    409,
-                    code="stale_camera_revision",
-                    category="conflict",
-                    message="Render the current camera before confirming it.",
-                )
-            project.workflow.confirmed_camera_revision = (
-                confirmation.camera_revision
-            )
-            project.workflow.confirmed_preview_artifact_id = preview.artifact_id
-            project.workflow.foot_point = None
-
-        return await asyncio.to_thread(repository.update, persist)
-
     @protected.put(
-        "/api/v1/projects/current/source-perspective",
+        "/api/v1/projects/current/target-ground/candidate",
         response_model=Project,
     )
-    async def calibrate_source_perspective(
+    async def fit_target_ground_candidate(
         request: Request,
-        calibration: SourcePerspectiveCalibrationRequest,
-    ) -> Project:
-        services = _services(request)
-        repository = services.project_repository
-        current = _load_project(repository)
-        if current.project_id != calibration.expected_project_id:
-            raise ApiError(
-                409,
-                code="project_context_changed",
-                category="conflict",
-                message="The active project changed before calibration began.",
-            )
-        artifact_root = (
-            repository.root
-            if services.artifact_store is None
-            else services.artifact_store.project_root(current.project_id)
-        )
-        resolved_anchor = await asyncio.to_thread(
-            resolve_subject_media,
-            current,
-            artifact_root,
-            SubjectMediaRole.PROXY,
-            calibration.anchor_frame_index,
-        )
-        if (
-            resolved_anchor.width != calibration.image_width
-            or resolved_anchor.height != calibration.image_height
-        ):
-            raise ApiError(
-                422,
-                code="source_calibration_geometry_mismatch",
-                category="validation",
-                message="Calibration dimensions must match the decoded source anchor frame.",
-            )
-
-        def persist(project: Project) -> None:
-            if project.project_id != calibration.expected_project_id:
-                raise ApiError(
-                    409,
-                    code="project_context_changed",
-                    category="conflict",
-                    message="The active project changed before calibration was saved.",
-                )
-            ingest = project.stages.get(StageName.INGEST)
-            segment = project.stages.get(StageName.SEGMENT)
-            source_asset_id = project.source_video_asset_id or project.source_video
-            summary = project.workflow.source_summary
-            if (
-                ingest is None
-                or segment is None
-                or ingest.cache_key is None
-                or segment.cache_key != calibration.expected_segment_cache_key
-                or source_asset_id is None
-                or summary is None
-                or calibration.anchor_frame_index >= (summary.frame_count or 0)
-            ):
-                raise ApiError(
-                    409,
-                    code="source_calibration_authority_changed",
-                    category="conflict",
-                    message="The source or segmentation authority changed before calibration was saved.",
-                )
-            try:
-                if calibration.evidence_method == "orthogonal_guides":
-                    assert calibration.group_a is not None
-                    assert calibration.group_b is not None
-                    assert calibration.reference_relation is not None
-                    guide_a = _image_guide_group(calibration.group_a)
-                    guide_b = _image_guide_group(calibration.group_b)
-                    perspective = SourcePerspective.from_orthogonal_guides(
-                        width=calibration.image_width,
-                        height=calibration.image_height,
-                        group_a=guide_a,
-                        group_b=guide_b,
-                        reference_relation=calibration.reference_relation,
-                    )
-                else:
-                    perspective = SourcePerspective.from_horizon(
-                        width=calibration.image_width,
-                        height=calibration.image_height,
-                        fov_y_degrees=60.0,
-                        horizon_start=(0.0, calibration.image_height / 2),
-                        horizon_end=(float(calibration.image_width), calibration.image_height / 2),
-                    )
-            except ValueError as error:
-                raise ApiError(
-                    422,
-                    code="invalid_perspective_reference",
-                    category="validation",
-                    message=str(error),
-                ) from error
-            revision = project.workflow.source_calibration_generation + 1
-            project.workflow.source_calibration_generation = revision
-            project.workflow.source_perspective_calibration = SourcePerspectiveCalibration(
-                source_asset_id=source_asset_id,
-                ingest_cache_key=ingest.cache_key,
-                segment_cache_key=segment.cache_key,
-                anchor_frame_index=calibration.anchor_frame_index,
-                image_width=calibration.image_width,
-                image_height=calibration.image_height,
-                vertical_fov=perspective.fov_y_degrees,
-                horizon_line=(
-                    float(perspective.horizon_line[0]),
-                    float(perspective.horizon_line[1]),
-                    float(perspective.horizon_line[2]),
-                ),
-                gravity_direction_camera=(
-                    float(perspective.up_camera[0]),
-                    float(perspective.up_camera[1]),
-                    float(perspective.up_camera[2]),
-                ),
-                evidence_method=calibration.evidence_method,
-                reference_relation=calibration.reference_relation,
-                guide_groups=(
-                    _image_guide_group(calibration.group_a),
-                    _image_guide_group(calibration.group_b),
-                )
-                if calibration.group_a is not None and calibration.group_b is not None
-                else None,
-                evidence_confidence="high" if calibration.evidence_method == "orthogonal_guides" else "low",
-                evidence_diagnostics=(
-                    "方形像素、零 skew、中心主点；FOV 由两组正交方向求解。",
-                ) if calibration.evidence_method == "orthogonal_guides" else (
-                    "未获得足够透视证据，使用中心主点、方形像素和 60° 垂直 FOV 系统初值。",
-                ),
-                revision=revision,
-            )
-            project.workflow.subject_contact_constraint = None
-            project.workflow.synthesis_placement = None
-            project.workflow.confirmed_synthesis_placement_revision = None
-            project.workflow.export_result = None
-            invalidate_for_change(project, ChangeKind.TARGET_CAMERA)
-
-        return await asyncio.to_thread(repository.update, persist)
-
-    @protected.put(
-        "/api/v1/projects/current/source-contact",
-        response_model=Project,
-    )
-    async def confirm_source_contact(
-        request: Request,
-        confirmation: SourceContactConfirmationRequest,
-    ) -> Project:
-        repository = _services(request).project_repository
-
-        def persist(project: Project) -> None:
-            calibration = project.workflow.source_perspective_calibration
-            if (
-                project.project_id != confirmation.expected_project_id
-                or calibration is None
-                or calibration.revision != confirmation.source_calibration_revision
-            ):
-                raise ApiError(
-                    409,
-                    code="source_contact_authority_changed",
-                    category="conflict",
-                    message="Confirm the foot point against the current source calibration.",
-                )
-            foot_x, foot_y = confirmation.foot_pixel
-            if (
-                foot_x >= calibration.image_width
-                or foot_y >= calibration.image_height
-            ):
-                raise ApiError(
-                    422,
-                    code="source_contact_outside_frame",
-                    category="validation",
-                    message="The confirmed foot point must lie inside the source frame.",
-                )
-            revision = project.workflow.source_contact_generation + 1
-            project.workflow.source_contact_generation = revision
-            project.workflow.subject_contact_constraint = SubjectContactConstraint(
-                source_asset_id=calibration.source_asset_id,
-                ingest_cache_key=calibration.ingest_cache_key,
-                segment_cache_key=calibration.segment_cache_key,
-                source_calibration_revision=calibration.revision,
-                anchor_frame_index=calibration.anchor_frame_index,
-                foot_pixel=(foot_x, foot_y),
-                revision=revision,
-            )
-            project.workflow.synthesis_placement = None
-            project.workflow.confirmed_synthesis_placement_revision = None
-            project.workflow.export_result = None
-            invalidate_for_change(project, ChangeKind.TARGET_CAMERA)
-
-        return await asyncio.to_thread(repository.update, persist)
-
-    @protected.post(
-        "/api/v1/projects/current/visibility-audit",
-        response_model=Project,
-    )
-    async def scan_subject_visibility(
-        request: Request,
-        audit_request: VisibilityAuditRequest,
+        candidate_request: TargetGroundCandidateRequest,
     ) -> Project:
         services = _services(request)
         repository = services.project_repository
         project = _load_project(repository)
-        segment = project.stages.get(StageName.SEGMENT)
-        source_asset_id = project.source_video_asset_id or project.source_video
-        if (
-            project.project_id != audit_request.expected_project_id
-            or segment is None
-            or segment.cache_key != audit_request.expected_segment_cache_key
-            or source_asset_id is None
-        ):
-            raise ApiError(
-                409,
-                code="visibility_audit_authority_changed",
-                category="conflict",
-                message="The source or segmentation changed before the visibility scan.",
-            )
-        artifact_root = (
-            repository.root
-            if services.artifact_store is None
-            else services.artifact_store.project_root(project.project_id)
-        )
-        audit = await asyncio.to_thread(
-            audit_subject_visibility, project, artifact_root
-        )
-
-        def converted(value: VisibilityCandidateRange) -> VisibilityRange:
-            return VisibilityRange(
-                start_frame=value.start_frame,
-                end_frame=value.end_frame,
-                review_frames=value.review_frames,
-            )
-
-        def persist(latest: Project) -> None:
-            latest_segment = latest.stages.get(StageName.SEGMENT)
-            if (
-                latest.project_id != audit_request.expected_project_id
-                or latest_segment is None
-                or latest_segment.cache_key
-                != audit_request.expected_segment_cache_key
-                or (latest.source_video_asset_id or latest.source_video)
-                != source_asset_id
-            ):
-                raise ApiError(
-                    409,
-                    code="visibility_audit_authority_changed",
-                    category="conflict",
-                    message="The source or segmentation changed during the visibility scan.",
-                )
-            previous = latest.workflow.subject_visibility_audit
-            revision = 1 if previous is None else previous.revision + 1
-            latest.workflow.subject_visibility_audit = SubjectVisibilityAudit(
-                source_asset_id=source_asset_id,
-                segment_cache_key=audit_request.expected_segment_cache_key,
-                fully_visible_ranges=tuple(map(converted, audit.fully_visible_ranges)),
-                bottom_cropped_ranges=tuple(map(converted, audit.bottom_cropped_ranges)),
-                uncertain_ranges=tuple(map(converted, audit.uncertain_ranges)),
-                recommended_anchor_frames=audit.recommended_anchor_frames,
-                revision=revision,
-            )
-
-        return await asyncio.to_thread(repository.update, persist)
-
-    @protected.put(
-        "/api/v1/projects/current/local-ground",
-        response_model=Project,
-    )
-    async def calibrate_local_ground(
-        request: Request,
-        anchor: LocalGroundAnchorRequest,
-    ) -> Project:
-        repository = _services(request).project_repository
-        project = _load_project(repository)
-        if project.project_id != anchor.expected_project_id:
-            raise ApiError(
-                409,
-                code="project_context_changed",
-                category="conflict",
-                message="The active project changed before local ground calibration.",
-            )
         preview = project.workflow.preview
+        camera_state = project.workflow.exploration_camera or project.workflow.target_camera
         camera = _project_camera(project)
+        scene_summary = project.workflow.scene_summary
         scene_asset_id = project.scene_ply_asset_id or project.scene_ply
+        if project.project_id != candidate_request.expected_project_id:
+            raise ApiError(
+                409,
+                code="project_context_changed",
+                category="conflict",
+                message="The active project changed before target ground fitting.",
+            )
         if (
             preview is None
+            or camera_state is None
             or camera is None
+            or scene_summary is None
             or scene_asset_id is None
-            or preview.artifact_id != anchor.preview_artifact_id
-            or preview.camera_revision != anchor.camera_revision
-            or preview.pick_buffer_revision != anchor.pick_buffer_revision
-            or project.workflow.confirmed_camera_revision != anchor.camera_revision
-            or project.workflow.confirmed_preview_artifact_id
-            != anchor.preview_artifact_id
+            or preview.artifact_id != candidate_request.preview_artifact_id
+            or preview.camera_revision != candidate_request.camera_revision
+            or preview.pick_buffer_revision != candidate_request.pick_buffer_revision
         ):
             raise ApiError(
                 409,
-                code="stale_ground_pick_buffer",
+                code="stale_ground_preview",
                 category="conflict",
-                message="Freeze and confirm one exploration frame before selecting all three ground points.",
+                message="Regenerate the current exploration preview before fitting the ground.",
             )
-        if any(x >= preview.width or y >= preview.height for x, y in anchor.points):
+        hints = tuple(
+            (point[0], point[1]) for point in candidate_request.hints
+        )
+        if any(x >= preview.width or y >= preview.height for x, y in hints):
             raise ApiError(
                 422,
-                code="ground_point_outside_image",
+                code="ground_hint_outside_image",
                 category="validation",
-                message="All local ground points must lie inside the frozen preview.",
+                message="All three ground hints must lie inside the current preview.",
             )
         buffer = _preview_artifacts(request).pick_buffer(preview.artifact_id)
-        depths = [float(buffer.expected_depth[y, x]) for x, y in anchor.points]
-        if any(not np.isfinite(depth) or depth <= 0 for depth in depths):
-            raise ApiError(
-                422,
-                code="invalid_ground_depth",
-                category="render",
-                message="All local ground points require valid scene depth.",
-            )
-        if max(depths) / min(depths) > 4.0:
-            raise ApiError(
-                422,
-                code="ground_depth_discontinuity",
-                category="validation",
-                message="The selected points cross a large depth discontinuity.",
-            )
-        world_points = tuple(
-            _unproject(camera, x, y, depth, preview.width, preview.height)
-            for (x, y), depth in zip(anchor.points, depths, strict=True)
-        )
-        camera_position = camera.camera_to_world()[:3, 3]
-        edge_lengths = (
-            np.linalg.norm(np.asarray(world_points[1]) - np.asarray(world_points[0])),
-            np.linalg.norm(np.asarray(world_points[2]) - np.asarray(world_points[1])),
-            np.linalg.norm(np.asarray(world_points[0]) - np.asarray(world_points[2])),
-        )
-        reference_distance = float(
-            np.median(
-                [
-                    np.linalg.norm(np.asarray(point) - camera_position)
-                    for point in world_points
-                ]
-            )
-        )
-        if max(edge_lengths) > 1.5 * reference_distance:
-            raise ApiError(
-                422,
-                code="ground_triangle_too_large",
-                category="validation",
-                message="Choose three points on a smaller local support-plane region.",
-            )
+        scene_path, _scene_reference = _scene_input(services, project)
         try:
-            ground = LocalGroundPlane.from_points(
-                p0=world_points[0],
-                p1=world_points[1],
-                p2=world_points[2],
-                reference_camera_position=camera_position,
+            scene = load_gaussian_ply(scene_path)
+            scales = np.exp(scene.scales.astype(np.float64))
+            logits = np.clip(scene.opacities.astype(np.float64), -80.0, 80.0)
+            opacities = 1.0 / (1.0 + np.exp(-logits))
+            fitted = fit_ground_from_gaussians(
+                means_world=scene.means,
+                scales_world=scales,
+                opacities=opacities,
+                camera_to_world=camera.camera_to_world(),
+                intrinsics=camera.intrinsics(preview.width, preview.height),
+                pick_buffer=buffer,
+                hints=cast(
+                    tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
+                    hints,
+                ),
             )
-        except ValueError as error:
+        except (OSError, ValueError) as error:
             raise ApiError(
                 422,
-                code="invalid_local_ground",
+                code="target_ground_fit_failed",
                 category="validation",
                 message=str(error),
+                retryable=True,
             ) from error
-        normal = -ground.normal if anchor.flip_normal else ground.normal
         fingerprint = _camera_fingerprint(
             camera,
             preview_artifact_id=preview.artifact_id,
             camera_revision=preview.camera_revision,
             pick_buffer_revision=preview.pick_buffer_revision,
         )
-        scene_authority = project.workflow.scene_summary
+        preview_authority = preview.model_copy(deep=True)
+        camera_authority = camera_state.model_copy(deep=True)
+        scene_authority = scene_summary.model_copy(deep=True)
 
         def persist(latest: Project) -> None:
-            latest_preview = latest.workflow.preview
             if (
-                latest.project_id != anchor.expected_project_id
+                latest.project_id != candidate_request.expected_project_id
                 or (latest.scene_ply_asset_id or latest.scene_ply) != scene_asset_id
                 or latest.workflow.scene_summary != scene_authority
-                or latest_preview != preview
-                or latest.workflow.confirmed_camera_revision != anchor.camera_revision
-                or latest.workflow.confirmed_preview_artifact_id
-                != anchor.preview_artifact_id
+                or latest.workflow.preview != preview_authority
+                or (latest.workflow.exploration_camera or latest.workflow.target_camera)
+                != camera_authority
             ):
                 raise ApiError(
                     409,
-                    code="stale_ground_pick_buffer",
+                    code="stale_ground_preview",
                     category="conflict",
-                    message="The frozen exploration authority changed while calibrating local ground.",
+                    message="The scene or exploration preview changed during ground fitting.",
                 )
-            revision = latest.workflow.local_ground_generation + 1
-            latest.workflow.local_ground_generation = revision
-            latest.workflow.local_ground_anchor = LocalGroundAnchor(
+            revision = latest.workflow.target_ground_generation + 1
+            latest.workflow.target_ground_generation = revision
+            p0, p1, p2 = fitted.refined_points
+            latest.workflow.target_ground = TargetGroundState(
                 scene_asset_id=scene_asset_id,
-                p0_world=world_points[0],
-                p1_world=world_points[1],
-                p2_world=world_points[2],
-                plane_normal=(float(normal[0]), float(normal[1]), float(normal[2])),
-                plane_offset=-float(np.dot(normal, np.asarray(world_points[0]))),
-                frozen_camera_to_world=_matrix_tuple(camera.camera_to_world()),
-                frozen_camera_fingerprint=fingerprint,
+                hint_pixels=cast(
+                    tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
+                    hints,
+                ),
+                p0_world=p0,
+                p1_world=p1,
+                p2_world=p2,
+                plane_normal=fitted.plane_normal,
+                plane_offset=fitted.plane_offset,
+                exploration_camera_to_world=_matrix_tuple(camera.camera_to_world()),
+                camera_fingerprint=fingerprint,
                 preview_artifact_id=preview.artifact_id,
                 camera_revision=preview.camera_revision,
                 pick_buffer_revision=preview.pick_buffer_revision,
+                support_counts=fitted.support_counts,
+                weighted_inlier_ratio=fitted.weighted_inlier_ratio,
+                rms_residual=fitted.rms_residual,
+                confidence=fitted.confidence,
                 revision=revision,
+                confirmed=False,
             )
-            latest.workflow.synthesis_placement = None
-            latest.workflow.confirmed_synthesis_placement_revision = None
             latest.workflow.export_result = None
-            invalidate_for_change(latest, ChangeKind.TARGET_CAMERA)
-
-        return await asyncio.to_thread(repository.update, persist)
-
-    @protected.put(
-        "/api/v1/projects/current/synthesis-placement",
-        response_model=Project,
-    )
-    async def solve_synthesis_placement(
-        request: Request,
-        placement_request: SynthesisPlacementRequest,
-    ) -> Project:
-        repository = _services(request).project_repository
-
-        def persist(project: Project) -> None:
-            calibration = project.workflow.source_perspective_calibration
-            anchor = project.workflow.local_ground_anchor
-            if (
-                project.project_id != placement_request.expected_project_id
-                or calibration is None
-                or anchor is None
-                or calibration.revision
-                != placement_request.source_calibration_revision
-                or anchor.revision != placement_request.ground_anchor_revision
-            ):
-                raise ApiError(
-                    409,
-                    code="synthesis_authority_changed",
-                    category="conflict",
-                    message="The source calibration or local ground changed before placement was solved.",
-                )
-            contact = project.workflow.subject_contact_constraint
-            if placement_request.mode == "contact" and (
-                contact is None
-                or placement_request.foot_pixel is None
-                or contact.source_asset_id != calibration.source_asset_id
-                or contact.ingest_cache_key != calibration.ingest_cache_key
-                or contact.segment_cache_key != calibration.segment_cache_key
-                or contact.source_calibration_revision != calibration.revision
-                or contact.anchor_frame_index != calibration.anchor_frame_index
-                or contact.foot_pixel != tuple(placement_request.foot_pixel)
-            ):
-                raise ApiError(
-                    409,
-                    code="source_contact_not_confirmed",
-                    category="conflict",
-                    message="Explicitly confirm the foot point on the current source anchor frame.",
-                )
-            try:
-                source = SourcePerspective(
-                    width=calibration.image_width,
-                    height=calibration.image_height,
-                    fov_y_degrees=calibration.vertical_fov,
-                    up_camera=np.asarray(
-                        calibration.gravity_direction_camera, dtype=np.float64
-                    ),
-                    horizon_line=np.asarray(calibration.horizon_line, dtype=np.float64),
-                )
-                ground = LocalGroundPlane.from_points(
-                    p0=anchor.p0_world,
-                    p1=anchor.p1_world,
-                    p2=anchor.p2_world,
-                    reference_camera_position=np.asarray(anchor.frozen_camera_to_world)[:3, 3],
-                )
-                if np.dot(ground.normal, np.asarray(anchor.plane_normal)) < 0:
-                    ground = LocalGroundPlane(
-                        p0=ground.p0,
-                        p1=ground.p1,
-                        p2=ground.p2,
-                        normal=-ground.normal,
-                        basis_u=ground.basis_u,
-                        basis_v=-ground.basis_v,
-                    )
-                rig = SynthesisCameraRig(
-                    ground=ground,
-                    source_perspective=source,
-                    reference_camera_to_world=np.asarray(
-                        anchor.frozen_camera_to_world, dtype=np.float64
-                    ),
-                )
-                if placement_request.mode == "contact":
-                    assert placement_request.foot_pixel is not None
-                    solved = rig.solve_contact(
-                        contact_pixel=(
-                            float(placement_request.foot_pixel[0]),
-                            float(placement_request.foot_pixel[1]),
-                        ),
-                        scene_azimuth_degrees=placement_request.scene_azimuth,
-                        subject_to_scene_scale=placement_request.subject_to_scene_scale,
-                    )
-                else:
-                    solved = rig.solve_perspective(
-                        scene_azimuth_degrees=placement_request.scene_azimuth,
-                        subject_to_scene_scale=placement_request.subject_to_scene_scale,
-                        composition_offset=(
-                            placement_request.composition_offset_local[0],
-                            placement_request.composition_offset_local[1],
-                        ),
-                    )
-            except ValueError as error:
-                raise ApiError(
-                    422,
-                    code="synthesis_constraints_unsatisfied",
-                    category="validation",
-                    message=str(error),
-                ) from error
-            authority_payload = {
-                "request": placement_request.model_dump(mode="json"),
-                "calibration": calibration.model_dump(mode="json"),
-                "ground": anchor.model_dump(mode="json"),
-            }
-            solver_cache_key = hashlib.sha256(
-                json.dumps(
-                    authority_payload, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8")
-            ).hexdigest()
-            revision = project.workflow.synthesis_placement_generation + 1
-            project.workflow.synthesis_placement_generation = revision
-            mode = SynthesisConstraintMode(placement_request.mode)
-            if mode is SynthesisConstraintMode.PERSPECTIVE:
-                project.workflow.subject_contact_constraint = None
-            project.workflow.synthesis_placement = SynthesisPlacement(
-                source_calibration_revision=calibration.revision,
-                ground_anchor_revision=anchor.revision,
-                source_contact_revision=(
-                    contact.revision
-                    if mode is SynthesisConstraintMode.CONTACT and contact is not None
-                    else None
-                ),
-                mode=mode,
-                scene_azimuth=placement_request.scene_azimuth,
-                subject_to_scene_scale=placement_request.subject_to_scene_scale,
-                composition_offset_local=(
-                    placement_request.composition_offset_local[0],
-                    placement_request.composition_offset_local[1],
-                ),
-                anchor_camera_to_world=_matrix_tuple(solved.camera_to_world()),
-                intrinsics=matrix3_tuple(source.intrinsics()),
-                solver_cache_key=solver_cache_key,
-                revision=revision,
-            )
-            project.workflow.confirmed_synthesis_placement_revision = None
-            project.workflow.export_result = None
-            invalidate_for_change(project, ChangeKind.TARGET_CAMERA)
+            invalidate_for_change(latest, ChangeKind.GS_ALIGNMENT)
 
         return await asyncio.to_thread(repository.update, persist)
 
     @protected.post(
-        "/api/v1/projects/current/synthesis-placement/confirm",
+        "/api/v1/projects/current/target-ground/confirm",
         response_model=Project,
     )
-    async def confirm_synthesis_placement(
+    async def confirm_target_ground(
         request: Request,
-        confirmation: SynthesisPlacementConfirmationRequest,
+        confirmation: TargetGroundConfirmationRequest,
     ) -> Project:
         repository = _services(request).project_repository
 
         def persist(project: Project) -> None:
-            placement = project.workflow.synthesis_placement
-            calibration = project.workflow.source_perspective_calibration
-            ground = project.workflow.local_ground_anchor
-            contact = project.workflow.subject_contact_constraint
+            candidate = project.workflow.target_ground
             if (
                 project.project_id != confirmation.expected_project_id
-                or placement is None
-                or placement.revision != confirmation.placement_revision
-                or calibration is None
-                or ground is None
-                or placement.source_calibration_revision != calibration.revision
-                or placement.ground_anchor_revision != ground.revision
-                or (
-                    placement.mode is SynthesisConstraintMode.CONTACT
-                    and (
-                        contact is None
-                        or placement.source_contact_revision != contact.revision
-                        or contact.source_calibration_revision != calibration.revision
-                    )
-                )
-                or (
-                    placement.mode is SynthesisConstraintMode.PERSPECTIVE
-                    and contact is not None
-                )
+                or candidate is None
+                or candidate.revision != confirmation.target_ground_revision
+                or candidate.scene_asset_id
+                != (project.scene_ply_asset_id or project.scene_ply)
             ):
                 raise ApiError(
                     409,
-                    code="stale_synthesis_placement",
+                    code="stale_target_ground_candidate",
                     category="conflict",
-                    message="Solve the current placement before confirming it.",
+                    message="Fit a current target-ground candidate before confirming it.",
                 )
-            project.workflow.confirmed_synthesis_placement_revision = placement.revision
+            project.workflow.target_ground = candidate.model_copy(
+                update={"confirmed": True}
+            )
+            project.workflow.export_result = None
+            invalidate_for_change(project, ChangeKind.GS_ALIGNMENT)
 
         return await asyncio.to_thread(repository.update, persist)
-
-    @protected.post(
-        "/api/v1/projects/current/pick", response_model=PickResponse
-    )
-    async def pick_foot_point(
-        request: Request, pick: PickRequest
-    ) -> PickResponse:
-        repository = _services(request).project_repository
-        project = _load_project(repository)
-        preview = project.workflow.preview
-        camera_state = (
-            project.workflow.exploration_camera
-            or project.workflow.target_camera
-        )
-        scene_path = project.scene_ply_asset_id or project.scene_ply
-        scene_authority = project.workflow.scene_summary
-        preview_epoch = project.workflow.preview_epoch
-        if (
-            preview is None
-            or camera_state is None
-            or scene_path is None
-            or scene_authority is None
-            or preview.artifact_id != pick.preview_artifact_id
-            or preview.camera_revision != pick.camera_revision
-            or preview.pick_buffer_revision != pick.pick_buffer_revision
-        ):
-            raise ApiError(
-                409,
-                code="stale_pick_buffer",
-                category="conflict",
-                message="Regenerate the preview before choosing a foot point.",
-            )
-        if (
-            project.workflow.confirmed_camera_revision != pick.camera_revision
-            or project.workflow.confirmed_preview_artifact_id
-            != pick.preview_artifact_id
-        ):
-            raise ApiError(
-                409,
-                code="camera_not_confirmed",
-                category="conflict",
-                message="Confirm the current camera before choosing a foot point.",
-            )
-        if pick.x >= preview.width or pick.y >= preview.height:
-            raise ApiError(
-                422,
-                code="pick_outside_image",
-                category="validation",
-                message="The selected point is outside the preview image.",
-            )
-        buffer = _preview_artifacts(request).pick_buffer(preview.artifact_id)
-        depth = float(buffer.expected_depth[pick.y, pick.x])
-        if not (depth > 0.0 and depth < float("inf")):
-            raise ApiError(
-                422,
-                code="invalid_pick_depth",
-                category="render",
-                message="Choose a point with valid scene depth.",
-            )
-        camera = (
-            MatrixCamera(
-                camera_to_world_matrix=np.asarray(
-                    camera_state.camera_to_world, dtype=np.float64
-                ),
-                fov_y_degrees=camera_state.fov_y_degrees,
-            )
-            if isinstance(camera_state, ExplorationCameraPose)
-            else OrbitCamera(
-                target=camera_state.target,
-                distance=camera_state.distance,
-                yaw=camera_state.yaw,
-                pitch=camera_state.pitch,
-                fov_y_degrees=camera_state.fov_y_degrees,
-            )
-        )
-        world = _unproject(
-            camera, pick.x, pick.y, depth, preview.width, preview.height
-        )
-        foot = FootPointState(
-            image=(pick.x, pick.y),
-            world=world,
-            preview_artifact_id=pick.preview_artifact_id,
-            camera_revision=pick.camera_revision,
-            pick_buffer_revision=pick.pick_buffer_revision,
-        )
-
-        def persist(latest: Project) -> None:
-            latest_preview = latest.workflow.preview
-            if (
-                latest_preview is None
-                or (latest.scene_ply_asset_id or latest.scene_ply) != scene_path
-                or latest.workflow.scene_summary != scene_authority
-                or latest.workflow.preview_epoch != preview_epoch
-                or latest_preview.artifact_id != pick.preview_artifact_id
-                or latest_preview.camera_revision != pick.camera_revision
-                or latest_preview.pick_buffer_revision
-                != pick.pick_buffer_revision
-            ):
-                raise ApiError(
-                    409,
-                    code="stale_pick_buffer",
-                    category="conflict",
-                    message="Regenerate the preview before choosing a foot point.",
-                )
-            if (
-                latest.workflow.confirmed_camera_revision != pick.camera_revision
-                or latest.workflow.confirmed_preview_artifact_id
-                != pick.preview_artifact_id
-            ):
-                raise ApiError(
-                    409,
-                    code="camera_not_confirmed",
-                    category="conflict",
-                    message="Confirm the current camera before choosing a foot point.",
-                )
-            latest.workflow.foot_point = foot
-            latest.workflow.export_result = None
-            invalidate_for_change(latest, ChangeKind.TARGET_CAMERA)
-
-        await asyncio.to_thread(repository.update, persist)
-        return PickResponse.model_validate(foot.model_dump())
 
     @protected.post(
         "/api/v1/assets/import",

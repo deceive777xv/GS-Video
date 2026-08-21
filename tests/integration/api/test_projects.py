@@ -164,7 +164,7 @@ def test_project_patch_rejects_stale_project_and_ingest_context(
 
     stale_project = api_client.patch(
         "/api/v1/projects/current",
-        json={"expected_project_id": "stale-project", "motion_scale": 2},
+        json={"expected_project_id": "stale-project", "gs_scale": 2},
         headers=auth_headers,
     )
     stale_ingest = api_client.patch(
@@ -172,7 +172,7 @@ def test_project_patch_rejects_stale_project_and_ingest_context(
         json={
             "expected_project_id": current["project_id"],
             "expected_ingest_cache_key": "stale-ingest",
-            "motion_scale": 2,
+            "gs_scale": 2,
         },
         headers=auth_headers,
     )
@@ -181,7 +181,8 @@ def test_project_patch_rejects_stale_project_and_ingest_context(
         json={
             "expected_project_id": current["project_id"],
             "expected_ingest_cache_key": current["stages"].get("ingest", {}).get("cache_key"),
-            "motion_scale": 2,
+            "gs_scale": 2,
+            "output_crop": {"x": -320, "y": -180, "width": 2560, "height": 1440},
         },
         headers=auth_headers,
     )
@@ -191,7 +192,13 @@ def test_project_patch_rejects_stale_project_and_ingest_context(
     assert stale_ingest.status_code == 409
     assert stale_ingest.json()["code"] == "project_context_changed"
     assert accepted.status_code == 200
-    assert accepted.json()["workflow"]["motion_scale"] == 2
+    assert accepted.json()["workflow"]["gs_scale"] == 2
+    assert accepted.json()["workflow"]["output_crop"] == {
+        "x": -320,
+        "y": -180,
+        "width": 2560,
+        "height": 1440,
+    }
 
 
 def test_local_asset_import_copies_into_project_source(

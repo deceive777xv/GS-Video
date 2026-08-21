@@ -36,6 +36,7 @@ def runtime_payload(workspace: Path) -> dict[str, object]:
         "segmentation_worker_prefix": [str(worker)],
         "segmentation_model_config": str(model_root / "segment.yaml"),
         "segmentation_checkpoint": str(model_root / "segment.pt"),
+        "camera_worker_prefix": [str(worker)],
         "renderer_worker_prefix": [str(worker)],
         "renderer_sh_degree": 3,
         "available_vram_limit_mb": 8192,

@@ -36,7 +36,7 @@ from gs_video.environment.vram import (
 from gs_video.resource_admission import fits_vram_budget
 from gs_video.pipeline.artifacts import validate_cache_key
 from gs_video.scene.camera import OrbitCamera, matrix4_tuple
-from gs_video.scene.synthesis_camera import MatrixCamera
+from gs_video.scene.camera import MatrixCamera
 from gs_video.scene.gsplat_renderer import GsplatRenderer
 from gs_video.scene.ply import load_gaussian_ply
 from gs_video.scene.preview_session import (
@@ -54,10 +54,6 @@ from gs_video.scene.worker_protocol import (
 )
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.segmentation.paths import has_reparse_component
-from gs_video.segmentation.visibility_audit import (
-    VisibilityAuditResult,
-    audit_visibility_mask_paths,
-)
 
 
 MAX_PREVIEW_ARTIFACT_BYTES = 16 * 1024 * 1024
@@ -225,6 +221,12 @@ def validate_pick_buffer(
         and buffer.expected_depth.flags.c_contiguous
         and np.isfinite(buffer.expected_depth).all()
         and np.all(buffer.expected_depth >= 0.0)
+        and isinstance(buffer.opacity, np.ndarray)
+        and buffer.opacity.shape == (height, width)
+        and buffer.opacity.dtype == np.float32
+        and buffer.opacity.flags.c_contiguous
+        and np.isfinite(buffer.opacity).all()
+        and np.all((buffer.opacity >= 0.0) & (buffer.opacity <= 1.0))
     )
     if not valid:
         raise ApiError(
@@ -597,19 +599,6 @@ def validate_subject_prompt(
             message="Choose a point inside an available decoded proxy frame.",
             retryable=True,
         ) from error
-
-
-def audit_subject_visibility(
-    project: Project,
-    project_root: Path,
-) -> VisibilityAuditResult:
-    definition = _SUBJECT_MEDIA_DEFINITIONS[SubjectMediaRole.ALPHA]
-    artifact_root, inventory = _subject_artifact_inventory(
-        project, project_root, definition
-    )
-    return audit_visibility_mask_paths(
-        artifact_root / item.name for item in inventory
-    )
 
 
 class PreviewServiceLike(Protocol):

@@ -11,7 +11,7 @@ from PIL import Image
 import pytest
 
 from gs_video.camera.classify import CameraKind
-from gs_video.camera.opencv_solver import CameraSolution
+from gs_video.camera.solution import CameraSolution, SourceGroundEstimate
 from gs_video.camera.serialization import (
     MappedTrajectory,
     read_camera_solution,
@@ -30,16 +30,14 @@ from gs_video.domain.models import (
     ArtifactCategory,
     ArtifactRef,
     ArtifactRole,
-    LocalGroundAnchor,
+    OutputCropState,
     Project,
     SceneSummary,
-    SourcePerspectiveCalibration,
     StageName,
     StageState,
     StageStatus,
     SubjectPromptState,
-    SynthesisConstraintMode,
-    SynthesisPlacement,
+    TargetGroundState,
     VideoSummary,
 )
 from gs_video.media.export import ExportResult
@@ -55,6 +53,7 @@ from gs_video.pipeline.services import (
     TrajectoryMapWorkflowService,
     WorkflowPaths,
     _frame_inventory,
+    _place_source_in_output,
     _preview_size,
     _sha256,
 )
@@ -442,9 +441,13 @@ class FakeSolver:
     def solve(
         self,
         frame_paths: list[Path] | tuple[Path, ...],
+        mask_paths: list[Path] | tuple[Path, ...],
+        output_dir: Path,
         emit: ProgressEmitter,
         token: CancellationToken,
     ) -> CameraSolution:
+        assert len(mask_paths) == len(frame_paths)
+        (output_dir / "depth.zip").write_bytes(b"fake-depth")
         poses = []
         for index, _path in enumerate(frame_paths, start=1):
             token.raise_if_cancelled()
@@ -459,6 +462,14 @@ class FakeSolver:
             CameraKind.SIX_DOF,
             0.9,
             {"backend": "fake"},
+            source_ground=SourceGroundEstimate(
+                normal=(0.0, 1.0, 0.0),
+                offset=0.0,
+                anchor_frame_index=0,
+                confidence=0.9,
+                support_ratio=0.8,
+                rms_residual=0.01,
+            ),
         )
 
 
@@ -466,11 +477,28 @@ class ReplacingSolver(FakeSolver):
     def solve(
         self,
         frame_paths: list[Path] | tuple[Path, ...],
+        mask_paths: list[Path] | tuple[Path, ...],
+        output_dir: Path,
         emit: ProgressEmitter,
         token: CancellationToken,
     ) -> CameraSolution:
         replace_rgb_with_same_size(frame_paths[0], 200)
-        return super().solve(frame_paths, emit, token)
+        return super().solve(frame_paths, mask_paths, output_dir, emit, token)
+
+
+def camera_inputs_succeeded(root: Path) -> Project:
+    project = ingest_succeeded(source_project(root), root)
+    project.workflow.subject_prompt = SubjectPromptState(frame_index=0, x=1, y=1)
+    result = SegmentWorkflowService(WorkflowPaths(root), FakeSegmenter(root)).run(
+        project, CancellationToken(), discard_progress
+    )
+    project.stages[StageName.SEGMENT] = StageState(
+        status=StageStatus.SUCCEEDED,
+        cache_key=result.cache_key,
+        output_paths=result.output_paths,
+        artifacts=result.artifacts,
+    )
+    return project
 
 
 def test_custom_solver_requires_explicit_backend_identity(tmp_path: Path) -> None:
@@ -479,7 +507,7 @@ def test_custom_solver_requires_explicit_backend_identity(tmp_path: Path) -> Non
 
 
 def test_camera_solver_publishes_serialized_solution(tmp_path: Path) -> None:
-    project = ingest_succeeded(source_project(tmp_path), tmp_path)
+    project = camera_inputs_succeeded(tmp_path)
     service = CameraSolveWorkflowService(
         WorkflowPaths(tmp_path), FakeSolver(), backend_identity="fake-opencv-1"
     )
@@ -496,7 +524,7 @@ def test_camera_solver_publishes_serialized_solution(tmp_path: Path) -> None:
 
 
 def test_camera_cache_hit_revalidates_pose_count(tmp_path: Path) -> None:
-    project = ingest_succeeded(source_project(tmp_path), tmp_path)
+    project = camera_inputs_succeeded(tmp_path)
     service = CameraSolveWorkflowService(
         WorkflowPaths(tmp_path), FakeSolver(), backend_identity="fake-opencv-1"
     )
@@ -521,7 +549,7 @@ def test_camera_cache_hit_revalidates_pose_count(tmp_path: Path) -> None:
 def test_camera_solver_rejects_proxy_replacement_before_publication(
     tmp_path: Path,
 ) -> None:
-    project = ingest_succeeded(source_project(tmp_path), tmp_path)
+    project = camera_inputs_succeeded(tmp_path)
 
     with pytest.raises(RepairableError, match="代理|authority|变化|fingerprint"):
         CameraSolveWorkflowService(
@@ -538,7 +566,11 @@ def camera_succeeded(project: Project, root: Path, cache_key: str = key("c")) ->
     camera_dir = root / "camera" / cache_key
     camera_dir.mkdir(parents=True, exist_ok=True)
     write_camera_solution(camera_dir / "solution.json", FakeSolver().solve(
-        [Path("1"), Path("2"), Path("3")], discard_progress, CancellationToken()
+        [Path("1"), Path("2"), Path("3")],
+        [Path("1"), Path("2"), Path("3")],
+        camera_dir,
+        discard_progress,
+        CancellationToken(),
     ))
     project.stages[StageName.SOLVE_CAMERA] = StageState(
         status=StageStatus.SUCCEEDED,
@@ -554,51 +586,28 @@ def camera_succeeded(project: Project, root: Path, cache_key: str = key("c")) ->
 
 def authorize_mapping(project: Project) -> None:
     project.scene_ply = "source/scene.ply"
-    project.stages[StageName.SEGMENT] = StageState(
-        status=StageStatus.SUCCEEDED,
-        cache_key=key("b"),
-    )
-    project.workflow.source_perspective_calibration = SourcePerspectiveCalibration(
-        source_asset_id="source/source.mp4",
-        ingest_cache_key=key("a"),
-        segment_cache_key=key("b"),
-        anchor_frame_index=0,
-        image_width=8,
-        image_height=6,
-        vertical_fov=55,
-        horizon_line=(0.0, 1.0, -3.0),
-        gravity_direction_camera=(0.0, -1.0, 0.0),
-        revision=2,
-    )
     identity = tuple(tuple(float(value) for value in row) for row in np.eye(4))
-    project.workflow.local_ground_anchor = LocalGroundAnchor(
+    project.workflow.target_ground = TargetGroundState(
         scene_asset_id="source/scene.ply",
+        hint_pixels=((1, 1), (2, 1), (1, 2)),
         p0_world=(0.0, 0.0, 0.0),
-        p1_world=(1.0, 0.0, 0.0),
-        p2_world=(0.0, 0.0, 1.0),
-        plane_normal=(0.0, -1.0, 0.0),
+        p1_world=(0.0, 0.0, 1.0),
+        p2_world=(1.0, 0.0, 0.0),
+        plane_normal=(0.0, 1.0, 0.0),
         plane_offset=0.0,
-        frozen_camera_to_world=identity,
-        frozen_camera_fingerprint="camera-fingerprint",
+        exploration_camera_to_world=identity,
+        camera_fingerprint=key("d"),
         preview_artifact_id="preview-2",
         camera_revision=2,
         pick_buffer_revision=4,
+        support_counts=(20, 20, 20),
+        weighted_inlier_ratio=0.9,
+        rms_residual=0.01,
+        confidence=0.9,
         revision=3,
+        confirmed=True,
     )
-    project.workflow.synthesis_placement = SynthesisPlacement(
-        source_calibration_revision=2,
-        ground_anchor_revision=3,
-        mode=SynthesisConstraintMode.PERSPECTIVE,
-        scene_azimuth=0.0,
-        subject_to_scene_scale=1.0,
-        composition_offset_local=(0.0, 0.0),
-        anchor_camera_to_world=identity,
-        intrinsics=((5.0, 0.0, 4.0), (0.0, 5.0, 3.0), (0.0, 0.0, 1.0)),
-        solver_cache_key=key("f"),
-        revision=4,
-    )
-    project.workflow.confirmed_synthesis_placement_revision = 4
-    project.workflow.motion_scale = 0.5
+    project.workflow.gs_scale = 0.5
 
 
 def test_trajectory_mapper_requires_and_serializes_single_preview_authority(
@@ -619,7 +628,9 @@ def test_trajectory_mapper_requires_and_serializes_single_preview_authority(
         "trajectory.json",
     )
     mapped = read_mapped_trajectory(artifact_path(tmp_path, relative))
-    assert mapped.fov_y_degrees == 55
+    assert mapped.fov_y_degrees == pytest.approx(90)
+    assert mapped.source_size == (8, 6)
+    assert mapped.frame_intrinsics is not None
     assert len(mapped.camera_to_world) == 3
     assert np.linalg.norm(
         mapped.camera_to_world[1][:3, 3] - mapped.camera_to_world[0][:3, 3]
@@ -629,8 +640,8 @@ def test_trajectory_mapper_requires_and_serializes_single_preview_authority(
 def test_trajectory_mapper_rejects_mismatched_placement_authority(tmp_path: Path) -> None:
     project = camera_succeeded(source_project(tmp_path), tmp_path)
     authorize_mapping(project)
-    assert project.workflow.synthesis_placement is not None
-    project.workflow.synthesis_placement.ground_anchor_revision = 2
+    assert project.workflow.target_ground is not None
+    project.workflow.target_ground.scene_asset_id = "another-scene"
 
     with pytest.raises(RepairableError, match="authority|授权|预览"):
         TrajectoryMapWorkflowService(WorkflowPaths(tmp_path)).run(
@@ -667,13 +678,11 @@ def test_trajectory_rejects_camera_replacement_during_mapping(
             ArtifactRole.CAMERA_SOLUTION
         ],
     )
-    original_map = workflow_services.map_trajectory
+    original_map = workflow_services.map_ground_aligned_trajectory
 
     def replacing_map(
         solution: CameraSolution,
-        target_camera_to_world: np.ndarray,
-        translation_scale: float,
-        anchor_frame_index: int = 0,
+        **kwargs: object,
     ) -> tuple[np.ndarray, ...]:
         replacement = solution_path.with_name("replacement.json")
         restored = read_camera_solution(solution_path)
@@ -685,18 +694,17 @@ def test_trajectory_rejects_camera_replacement_during_mapping(
                 restored.kind,
                 0.8,
                 restored.diagnostics,
+                frame_intrinsics=restored.frame_intrinsics,
+                source_ground=restored.source_ground,
             ),
         )
         assert replacement.stat().st_size == solution_path.stat().st_size
         replacement.replace(solution_path)
-        return original_map(
-            solution,
-            target_camera_to_world,
-            translation_scale,
-            anchor_frame_index,
-        )
+        return tuple(original_map(solution, **kwargs))
 
-    monkeypatch.setattr(workflow_services, "map_trajectory", replacing_map)
+    monkeypatch.setattr(
+        workflow_services, "map_ground_aligned_trajectory", replacing_map
+    )
 
     with pytest.raises(RepairableError, match="相机|authority|变化|摘要"):
         TrajectoryMapWorkflowService(WorkflowPaths(tmp_path)).run(
@@ -737,6 +745,7 @@ class MismatchedRendererWorker:
 class CpuFakeRendererWorker:
     def __init__(self) -> None:
         self.requests: list[RenderSequenceRequest] = []
+        self.trajectories: list[MappedTrajectory] = []
 
     def probe(
         self, *, token: CancellationToken | None = None
@@ -758,6 +767,7 @@ class CpuFakeRendererWorker:
         self.requests.append(request)
         request.output_dir.mkdir()
         trajectory = read_mapped_trajectory(request.camera_manifest)
+        self.trajectories.append(trajectory)
         source_indices = tuple(
             range(0, len(trajectory.camera_to_world), request.preview_stride)
         )
@@ -807,6 +817,44 @@ def test_renderer_service_orchestrates_cpu_adapter_and_registers_artifacts(
     assert events == [(1, 1, "cpu fake render 1/1")]
 
 
+def test_renderer_extends_beyond_observed_raster_by_shifting_vipe_principal_point(
+    tmp_path: Path,
+) -> None:
+    project = renderer_project(tmp_path)
+    project.workflow.output_crop = OutputCropState(
+        x=-2, y=-2, width=12, height=10
+    )
+    worker = CpuFakeRendererWorker()
+
+    RendererWorkflowService(WorkflowPaths(tmp_path), worker).run(
+        project, "final", CancellationToken(), discard_progress
+    )
+
+    assert (worker.requests[0].width, worker.requests[0].height) == (12, 10)
+    rendered_trajectory = worker.trajectories[0]
+    assert rendered_trajectory.source_size == (12, 10)
+    assert rendered_trajectory.frame_intrinsics is not None
+    assert rendered_trajectory.frame_intrinsics[0][0, 2] == pytest.approx(6.0)
+    assert rendered_trajectory.frame_intrinsics[0][1, 2] == pytest.approx(5.0)
+
+
+def test_foreground_alpha_is_padded_transparently_when_crop_exceeds_source() -> None:
+    foreground = np.full((2, 4, 3), 127, dtype=np.uint8)
+    alpha = np.full((2, 4), 255, dtype=np.uint8)
+
+    canvas, alpha_canvas = _place_source_in_output(
+        foreground,
+        alpha,
+        OutputCropState(x=-2, y=0, width=8, height=2),
+    )
+
+    assert np.all(canvas[:, :2] == 0)
+    assert np.all(alpha_canvas[:, :2] == 0)
+    assert np.all(canvas[:, 2:6] == 127)
+    assert np.all(alpha_canvas[:, 2:6] == 255)
+    assert np.all(alpha_canvas[:, 6:] == 0)
+
+
 def renderer_project(root: Path) -> Project:
     project = source_project(root, frame_count=1)
     scene = root / "source" / "scene.ply"
@@ -824,7 +872,14 @@ def renderer_project(root: Path) -> Project:
     trajectory.parent.mkdir(parents=True)
     write_mapped_trajectory(
         trajectory,
-        MappedTrajectory(55.0, (np.eye(4, dtype=np.float64),)),
+        MappedTrajectory(
+            55.0,
+            (np.eye(4, dtype=np.float64),),
+            frame_intrinsics=(
+                np.array([[6.0, 0.0, 4.0], [0.0, 6.0, 3.0], [0.0, 0.0, 1.0]]),
+            ),
+            source_size=(8, 6),
+        ),
     )
     project.stages[StageName.MAP_TRAJECTORY] = StageState(
         status=StageStatus.SUCCEEDED,

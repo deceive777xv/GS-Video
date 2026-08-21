@@ -84,6 +84,7 @@ class RenderSequence:
 class PickBuffer:
     rgb: npt.NDArray[np.uint8]
     expected_depth: npt.NDArray[np.float32]
+    opacity: npt.NDArray[np.float32]
 
 
 class SceneRenderer(Protocol):

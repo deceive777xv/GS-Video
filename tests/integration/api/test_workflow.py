@@ -5,7 +5,6 @@ import hashlib
 from pathlib import Path
 from threading import Event
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
 
 import numpy as np
 import pytest
@@ -23,14 +22,12 @@ from gs_video.domain.models import (
     ArtifactRole,
     CameraPose,
     ExportResultState,
-    FootPointState,
     PreviewState,
     StageName,
     StageState,
     StageStatus,
     SubjectPromptState,
     SceneSummary,
-    VideoSummary,
 )
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.media.ffmpeg import VideoMetadata
@@ -38,6 +35,7 @@ from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter, discard_progress
 from gs_video.project.repository import ProjectRepository
 from gs_video.scene.camera import OrbitCamera
+from gs_video.scene.ground_fit import GroundFitCandidate
 
 
 TOKEN = "workflow-session-token"
@@ -124,7 +122,11 @@ class PreviewService:
         self.cameras.append(camera)
         rgb = np.full((height, width, 3), 96, dtype=np.uint8)
         depth = np.full((height, width), 2.0, dtype=np.float32)
-        return PickBuffer(rgb=rgb, expected_depth=depth)
+        return PickBuffer(
+            rgb=rgb,
+            expected_depth=depth,
+            opacity=np.ones((height, width), dtype=np.float32),
+        )
 
 
 class ExportInspector:
@@ -262,6 +264,90 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
         yield client
 
 
+def test_three_viewport_hints_fit_one_confirmable_target_ground_without_camera_freeze(
+    workflow_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = workflow_client.get(
+        "/api/v1/projects/current",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    ).json()
+    preview = workflow_client.post(
+        "/api/v1/projects/current/preview",
+        json={
+            "expected_project_id": project["project_id"],
+            "generation": 1,
+            "width": 16,
+            "height": 9,
+            "camera": {
+                "camera_to_world": [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, -2.0],
+                    [0.0, 0.0, 1.0, -5.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+                "fov_y_degrees": 60.0,
+            },
+        },
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    assert preview.status_code == 201, preview.text
+    descriptor = preview.json()
+
+    class Scene:
+        means = np.zeros((12, 3), dtype=np.float32)
+        scales = np.zeros((12, 3), dtype=np.float32)
+        opacities = np.zeros(12, dtype=np.float32)
+
+    monkeypatch.setattr("gs_video.api.routes.load_gaussian_ply", lambda _path: Scene())
+    monkeypatch.setattr(
+        "gs_video.api.routes.fit_ground_from_gaussians",
+        lambda **_kwargs: GroundFitCandidate(
+            plane_normal=(0.0, -1.0, 0.0),
+            plane_offset=0.0,
+            refined_points=(
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 1.0),
+                (1.0, 0.0, 0.0),
+            ),
+            support_counts=(12, 11, 10),
+            weighted_inlier_ratio=0.86,
+            rms_residual=0.01,
+            confidence=0.82,
+        ),
+    )
+
+    fitted = workflow_client.put(
+        "/api/v1/projects/current/target-ground/candidate",
+        json={
+            "expected_project_id": project["project_id"],
+            "preview_artifact_id": descriptor["artifact_id"],
+            "camera_revision": descriptor["camera_revision"],
+            "pick_buffer_revision": descriptor["pick_buffer_revision"],
+            "hints": [[4, 7], [11, 7], [8, 5]],
+        },
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+
+    assert fitted.status_code == 200, fitted.text
+    candidate = fitted.json()["workflow"]["target_ground"]
+    assert candidate["confirmed"] is False
+    assert candidate["p0_world"] == [0.0, 0.0, 0.0]
+    assert candidate["support_counts"] == [12, 11, 10]
+
+    confirmed = workflow_client.post(
+        "/api/v1/projects/current/target-ground/confirm",
+        json={
+            "expected_project_id": project["project_id"],
+            "target_ground_revision": candidate["revision"],
+        },
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["workflow"]["target_ground"]["confirmed"] is True
+
+
 @pytest.fixture
 def auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {TOKEN}"}
@@ -274,7 +360,6 @@ def test_targeted_workflow_patch_persists_and_invalidates_only_downstream(
         "/api/v1/projects/current",
         json={
             "subject_prompt": {"frame_index": 4, "x": 10, "y": 5},
-            "motion_scale": 0.75,
         },
         headers=auth_headers,
     )
@@ -286,485 +371,10 @@ def test_targeted_workflow_patch_persists_and_invalidates_only_downstream(
         "x": 10,
         "y": 5,
     }
-    assert body["workflow"]["motion_scale"] == 0.75
     persisted = workflow_client.get(
         "/api/v1/projects/current", headers=auth_headers
     ).json()
     assert persisted["workflow"] == body["workflow"]
-
-
-def test_preview_and_pick_are_persisted_with_revision_guards(
-    workflow_client: TestClient, auth_headers: dict[str, str]
-) -> None:
-    project_id = workflow_client.get(
-        "/api/v1/projects/current", headers=auth_headers
-    ).json()["project_id"]
-    wrong_project = workflow_client.post(
-        "/api/v1/projects/current/preview",
-        json={
-            "expected_project_id": "stale-project",
-            "generation": 1,
-            "width": 16,
-            "height": 9,
-            "camera": {
-                "target": [0.0, 0.0, 0.0],
-                "distance": 4.0,
-                "yaw": 0.0,
-                "pitch": 0.0,
-                "fov_y_degrees": 60.0,
-            },
-        },
-        headers=auth_headers,
-    )
-    assert wrong_project.status_code == 409
-    assert wrong_project.json()["code"] == "project_context_changed"
-    preview = workflow_client.post(
-        "/api/v1/projects/current/preview",
-        json={
-            "expected_project_id": project_id,
-            "generation": 1,
-            "width": 16,
-            "height": 9,
-            "camera": {
-                "target": [0.0, 0.0, 0.0],
-                "distance": 4.0,
-                "yaw": 0.0,
-                "pitch": 0.0,
-                "fov_y_degrees": 60.0,
-            },
-        },
-        headers=auth_headers,
-    )
-
-    assert preview.status_code == 201
-    descriptor = preview.json()
-    assert descriptor["generation"] == 1
-    assert descriptor["width"] == 16
-    assert descriptor["height"] == 9
-    assert descriptor["camera_revision"] == 1
-    assert descriptor["pick_buffer_revision"] == 1
-    assert "path" not in descriptor
-
-    image = workflow_client.get(
-        f"/api/v1/projects/current/previews/{descriptor['artifact_id']}",
-        headers=auth_headers,
-    )
-    assert image.status_code == 200
-    assert image.headers["cache-control"] == "no-store"
-    assert image.headers["x-content-type-options"] == "nosniff"
-    assert image.headers["content-type"] == "image/png"
-
-    unconfirmed = workflow_client.post(
-        "/api/v1/projects/current/pick",
-        json={
-            "x": 8,
-            "y": 4,
-            "preview_artifact_id": descriptor["artifact_id"],
-            "camera_revision": descriptor["camera_revision"],
-            "pick_buffer_revision": descriptor["pick_buffer_revision"],
-        },
-        headers=auth_headers,
-    )
-    assert unconfirmed.status_code == 409
-    assert unconfirmed.json()["code"] == "camera_not_confirmed"
-
-    second = workflow_client.post(
-        "/api/v1/projects/current/preview",
-        json={
-            "expected_project_id": project_id,
-            "generation": 2,
-            "width": 16,
-            "height": 9,
-            "camera": {
-                "target": [0.0, 0.0, 0.0],
-                "distance": 4.0,
-                "yaw": 5.0,
-                "pitch": 0.0,
-                "fov_y_degrees": 60.0,
-            },
-        },
-        headers=auth_headers,
-    ).json()
-
-    wrong_confirmation = workflow_client.post(
-        "/api/v1/projects/current/camera/confirm",
-        json={
-            "expected_project_id": "stale-project",
-            "camera_revision": second["camera_revision"],
-        },
-        headers=auth_headers,
-    )
-    assert wrong_confirmation.status_code == 409
-    assert wrong_confirmation.json()["code"] == "project_context_changed"
-
-    confirmed = workflow_client.post(
-        "/api/v1/projects/current/camera/confirm",
-        json={
-            "expected_project_id": project_id,
-            "camera_revision": second["camera_revision"],
-        },
-        headers=auth_headers,
-    )
-    assert confirmed.status_code == 200
-    assert confirmed.json()["workflow"]["confirmed_camera_revision"] == 2
-
-    stale = workflow_client.post(
-        "/api/v1/projects/current/pick",
-        json={
-            "x": 8,
-            "y": 4,
-            "preview_artifact_id": descriptor["artifact_id"],
-            "camera_revision": descriptor["camera_revision"],
-            "pick_buffer_revision": descriptor["pick_buffer_revision"],
-        },
-        headers=auth_headers,
-    )
-    assert stale.status_code == 409
-    assert stale.json()["code"] == "stale_pick_buffer"
-
-    picked = workflow_client.post(
-        "/api/v1/projects/current/pick",
-        json={
-            "x": 8,
-            "y": 4,
-            "preview_artifact_id": second["artifact_id"],
-            "camera_revision": second["camera_revision"],
-            "pick_buffer_revision": second["pick_buffer_revision"],
-        },
-        headers=auth_headers,
-    )
-    assert picked.status_code == 200
-    assert picked.json()["camera_revision"] == 2
-    assert picked.json()["pick_buffer_revision"] == 2
-    assert len(picked.json()["world"]) == 3
-    project = workflow_client.get(
-        "/api/v1/projects/current", headers=auth_headers
-    ).json()
-    assert project["workflow"]["foot_point"] == picked.json()
-
-
-def test_constrained_camera_flow_binds_source_ground_and_placement_authority(
-    workflow_client: TestClient, auth_headers: dict[str, str]
-) -> None:
-    repository = workflow_client.app.state.services.project_repository
-
-    def add_source_summary(project):
-        project.workflow.source_summary = VideoSummary(
-            filename="video.mp4",
-            size=100,
-            sha256="a" * 64,
-            width=16,
-            height=9,
-            duration_seconds=1.0,
-            fps="5/1",
-            has_audio=False,
-            frame_count=5,
-        )
-
-    project = repository.update(add_source_summary)
-    invalid_perspective = workflow_client.put(
-        "/api/v1/projects/current/source-perspective",
-        json={
-            "expected_project_id": project.project_id,
-            "expected_segment_cache_key": SEGMENT_CACHE_KEY,
-            "anchor_frame_index": 2,
-            "image_width": 16,
-            "image_height": 9,
-            "evidence_method": "orthogonal_guides",
-            "reference_relation": "a_vertical_b_horizontal",
-            "group_a": [[[2.0, 1.0], [5.0, 2.0]], [[2.0, 4.0], [5.0, 5.0]]],
-            "group_b": [[[1.0, 2.0], [5.0, 2.0]], [[1.0, 5.0], [5.0, 5.0]]],
-        },
-        headers=auth_headers,
-    )
-    assert invalid_perspective.status_code == 422
-    assert invalid_perspective.json()["code"] == "invalid_perspective_reference"
-
-    mixed_evidence = workflow_client.put(
-        "/api/v1/projects/current/source-perspective",
-        json={
-            "expected_project_id": project.project_id,
-            "expected_segment_cache_key": SEGMENT_CACHE_KEY,
-            "anchor_frame_index": 2,
-            "image_width": 16,
-            "image_height": 9,
-            "evidence_method": "automatic_prior",
-            "prior_source": "centered_60_degree_default",
-            "reference_relation": "a_vertical_b_horizontal",
-            "group_a": [[[2.0, 1.0], [5.0, 2.0]], [[2.0, 4.0], [5.0, 5.0]]],
-            "group_b": [[[1.0, 2.0], [5.0, 2.0]], [[1.0, 5.0], [5.0, 5.0]]],
-        },
-        headers=auth_headers,
-    )
-    assert mixed_evidence.status_code == 422
-
-    calibrated = workflow_client.put(
-        "/api/v1/projects/current/source-perspective",
-        json={
-            "expected_project_id": project.project_id,
-            "expected_segment_cache_key": SEGMENT_CACHE_KEY,
-            "anchor_frame_index": 2,
-            "image_width": 16,
-            "image_height": 9,
-            "evidence_method": "automatic_prior",
-            "prior_source": "centered_60_degree_default",
-        },
-        headers=auth_headers,
-    )
-    assert calibrated.status_code == 200, calibrated.text
-    calibration = calibrated.json()["workflow"]["source_perspective_calibration"]
-    assert calibration["anchor_frame_index"] == 2
-    assert calibration["evidence_method"] == "automatic_prior"
-    assert calibration["evidence_confidence"] == "low"
-
-    camera_to_world = [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, -2.0],
-        [0.0, 0.0, 1.0, -5.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-    preview = workflow_client.post(
-        "/api/v1/projects/current/preview",
-        json={
-            "expected_project_id": project.project_id,
-            "generation": 1,
-            "width": 16,
-            "height": 9,
-            "camera": {
-                "camera_to_world": camera_to_world,
-                "fov_y_degrees": 60.0,
-            },
-        },
-        headers=auth_headers,
-    )
-    assert preview.status_code == 201, preview.text
-    descriptor = preview.json()
-    confirmed = workflow_client.post(
-        "/api/v1/projects/current/camera/confirm",
-        json={
-            "expected_project_id": project.project_id,
-            "camera_revision": descriptor["camera_revision"],
-        },
-        headers=auth_headers,
-    )
-    assert confirmed.status_code == 200
-
-    anchored = workflow_client.put(
-        "/api/v1/projects/current/local-ground",
-        json={
-            "expected_project_id": project.project_id,
-            "preview_artifact_id": descriptor["artifact_id"],
-            "camera_revision": descriptor["camera_revision"],
-            "pick_buffer_revision": descriptor["pick_buffer_revision"],
-            "points": [[4, 7], [11, 7], [8, 5]],
-            "flip_normal": False,
-        },
-        headers=auth_headers,
-    )
-    assert anchored.status_code == 200, anchored.text
-    ground = anchored.json()["workflow"]["local_ground_anchor"]
-    assert ground["revision"] == 1
-    assert ground["frozen_camera_to_world"] == camera_to_world
-
-    flipped = workflow_client.put(
-        "/api/v1/projects/current/local-ground",
-        json={
-            "expected_project_id": project.project_id,
-            "preview_artifact_id": descriptor["artifact_id"],
-            "camera_revision": descriptor["camera_revision"],
-            "pick_buffer_revision": descriptor["pick_buffer_revision"],
-            "points": [[4, 7], [11, 7], [8, 5]],
-            "flip_normal": True,
-        },
-        headers=auth_headers,
-    )
-    assert flipped.status_code == 200, flipped.text
-    flipped_ground = flipped.json()["workflow"]["local_ground_anchor"]
-    assert flipped_ground["revision"] == 2
-    assert flipped_ground["plane_normal"] == pytest.approx(
-        [-component for component in ground["plane_normal"]]
-    )
-    ground = flipped_ground
-
-    unconfirmed_contact = workflow_client.put(
-        "/api/v1/projects/current/synthesis-placement",
-        json={
-            "expected_project_id": project.project_id,
-            "source_calibration_revision": calibration["revision"],
-            "ground_anchor_revision": ground["revision"],
-            "mode": "contact",
-            "scene_azimuth": 0.0,
-            "subject_to_scene_scale": 1.0,
-            "composition_offset_local": [0.0, 0.0],
-            "foot_pixel": [8, 7],
-        },
-        headers=auth_headers,
-    )
-    assert unconfirmed_contact.status_code == 409
-    assert unconfirmed_contact.json()["code"] == "source_contact_not_confirmed"
-
-    contact_confirmation = workflow_client.put(
-        "/api/v1/projects/current/source-contact",
-        json={
-            "expected_project_id": project.project_id,
-            "source_calibration_revision": calibration["revision"],
-            "foot_pixel": [8, 7],
-        },
-        headers=auth_headers,
-    )
-    assert contact_confirmation.status_code == 200
-    contact = contact_confirmation.json()["workflow"]["subject_contact_constraint"]
-    assert contact["foot_pixel"] == [8, 7]
-    assert contact["anchor_frame_index"] == calibration["anchor_frame_index"]
-
-    contact_solved = workflow_client.put(
-        "/api/v1/projects/current/synthesis-placement",
-        json={
-            "expected_project_id": project.project_id,
-            "source_calibration_revision": calibration["revision"],
-            "ground_anchor_revision": ground["revision"],
-            "mode": "contact",
-            "scene_azimuth": 0.0,
-            "subject_to_scene_scale": 1.0,
-            "composition_offset_local": [0.0, 0.0],
-            "foot_pixel": [8, 7],
-        },
-        headers=auth_headers,
-    )
-    assert contact_solved.status_code == 200, contact_solved.text
-    assert contact_solved.json()["workflow"]["synthesis_placement"]["mode"] == "contact"
-
-    solved = workflow_client.put(
-        "/api/v1/projects/current/synthesis-placement",
-        json={
-            "expected_project_id": project.project_id,
-            "source_calibration_revision": calibration["revision"],
-            "ground_anchor_revision": ground["revision"],
-            "mode": "perspective",
-            "scene_azimuth": 45.0,
-            "subject_to_scene_scale": 1.25,
-            "composition_offset_local": [0.2, -0.1],
-            "foot_pixel": None,
-        },
-        headers=auth_headers,
-    )
-    assert solved.status_code == 200, solved.text
-    placement = solved.json()["workflow"]["synthesis_placement"]
-    assert placement["scene_azimuth"] == 45.0
-    assert placement["mode"] == "perspective"
-    assert solved.json()["workflow"]["subject_contact_constraint"] is None
-
-    final = workflow_client.post(
-        "/api/v1/projects/current/synthesis-placement/confirm",
-        json={
-            "expected_project_id": project.project_id,
-            "placement_revision": placement["revision"],
-        },
-        headers=auth_headers,
-    )
-    assert final.status_code == 200
-    assert (
-        final.json()["workflow"]["confirmed_synthesis_placement_revision"]
-        == placement["revision"]
-    )
-    stages_before_exploration = final.json()["stages"]
-    explored = workflow_client.post(
-        "/api/v1/projects/current/preview",
-        json={
-            "expected_project_id": project.project_id,
-            "generation": 2,
-            "width": 16,
-            "height": 9,
-            "camera": {
-                "camera_to_world": [
-                    [1.0, 0.0, 0.0, 0.25],
-                    [0.0, 1.0, 0.0, -2.0],
-                    [0.0, 0.0, 1.0, -5.0],
-                    [0.0, 0.0, 0.0, 1.0],
-                ],
-                "fov_y_degrees": 60.0,
-            },
-        },
-        headers=auth_headers,
-    )
-    assert explored.status_code == 201, explored.text
-    after_exploration = workflow_client.get(
-        "/api/v1/projects/current", headers=auth_headers
-    ).json()
-    assert after_exploration["workflow"]["local_ground_anchor"] == ground
-    assert after_exploration["workflow"]["synthesis_placement"] == placement
-    assert (
-        after_exploration["workflow"]["confirmed_synthesis_placement_revision"]
-        == placement["revision"]
-    )
-    assert after_exploration["stages"] == stages_before_exploration
-
-    def clear_source_authority(current):
-        current.workflow.source_perspective_calibration = None
-        current.workflow.subject_contact_constraint = None
-        current.workflow.synthesis_placement = None
-        current.workflow.confirmed_synthesis_placement_revision = None
-
-    repository.update(clear_source_authority)
-    recalibrated = workflow_client.put(
-        "/api/v1/projects/current/source-perspective",
-        json={
-            "expected_project_id": project.project_id,
-            "expected_segment_cache_key": SEGMENT_CACHE_KEY,
-            "anchor_frame_index": 2,
-            "image_width": 16,
-            "image_height": 9,
-            "evidence_method": "automatic_prior",
-            "prior_source": "centered_60_degree_default",
-        },
-        headers=auth_headers,
-    )
-    assert recalibrated.status_code == 200, recalibrated.text
-    new_calibration = recalibrated.json()["workflow"][
-        "source_perspective_calibration"
-    ]
-    assert new_calibration["revision"] == calibration["revision"] + 1
-
-    stale_contact = workflow_client.put(
-        "/api/v1/projects/current/source-contact",
-        json={
-            "expected_project_id": project.project_id,
-            "source_calibration_revision": calibration["revision"],
-            "foot_pixel": [8, 7],
-        },
-        headers=auth_headers,
-    )
-    assert stale_contact.status_code == 409
-    assert stale_contact.json()["code"] == "source_contact_authority_changed"
-
-    resolved_again = workflow_client.put(
-        "/api/v1/projects/current/synthesis-placement",
-        json={
-            "expected_project_id": project.project_id,
-            "source_calibration_revision": new_calibration["revision"],
-            "ground_anchor_revision": ground["revision"],
-            "mode": "perspective",
-            "scene_azimuth": 45.0,
-            "subject_to_scene_scale": 1.25,
-            "composition_offset_local": [0.2, -0.1],
-            "foot_pixel": None,
-        },
-        headers=auth_headers,
-    )
-    assert resolved_again.status_code == 200, resolved_again.text
-    new_placement = resolved_again.json()["workflow"]["synthesis_placement"]
-    assert new_placement["revision"] == placement["revision"] + 1
-
-    stale_confirmation = workflow_client.post(
-        "/api/v1/projects/current/synthesis-placement/confirm",
-        json={
-            "expected_project_id": project.project_id,
-            "placement_revision": placement["revision"],
-        },
-        headers=auth_headers,
-    )
-    assert stale_confirmation.status_code == 409
-    assert stale_confirmation.json()["code"] == "stale_synthesis_placement"
 
 
 def test_live_preview_returns_jpeg_without_changing_project_authority(
@@ -813,95 +423,6 @@ def test_live_preview_release_closes_the_resident_session(
     assert response.status_code == 204
     assert response.content == b""
     assert service.close_calls == 1
-
-
-def test_pick_rejects_preview_artifact_aba_before_transaction_commit(
-    workflow_client: TestClient,
-    auth_headers: dict[str, str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project_id = workflow_client.get(
-        "/api/v1/projects/current", headers=auth_headers
-    ).json()["project_id"]
-    request = {
-        "expected_project_id": project_id,
-        "generation": 1,
-        "width": 16,
-        "height": 9,
-        "camera": {
-            "target": [0.0, 0.0, 0.0],
-            "distance": 4.0,
-            "yaw": 0.0,
-            "pitch": 0.0,
-            "fov_y_degrees": 60.0,
-        },
-    }
-    old_preview = workflow_client.post(
-        "/api/v1/projects/current/preview", json=request, headers=auth_headers
-    ).json()
-    workflow_client.post(
-        "/api/v1/projects/current/camera/confirm",
-        json={
-            "expected_project_id": project_id,
-            "camera_revision": old_preview["camera_revision"],
-        },
-        headers=auth_headers,
-    )
-    repository = workflow_client.app.state.services.project_repository
-
-    from gs_video.api import routes as workflow_routes
-
-    original_unproject = workflow_routes._unproject
-
-    def replace_authority_after_unproject(
-        *args: Any, **kwargs: Any
-    ) -> tuple[float, float, float]:
-        world = original_unproject(*args, **kwargs)
-
-        def replace(latest: Any) -> None:
-            latest.scene_ply = "source/scene-b.ply"
-            latest.workflow.scene_summary = SceneSummary(
-                filename="scene-b.ply",
-                size=7,
-                sha256="b" * 64,
-                gaussian_count=1,
-                estimated_vram_mb=1,
-            )
-            latest.workflow.preview = PreviewState(
-                artifact_id="preview-b",
-                artifact_size=1,
-                artifact_sha256="b" * 64,
-                generation=1,
-                width=16,
-                height=9,
-                camera_revision=1,
-                pick_buffer_revision=1,
-            )
-            latest.workflow.confirmed_camera_revision = 1
-            latest.workflow.confirmed_preview_artifact_id = "preview-b"
-
-        repository.update(replace)
-        return world
-
-    monkeypatch.setattr(
-        workflow_routes, "_unproject", replace_authority_after_unproject
-    )
-
-    stale = workflow_client.post(
-        "/api/v1/projects/current/pick",
-        json={
-            "x": 8,
-            "y": 4,
-            "preview_artifact_id": old_preview["artifact_id"],
-            "camera_revision": 1,
-            "pick_buffer_revision": 1,
-        },
-        headers=auth_headers,
-    )
-
-    assert stale.status_code == 409
-    assert stale.json()["code"] == "stale_pick_buffer"
-    assert repository.load().workflow.foot_point is None
 
 
 def test_stale_preview_generation_cannot_replace_newer_snapshot(
@@ -1262,13 +783,6 @@ def test_replacing_source_video_clears_all_source_derived_authority(
             target=(0.0, 0.0, 0.0), distance=4.0, yaw=0.0,
             pitch=0.0, fov_y_degrees=60.0, revision=3
         )
-        workflow.confirmed_camera_revision = 3
-        workflow.confirmed_preview_artifact_id = "f" * 32
-        workflow.foot_point = FootPointState(
-            image=(8, 4), world=(0.0, 0.0, 2.0),
-            preview_artifact_id="f" * 32,
-            camera_revision=3, pick_buffer_revision=3
-        )
         workflow.preview = PreviewState(
             artifact_id="f" * 32, artifact_size=10,
             artifact_sha256="e" * 64, generation=3, width=16, height=9,
@@ -1312,9 +826,6 @@ def test_replacing_source_video_clears_all_source_derived_authority(
     assert response.status_code == 201
     project = repository.load()
     assert project.workflow.subject_prompt is None
-    assert project.workflow.confirmed_camera_revision is None
-    assert project.workflow.confirmed_preview_artifact_id is None
-    assert project.workflow.foot_point is None
     assert project.workflow.preview_epoch == initial_preview_epoch + 1
     assert project.workflow.preview is None
     assert project.workflow.export_result is None

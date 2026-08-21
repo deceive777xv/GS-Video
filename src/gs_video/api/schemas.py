@@ -4,7 +4,7 @@ from enum import StrEnum
 from ipaddress import ip_address
 from math import isfinite
 from pathlib import Path, PurePath, PureWindowsPath
-from typing import Any, Literal, Self
+from typing import Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -217,12 +217,21 @@ class SubjectPromptInput(StrictModel):
     y: int = Field(ge=0)
 
 
+class OutputCropInput(StrictModel):
+    x: int = Field(ge=-32768, le=32768)
+    y: int = Field(ge=-32768, le=32768)
+    width: int = Field(ge=2, le=3840, multiple_of=2)
+    height: int = Field(ge=2, le=2160, multiple_of=2)
+
+
 class ProjectPatch(StrictModel):
     expected_project_id: str | None = Field(default=None, min_length=1)
     expected_ingest_cache_key: str | None = None
     name: str | None = Field(default=None, min_length=1, max_length=200)
     subject_prompt: SubjectPromptInput | None = None
-    motion_scale: float | None = Field(default=None, ge=0.1, le=4.0)
+    gs_scale: float | None = Field(default=None, ge=0.001, le=1000)
+    scene_azimuth: float | None = Field(default=None, ge=-180, lt=180)
+    output_crop: OutputCropInput | None = None
     preview_height: int | None = Field(default=None, ge=180, le=540)
 
 
@@ -320,123 +329,28 @@ class PickRequest(StrictModel):
     pick_buffer_revision: int = Field(ge=1)
 
 
-class PickResponse(StrictModel):
-    image: tuple[int, int]
-    world: tuple[float, float, float]
-    preview_artifact_id: str
-    camera_revision: int
-    pick_buffer_revision: int
-
-
-class CameraConfirmationRequest(StrictModel):
-    expected_project_id: str = Field(min_length=1)
-    camera_revision: int = Field(ge=1)
-
-
-class SourcePerspectiveCalibrationRequest(StrictModel):
-    expected_project_id: str = Field(min_length=1)
-    expected_segment_cache_key: str = Field(pattern=r"^[0-9a-f]{64}$")
-    anchor_frame_index: int = Field(ge=0)
-    image_width: int = Field(gt=0, le=16384)
-    image_height: int = Field(gt=0, le=16384)
-    evidence_method: Literal["orthogonal_guides", "automatic_prior"]
-    reference_relation: Literal[
-        "a_vertical_b_horizontal", "both_horizontal_plane"
-    ] | None = None
-    group_a: list[list[list[float]]] | None = None
-    group_b: list[list[list[float]]] | None = None
-    prior_source: Literal["centered_60_degree_default"] | None = None
-
-    @model_validator(mode="after")
-    def validate_evidence(self) -> Self:
-        if self.evidence_method == "orthogonal_guides":
-            if self.reference_relation is None or self.group_a is None or self.group_b is None:
-                raise ValueError("orthogonal guide evidence requires relation and both guide groups")
-            if self.prior_source is not None:
-                raise ValueError("orthogonal guide evidence must not include an automatic prior")
-            for group_name, group in (("group_a", self.group_a), ("group_b", self.group_b)):
-                if len(group) != 2 or any(
-                    len(segment) != 2 or any(len(point) != 2 for point in segment)
-                    for segment in group
-                ):
-                    raise ValueError(f"{group_name} must contain two two-point line segments")
-                if not all(isfinite(component) for segment in group for point in segment for component in point):
-                    raise ValueError(f"{group_name} must contain finite coordinates")
-        else:
-            if self.prior_source is None:
-                raise ValueError("automatic prior evidence requires prior_source")
-            if self.reference_relation is not None or self.group_a is not None or self.group_b is not None:
-                raise ValueError("automatic prior evidence must not include guide evidence")
-        return self
-
-
-class VisibilityAuditRequest(StrictModel):
-    expected_project_id: str = Field(min_length=1)
-    expected_segment_cache_key: str = Field(pattern=r"^[0-9a-f]{64}$")
-
-
-class SourceContactConfirmationRequest(StrictModel):
-    expected_project_id: str = Field(min_length=1)
-    source_calibration_revision: int = Field(ge=1)
-    foot_pixel: list[int] = Field(min_length=2, max_length=2)
-
-    @field_validator("foot_pixel")
-    @classmethod
-    def validate_foot_pixel(cls, value: list[int]) -> list[int]:
-        if any(component < 0 for component in value):
-            raise ValueError("foot pixel must be non-negative")
-        return value
-
-
-class LocalGroundAnchorRequest(StrictModel):
+class TargetGroundCandidateRequest(StrictModel):
     expected_project_id: str = Field(min_length=1)
     preview_artifact_id: str = Field(min_length=1, max_length=128)
     camera_revision: int = Field(ge=1)
     pick_buffer_revision: int = Field(ge=1)
-    points: list[list[int]] = Field(min_length=3, max_length=3)
-    flip_normal: bool = False
+    hints: list[list[int]] = Field(min_length=3, max_length=3)
 
-    @field_validator("points")
+    @field_validator("hints")
     @classmethod
-    def validate_points(
-        cls, value: list[list[int]]
-    ) -> list[list[int]]:
+    def validate_hints(cls, value: list[list[int]]) -> list[list[int]]:
         if any(len(point) != 2 for point in value):
-            raise ValueError("each ground point must contain two coordinates")
+            raise ValueError("each ground hint must contain two coordinates")
         if any(component < 0 for point in value for component in point):
-            raise ValueError("ground points must be non-negative")
+            raise ValueError("ground hint coordinates must be non-negative")
         if len({tuple(point) for point in value}) != 3:
-            raise ValueError("ground points must be distinct")
+            raise ValueError("ground hints must be distinct")
         return value
 
 
-class SynthesisPlacementRequest(StrictModel):
+class TargetGroundConfirmationRequest(StrictModel):
     expected_project_id: str = Field(min_length=1)
-    source_calibration_revision: int = Field(ge=1)
-    ground_anchor_revision: int = Field(ge=1)
-    mode: Literal["contact", "perspective"]
-    scene_azimuth: float = Field(ge=-180, lt=180, allow_inf_nan=False)
-    subject_to_scene_scale: float = Field(ge=0.25, le=4, allow_inf_nan=False)
-    composition_offset_local: list[float] = Field(
-        default_factory=lambda: [0.0, 0.0], min_length=2, max_length=2
-    )
-    foot_pixel: list[int] | None = Field(default=None, min_length=2, max_length=2)
-
-    @model_validator(mode="after")
-    def validate_mode_fields(self) -> Self:
-        if self.mode == "contact":
-            if self.foot_pixel is None or any(value < 0 for value in self.foot_pixel):
-                raise ValueError("contact mode requires a non-negative foot pixel")
-            if self.composition_offset_local != [0.0, 0.0]:
-                raise ValueError("contact mode does not allow composition offset")
-        elif self.foot_pixel is not None:
-            raise ValueError("perspective mode must not include a foot pixel")
-        return self
-
-
-class SynthesisPlacementConfirmationRequest(StrictModel):
-    expected_project_id: str = Field(min_length=1)
-    placement_revision: int = Field(ge=1)
+    target_ground_revision: int = Field(ge=1)
 
 
 class VerifiedExportResponse(StrictModel):

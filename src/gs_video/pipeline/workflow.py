@@ -18,7 +18,7 @@ from gs_video.pipeline.runner import (
 DEPENDENCIES: dict[StageName, tuple[StageName, ...]] = {
     StageName.INGEST: (),
     StageName.SEGMENT: (StageName.INGEST,),
-    StageName.SOLVE_CAMERA: (StageName.INGEST,),
+    StageName.SOLVE_CAMERA: (StageName.INGEST, StageName.SEGMENT),
     StageName.MAP_TRAJECTORY: (StageName.SOLVE_CAMERA,),
     StageName.RENDER: (StageName.MAP_TRAJECTORY,),
     StageName.COMPOSITE: (StageName.SEGMENT, StageName.RENDER),
@@ -30,7 +30,8 @@ class ChangeKind(StrEnum):
     SOURCE_VIDEO = "source_video"
     SUBJECT_PROMPT = "subject_prompt"
     TARGET_CAMERA = "target_camera"
-    MOTION_SCALE = "motion_scale"
+    GS_ALIGNMENT = "gs_alignment"
+    OUTPUT_CROP = "output_crop"
     EDGE_SETTINGS = "edge_settings"
     EXPORT_SETTINGS = "export_settings"
 
@@ -165,7 +166,8 @@ INVALIDATION_ROOT: dict[ChangeKind, tuple[StageName, ...]] = {
     ChangeKind.SOURCE_VIDEO: (StageName.INGEST,),
     ChangeKind.SUBJECT_PROMPT: (StageName.SEGMENT,),
     ChangeKind.TARGET_CAMERA: (StageName.MAP_TRAJECTORY,),
-    ChangeKind.MOTION_SCALE: (StageName.MAP_TRAJECTORY,),
+    ChangeKind.GS_ALIGNMENT: (StageName.MAP_TRAJECTORY,),
+    ChangeKind.OUTPUT_CROP: (StageName.RENDER,),
     ChangeKind.EDGE_SETTINGS: (StageName.COMPOSITE,),
     ChangeKind.EXPORT_SETTINGS: (StageName.EXPORT,),
 }

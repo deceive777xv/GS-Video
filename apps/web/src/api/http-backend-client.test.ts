@@ -12,7 +12,7 @@ import {
   useTaskEventSource,
 } from './task-events'
 import type { TaskEventSource, TaskEventSubscription } from './task-events'
-import type { PickRequest, TaskDto } from './types'
+import type { TaskDto } from './types'
 
 const task = (revision = 9): TaskDto => ({
   id: 't1',
@@ -54,14 +54,8 @@ const fakeBackendClient = (currentTask = task()): BackendClient => ({
   renderLivePreview: vi.fn().mockResolvedValue(new Blob()),
   closeLivePreview: vi.fn().mockResolvedValue(undefined),
   fetchPreviewArtifact: vi.fn(),
-  pickFootPoint: vi.fn(),
-  confirmCamera: vi.fn(),
-  scanSubjectVisibility: vi.fn(),
-  calibrateSourcePerspective: vi.fn(),
-  confirmSourceContact: vi.fn(),
-  calibrateLocalGround: vi.fn(),
-  solveSynthesisPlacement: vi.fn(),
-  confirmSynthesisPlacement: vi.fn(),
+  fitTargetGround: vi.fn(),
+  confirmTargetGround: vi.fn(),
   getVerifiedExport: vi.fn(),
   fetchExportArtifact: vi.fn(),
   getCompositePreview: vi.fn(),
@@ -531,43 +525,6 @@ describe('HttpBackendClient', () => {
     )
   })
 
-  it('binds a foot-point pick to the exact opaque preview artifact', async () => {
-    const input: PickRequest = {
-      x: 8,
-      y: 4,
-      preview_artifact_id: 'preview-1',
-      camera_revision: 2,
-      pick_buffer_revision: 2,
-    }
-    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          image: [8, 4],
-          world: [0, 0, 0],
-          preview_artifact_id: 'preview-1',
-          camera_revision: 2,
-          pick_buffer_revision: 2,
-        }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
-      ),
-    )
-    const client = new HttpBackendClient({
-      origin: 'http://127.0.0.1:49152',
-      token: 'secret',
-      fetchImpl,
-    })
-
-    await client.pickFootPoint(input)
-
-    expect(fetchImpl).toHaveBeenCalledWith(
-      'http://127.0.0.1:49152/api/v1/projects/current/pick',
-      expect.objectContaining({
-        method: 'POST',
-        body: JSON.stringify(input),
-      }),
-    )
-  })
-
   it('retrieves only a verified opaque export and its authenticated Blob', async () => {
     const result = {
       artifact_id: 'export-1',
@@ -707,37 +664,6 @@ describe('HttpBackendClient', () => {
       }),
     )
     expect(String(fetchImpl.mock.calls[0]?.[0])).not.toContain('secret')
-  })
-
-  it('confirms exactly the rendered camera revision through the project API', async () => {
-    const project = {
-      schema_version: 3,
-      project_id: 'p1',
-      name: 'demo',
-      created_at: '2026-07-16T00:00:00Z',
-      source_video: null,
-      scene_ply: null,
-      stages: {},
-      workflow: { confirmed_camera_revision: 4 },
-    }
-    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(JSON.stringify(project), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      }),
-    )
-    const client = new HttpBackendClient({
-      origin: 'http://127.0.0.1:49152',
-      token: 'secret',
-      fetchImpl,
-    })
-
-    await client.confirmCamera('project-1', 4)
-
-    expect(fetchImpl).toHaveBeenCalledWith(
-      'http://127.0.0.1:49152/api/v1/projects/current/camera/confirm',
-      expect.objectContaining({ method: 'POST', body: '{"expected_project_id":"project-1","camera_revision":4}' }),
-    )
   })
 
   it('fetches opaque subject proxy and Alpha artifacts with authentication', async () => {

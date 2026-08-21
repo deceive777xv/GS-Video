@@ -8,7 +8,7 @@ from PIL import Image
 import pytest
 
 from gs_video.camera.classify import CameraKind
-from gs_video.camera.opencv_solver import CameraSolution
+from gs_video.camera.solution import CameraSolution, SourceGroundEstimate
 from gs_video.domain.contracts import (
     MaskSequence,
     Prompt,
@@ -20,14 +20,11 @@ from gs_video.domain.models import (
     ArtifactCategory,
     ArtifactRef,
     ArtifactRole,
-    LocalGroundAnchor,
     Project,
     StageName,
     StageStatus,
     SubjectPromptState,
-    SourcePerspectiveCalibration,
-    SynthesisConstraintMode,
-    SynthesisPlacement,
+    TargetGroundState,
     VideoSummary,
 )
 from gs_video.media.export import ExportResult
@@ -307,9 +304,14 @@ class _IntegrationSolver:
     def solve(
         self,
         frame_paths: list[Path] | tuple[Path, ...],
+        mask_paths: list[Path] | tuple[Path, ...],
+        output_dir: Path,
         emit: ProgressEmitter,
         token: CancellationToken,
     ) -> CameraSolution:
+        assert len(mask_paths) == len(frame_paths)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "depth.zip").write_bytes(b"fake-depth")
         poses = []
         for index, _path in enumerate(frame_paths, start=1):
             token.raise_if_cancelled()
@@ -322,6 +324,14 @@ class _IntegrationSolver:
             poses,
             CameraKind.SIX_DOF,
             0.9,
+            source_ground=SourceGroundEstimate(
+                normal=(0.0, 1.0, 0.0),
+                offset=0.0,
+                anchor_frame_index=0,
+                confidence=0.9,
+                support_ratio=0.9,
+                rms_residual=0.01,
+            ),
         )
 
 
@@ -465,54 +475,32 @@ def test_concrete_cpu_services_progress_through_export_and_persist_artifacts(
     assert segmented.status is StageStatus.SUCCEEDED
     solved = runner.run(StageName.SOLVE_CAMERA, CancellationToken())
     assert solved.status is StageStatus.SUCCEEDED
-    ingest_key = project.stages[StageName.INGEST].cache_key
-    segment_key = project.stages[StageName.SEGMENT].cache_key
-    assert ingest_key is not None and segment_key is not None
     camera_to_world = (
         (1.0, 0.0, 0.0, 0.0),
         (0.0, 1.0, 0.0, -2.0),
         (0.0, 0.0, 1.0, -5.0),
         (0.0, 0.0, 0.0, 1.0),
     )
-    project.workflow.source_perspective_calibration = SourcePerspectiveCalibration(
-        source_asset_id=project.source_video,
-        ingest_cache_key=ingest_key,
-        segment_cache_key=segment_key,
-        anchor_frame_index=0,
-        image_width=8,
-        image_height=6,
-        vertical_fov=55,
-        horizon_line=(0.0, 1.0, -3.0),
-        gravity_direction_camera=(0.0, -1.0, 0.0),
-        revision=1,
-    )
-    project.workflow.local_ground_anchor = LocalGroundAnchor(
+    project.workflow.target_ground = TargetGroundState(
         scene_asset_id=project.scene_ply,
+        hint_pixels=((1, 1), (2, 1), (1, 2)),
         p0_world=(0.0, 0.0, 0.0),
-        p1_world=(1.0, 0.0, 0.0),
-        p2_world=(0.0, 0.0, 1.0),
-        plane_normal=(0.0, -1.0, 0.0),
+        p1_world=(0.0, 0.0, 1.0),
+        p2_world=(1.0, 0.0, 0.0),
+        plane_normal=(0.0, 1.0, 0.0),
         plane_offset=0.0,
-        frozen_camera_to_world=camera_to_world,
-        frozen_camera_fingerprint="integration-ground",
+        exploration_camera_to_world=camera_to_world,
+        camera_fingerprint="f" * 64,
         preview_artifact_id="preview-1",
         camera_revision=1,
         pick_buffer_revision=1,
+        support_counts=(20, 20, 20),
+        weighted_inlier_ratio=0.9,
+        rms_residual=0.01,
+        confidence=0.9,
         revision=1,
+        confirmed=True,
     )
-    project.workflow.synthesis_placement = SynthesisPlacement(
-        source_calibration_revision=1,
-        ground_anchor_revision=1,
-        mode=SynthesisConstraintMode.PERSPECTIVE,
-        scene_azimuth=0.0,
-        subject_to_scene_scale=1.0,
-        composition_offset_local=(0.0, 0.0),
-        anchor_camera_to_world=camera_to_world,
-        intrinsics=((3.0, 0.0, 4.0), (0.0, 3.0, 3.0), (0.0, 0.0, 1.0)),
-        solver_cache_key="f" * 64,
-        revision=1,
-    )
-    project.workflow.confirmed_synthesis_placement_revision = 1
 
     result = runner.run(StageName.EXPORT, CancellationToken())
 
