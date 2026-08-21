@@ -87,6 +87,29 @@ def test_runtime_config_accepts_wsl_segmentation_worker_prefix(
     )
 
 
+def test_runtime_config_accepts_wsl_camera_worker_prefix(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace-wsl-camera"
+    workspace.mkdir()
+    payload = runtime_payload(workspace)
+    payload["camera_worker_prefix"] = [
+        "wsl.exe",
+        "-d",
+        "Ubuntu",
+        "--",
+        "/mnt/e/Project/GS-Video/.runtime/camera/wsl/.venv/bin/python",
+    ]
+
+    config = load_runtime_config(write_runtime(workspace, payload))
+
+    assert config.camera_worker_prefix == (
+        "wsl.exe",
+        "-d",
+        "Ubuntu",
+        "--",
+        "/mnt/e/Project/GS-Video/.runtime/camera/wsl/.venv/bin/python",
+    )
+
+
 def test_runtime_config_accepts_vram_budget_above_legacy_eight_gib(
     tmp_path: Path,
 ) -> None:

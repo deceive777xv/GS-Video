@@ -75,6 +75,30 @@ def test_prepare_desktop_runtime_does_not_rewrite_unchanged_file(
     assert runtime_path.stat().st_mtime_ns == original_mtime
 
 
+def test_prepare_desktop_runtime_prefers_project_local_wsl_camera(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "repo-wsl-camera").absolute()
+    root.mkdir()
+    create_runtime_layout(root)
+    wsl_python = root / ".runtime" / "camera" / "wsl" / ".venv" / "bin" / "python"
+    wsl_python.parent.mkdir(parents=True)
+    wsl_python.write_bytes(b"linux runtime")
+
+    runtime_path = prepare_desktop_runtime(root, validate=False)
+
+    payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+    drive = root.drive.rstrip(":").lower()
+    relative = wsl_python.relative_to(wsl_python.anchor).as_posix()
+    assert payload["camera_worker_prefix"] == [
+        "wsl.exe",
+        "-d",
+        "Ubuntu",
+        "--",
+        f"/mnt/{drive}/{relative}",
+    ]
+
+
 def test_prepare_desktop_runtime_preserves_machine_vram_preference(
     tmp_path: Path,
 ) -> None:

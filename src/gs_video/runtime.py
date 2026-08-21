@@ -163,9 +163,9 @@ class WorkflowRuntimeConfig(BaseModel):
             raise ValueError("worker argv must contain nonempty safe entries")
         return value
 
-    @field_validator("segmentation_worker_prefix")
+    @field_validator("segmentation_worker_prefix", "camera_worker_prefix")
     @classmethod
-    def segmentation_worker_argv(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+    def cross_platform_worker_argv(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if is_wsl_prefix(value):
             separator = value.index("--")
             if (
@@ -180,7 +180,7 @@ class WorkflowRuntimeConfig(BaseModel):
             raise ValueError("worker executable path must be absolute")
         return value
 
-    @field_validator("camera_worker_prefix", "renderer_worker_prefix")
+    @field_validator("renderer_worker_prefix")
     @classmethod
     def renderer_worker_argv(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if not Path(value[0]).is_absolute():
@@ -278,16 +278,17 @@ def _validate_loaded_config(
         _ordinary_file(renderer_executable, "renderer worker")
     elif not allow_missing_resources:
         raise ValueError("renderer worker is unavailable")
-    camera_executable = _resolved_inside(
-        Path(config.camera_worker_prefix[0]),
-        workspace,
-        "camera worker",
-        strict=not allow_missing_resources,
-    )
-    if camera_executable.exists():
-        _ordinary_file(camera_executable, "camera worker")
-    elif not allow_missing_resources:
-        raise ValueError("camera worker is unavailable")
+    if not is_wsl_prefix(config.camera_worker_prefix):
+        camera_executable = _resolved_inside(
+            Path(config.camera_worker_prefix[0]),
+            workspace,
+            "camera worker",
+            strict=not allow_missing_resources,
+        )
+        if camera_executable.exists():
+            _ordinary_file(camera_executable, "camera worker")
+        elif not allow_missing_resources:
+            raise ValueError("camera worker is unavailable")
 
 
 def load_runtime_config(
@@ -514,7 +515,7 @@ def assemble_api_services(
     camera_solver = VipeCameraSolver(
         config.camera_worker_prefix,
         gpu_gate=gpu_gate,
-        cache_root=runtime_root / "camera" / ".cache",
+        cache_root=runtime_root / "camera" / "cache",
         log_path=log_root / "vipe-worker.log",
     )
     identity_lock = Lock()

@@ -44,6 +44,17 @@ def _required_file(
     return resolved
 
 
+def _wsl_path(path: Path) -> str:
+    absolute = path.absolute()
+    drive = absolute.drive.rstrip(":")
+    if len(drive) != 1 or not drive.isalpha():
+        raise DesktopRuntimeError(
+            f"WSL camera worker must be stored on a Windows drive: {absolute}"
+        )
+    relative = absolute.relative_to(absolute.anchor).as_posix()
+    return f"/mnt/{drive.lower()}/{relative}"
+
+
 def _runtime_payload(
     repo_root: Path, *, allow_missing_resources: bool = False
 ) -> dict[str, Any]:
@@ -73,12 +84,25 @@ def _runtime_payload(
         root,
         allow_missing=allow_missing_resources,
     )
-    camera_python = _required_file(
-        runtime_root / "camera" / ".venv" / "Scripts" / "python.exe",
-        "ViPE camera worker Python",
-        root,
-        allow_missing=allow_missing_resources,
-    )
+    wsl_camera_python = runtime_root / "camera" / "wsl" / ".venv" / "bin" / "python"
+    # Linux virtualenv interpreters are symlinks represented as reparse points on
+    # DrvFS. Windows cannot follow them, but WSL can execute them normally.
+    if os.path.lexists(wsl_camera_python):
+        camera_worker_prefix = [
+            "wsl.exe",
+            "-d",
+            "Ubuntu",
+            "--",
+            _wsl_path(wsl_camera_python),
+        ]
+    else:
+        camera_python = _required_file(
+            runtime_root / "camera" / ".venv" / "Scripts" / "python.exe",
+            "ViPE camera worker Python",
+            root,
+            allow_missing=allow_missing_resources,
+        )
+        camera_worker_prefix = [str(camera_python)]
     model_config = _required_file(
         edgetam_root / "sam2" / "configs" / "edgetam.yaml",
         "EdgeTAM model config",
@@ -98,7 +122,7 @@ def _runtime_payload(
         "segmentation_worker_prefix": [str(segmentation_python)],
         "segmentation_model_config": str(model_config),
         "segmentation_checkpoint": str(checkpoint),
-        "camera_worker_prefix": [str(camera_python)],
+        "camera_worker_prefix": camera_worker_prefix,
         "renderer_worker_prefix": [str(renderer_python)],
         "renderer_sh_degree": 3,
         "available_vram_limit_mb": load_user_vram_limit(

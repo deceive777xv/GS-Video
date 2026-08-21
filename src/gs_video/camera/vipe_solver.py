@@ -15,7 +15,11 @@ from gs_video.domain.errors import GsVideoError, RepairableError
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
 from gs_video.pipeline.gpu import GpuAdmissionGate
-from gs_video.segmentation.paths import has_reparse_component
+from gs_video.segmentation.paths import (
+    has_reparse_component,
+    is_wsl_prefix,
+    worker_path,
+)
 from gs_video.segmentation.tree_guard import create_process_tree_guard
 
 
@@ -89,15 +93,46 @@ class VipeCameraSolver:
         environment = os.environ.copy()
         if self._cache_root is not None:
             self._cache_root.mkdir(parents=True, exist_ok=True)
-            environment.update(
-                {
-                    "HF_HOME": str(self._cache_root / "huggingface"),
-                    "HF_HUB_CACHE": str(self._cache_root / "huggingface" / "hub"),
-                    "TORCH_HOME": str(self._cache_root / "torch"),
-                    "XDG_CACHE_HOME": str(self._cache_root),
-                }
-            )
+            cache_variables = {
+                "HF_HOME": str(self._cache_root / "huggingface"),
+                "HF_HUB_CACHE": str(self._cache_root / "huggingface" / "hub"),
+                "TORCH_HOME": str(self._cache_root / "torch"),
+                "XDG_CACHE_HOME": str(self._cache_root),
+            }
+            environment.update(cache_variables)
+            if is_wsl_prefix(self.worker_prefix):
+                existing = [
+                    item
+                    for item in environment.get("WSLENV", "").split(":")
+                    if item
+                ]
+                known = {item.split("/", 1)[0] for item in existing}
+                existing.extend(
+                    f"{name}/p" for name in cache_variables if name not in known
+                )
+                environment["WSLENV"] = ":".join(existing)
         return environment
+
+    def _command(
+        self,
+        frame_dir: Path,
+        mask_dir: Path,
+        output_dir: Path,
+        count: int,
+    ) -> list[str]:
+        return [
+            *self.worker_prefix,
+            "-m",
+            "gs_video.camera.vipe_worker",
+            "--frames",
+            worker_path(frame_dir, self.worker_prefix),
+            "--masks",
+            worker_path(mask_dir, self.worker_prefix),
+            "--output",
+            worker_path(output_dir, self.worker_prefix),
+            "--count",
+            str(count),
+        ]
 
     def solve(
         self,
@@ -110,19 +145,12 @@ class VipeCameraSolver:
         frames = tuple(Path(path).absolute() for path in frame_paths)
         masks = tuple(Path(path).absolute() for path in mask_paths)
         frame_dir, mask_dir = self._validate_inventory(frames, masks, output_dir)
-        command = [
-            *self.worker_prefix,
-            "-m",
-            "gs_video.camera.vipe_worker",
-            "--frames",
-            str(frame_dir),
-            "--masks",
-            str(mask_dir),
-            "--output",
-            str(Path(output_dir).absolute()),
-            "--count",
-            str(len(frames)),
-        ]
+        command = self._command(
+            frame_dir,
+            mask_dir,
+            Path(output_dir).absolute(),
+            len(frames),
+        )
         options: dict[str, object] = {
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
