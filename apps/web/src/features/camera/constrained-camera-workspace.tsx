@@ -295,7 +295,7 @@ export function ConstrainedCameraWorkspace({
         </aside>
       </div>
       <div className="camera-secondary-panel">
-        <p>{shownHints.length}/3 个地面提示。重新生成视图会清除未拟合提示。</p>
+        <p>{shownHints.length}/3 个地面提示。P0 对应源锚帧相机在源地面上的垂直投影。重新生成视图会清除未拟合提示。</p>
         <div className="secondary-actions">
           <button disabled={busy || pending || hints.length === 0} onClick={() => setHints([])} type="button">重选三点</button>
           <button disabled={busy || pending || frame === null || hints.length !== 3} onClick={() => void fitGround()} type="button">自动寻找真正地面</button>
@@ -305,7 +305,6 @@ export function ConstrainedCameraWorkspace({
       </div>
       <div className="camera-secondary-panel">
         <h4>轨迹映射</h4>
-        <p>P0 对应源锚帧相机在源地面上的垂直投影。</p>
         <div className="secondary-actions">
           <label>GS 比例<input aria-label="GS 比例" disabled={busy || pending} min="0.001" max="1000" onChange={(event) => setScaleText(event.currentTarget.value)} step="0.01" type="number" value={scaleText} /></label>
           <label>场景方位角<input aria-label="场景方位角" disabled={busy || pending} min="-180" max="179.999" onChange={(event) => setAzimuthText(event.currentTarget.value)} step="1" type="number" value={azimuthText} /></label>
