@@ -102,6 +102,19 @@ function cameraInput(pose: EulerPose): MatrixCameraInput {
   return { camera_to_world: poseMatrix(pose), fov_y_degrees: pose.fov }
 }
 
+function previewAuthority(projectId: string, preview: PreviewFrameDto | null): string | null {
+  if (preview === null) return null
+  return JSON.stringify([
+    projectId,
+    preview.artifact_id,
+    preview.generation,
+    preview.width,
+    preview.height,
+    preview.camera_revision,
+    preview.pick_buffer_revision,
+  ])
+}
+
 function Marker({ point, frame, label }: {
   point: ImagePoint
   frame: PreviewFrameDto
@@ -159,6 +172,12 @@ export function ConstrainedCameraWorkspace({
   const viewportRef = useRef<HTMLDivElement>(null)
   const generation = useRef(project.workflow.preview?.generation ?? 0)
   const frameUrlRef = useRef<string | null>(null)
+  const frameAuthorityRef = useRef<string | null>(null)
+  const previewRequest = useRef(0)
+  const onErrorRef = useRef(onError)
+  onErrorRef.current = onError
+  const authoritativePreview = project.workflow.preview
+  const authoritativePreviewKey = previewAuthority(project.project_id, authoritativePreview)
   const targetGround = project.workflow.target_ground
   const candidateMatchesFrame = frame !== null
     && targetGround !== null
@@ -171,10 +190,52 @@ export function ConstrainedCameraWorkspace({
     frameUrlRef.current = next
     setFrameUrl(next)
   }
-  useEffect(() => () => replaceFrameUrl(null), [])
+  useEffect(() => {
+    generation.current = authoritativePreview?.generation ?? 0
+    const request = ++previewRequest.current
+    if (authoritativePreview === null || authoritativePreviewKey === null) {
+      frameAuthorityRef.current = null
+      setFrame(null)
+      replaceFrameUrl(null)
+      return
+    }
+    if (
+      frameAuthorityRef.current === authoritativePreviewKey
+      && frameUrlRef.current !== null
+    ) return
+
+    frameAuthorityRef.current = null
+    setFrame(null)
+    replaceFrameUrl(null)
+    const controller = new AbortController()
+    void backend.fetchPreviewArtifact(
+      authoritativePreview.artifact_id,
+      controller.signal,
+    ).then((blob) => {
+      if (controller.signal.aborted || previewRequest.current !== request) return
+      const nextUrl = URL.createObjectURL(blob)
+      if (controller.signal.aborted || previewRequest.current !== request) {
+        URL.revokeObjectURL(nextUrl)
+        return
+      }
+      frameAuthorityRef.current = authoritativePreviewKey
+      setFrame(authoritativePreview)
+      replaceFrameUrl(nextUrl)
+    }).catch((error: unknown) => {
+      if (controller.signal.aborted || previewRequest.current !== request) return
+      onErrorRef.current(error instanceof Error ? error : '无法载入当前 Gaussian 场景预览。')
+    })
+    return () => controller.abort()
+  }, [authoritativePreviewKey, backend])
+  useEffect(() => () => {
+    previewRequest.current += 1
+    frameAuthorityRef.current = null
+    replaceFrameUrl(null)
+  }, [])
 
   const updatePose = (key: keyof EulerPose, value: number): void => {
     setPose((current) => ({ ...current, [key]: value }))
+    frameAuthorityRef.current = null
     setFrame(null)
     replaceFrameUrl(null)
     setHints([])
@@ -193,6 +254,7 @@ export function ConstrainedCameraWorkspace({
         camera: cameraInput(pose),
       })
       const blob = await backend.fetchPreviewArtifact(rendered.artifact_id)
+      frameAuthorityRef.current = previewAuthority(project.project_id, rendered)
       replaceFrameUrl(URL.createObjectURL(blob))
       setFrame(rendered)
       setHints([])
@@ -290,7 +352,7 @@ export function ConstrainedCameraWorkspace({
             {(['x', 'y', 'z', 'yaw', 'pitch', 'roll'] as const).map((key) => <NumberField disabled={busy || pending} key={key} label={`探索相机 ${key.toUpperCase()}`} onChange={(value) => updatePose(key, value)} value={pose[key]} />)}
           </div>
           <NumberField disabled={busy || pending} label="探索相机 FOV" max={120} min={10} onChange={(value) => updatePose('fov', value)} value={pose.fov} />
-          <button disabled={busy || pending} onClick={() => { setPose(DEFAULT_POSE); setFrame(null); replaceFrameUrl(null); setHints([]) }} type="button">重置探索相机</button>
+          <button disabled={busy || pending} onClick={() => { setPose(DEFAULT_POSE); frameAuthorityRef.current = null; setFrame(null); replaceFrameUrl(null); setHints([]) }} type="button">重置探索相机</button>
           <button disabled={busy || pending} onClick={() => void renderSelectionView()} type="button">更新地面选择视图</button>
         </aside>
       </div>

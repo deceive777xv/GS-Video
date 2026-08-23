@@ -1,9 +1,9 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, it, vi } from 'vitest'
 
 import type { BackendClient } from '../../api/backend-client'
-import type { ProjectDto, TargetGroundDto } from '../../api/types'
+import type { PreviewFrameDto, ProjectDto, TargetGroundDto } from '../../api/types'
 import { ConstrainedCameraWorkspace } from './constrained-camera-workspace'
 
 afterEach(() => vi.restoreAllMocks())
@@ -15,19 +15,133 @@ const identity = [
   [0, 0, 0, 1],
 ] as const
 
-function project(targetGround: TargetGroundDto | null = null): ProjectDto {
+function project(
+  targetGround: TargetGroundDto | null = null,
+  preview: PreviewFrameDto | null = null,
+  projectId = 'project-1',
+): ProjectDto {
   return {
-    project_id: 'project-1',
+    project_id: projectId,
     scene_ply: 'opaque:scene',
     workflow: {
       exploration_camera: null,
-      preview: null,
+      preview,
       target_ground: targetGround,
       gs_scale: 1,
       scene_azimuth: 0,
     },
   } as unknown as ProjectDto
 }
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, reject, resolve }
+}
+
+const restoredPreview: PreviewFrameDto = {
+  artifact_id: 'preview-restored',
+  generation: 4,
+  width: 960,
+  height: 540,
+  camera_revision: 7,
+  pick_buffer_revision: 9,
+}
+
+it('restores an existing authoritative GS preview when the scene page opens', async () => {
+  vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:restored-preview')
+  vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+  const initial = project(null, restoredPreview)
+  const backend = {
+    fetchPreviewArtifact: vi.fn(async () => new Blob(['png'], { type: 'image/png' })),
+  } as unknown as BackendClient
+  const props = {
+    backend,
+    busy: false,
+    onError: vi.fn(),
+    onProjectChange: vi.fn(),
+    onRefresh: vi.fn(async () => initial),
+    panel: 'scene' as const,
+  }
+  const view = render(<ConstrainedCameraWorkspace {...props} project={initial} />)
+
+  expect(await screen.findByAltText('Gaussian 地面选择视图')).toHaveAttribute(
+    'src',
+    'blob:restored-preview',
+  )
+  expect(backend.fetchPreviewArtifact).toHaveBeenCalledWith(
+    'preview-restored',
+    expect.any(AbortSignal),
+  )
+
+  fireEvent.change(screen.getByLabelText('探索相机 X'), { target: { value: '1' } })
+  expect(screen.queryByAltText('Gaussian 地面选择视图')).not.toBeInTheDocument()
+  view.rerender(<ConstrainedCameraWorkspace {...props} onError={vi.fn()} project={initial} />)
+  expect(backend.fetchPreviewArtifact).toHaveBeenCalledTimes(1)
+  expect(screen.queryByAltText('Gaussian 地面选择视图')).not.toBeInTheDocument()
+
+  view.unmount()
+  expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:restored-preview')
+})
+
+it('drops stale preview successes and errors across an A to B to A authority change', async () => {
+  const firstA = deferred<Blob>()
+  const staleB = deferred<Blob>()
+  const latestA = deferred<Blob>()
+  const latestBlob = new Blob(['latest'], { type: 'image/png' })
+  const createObjectUrl = vi.spyOn(URL, 'createObjectURL').mockImplementation((blob) => (
+    blob === latestBlob ? 'blob:latest-a' : 'blob:stale'
+  ))
+  vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+  const backend = {
+    fetchPreviewArtifact: vi.fn()
+      .mockReturnValueOnce(firstA.promise)
+      .mockReturnValueOnce(staleB.promise)
+      .mockReturnValueOnce(latestA.promise),
+  } as unknown as BackendClient
+  const onError = vi.fn()
+  const firstProjectA = project(null, restoredPreview, 'project-a')
+  const projectB = project(null, { ...restoredPreview, artifact_id: 'preview-b' }, 'project-b')
+  const latestProjectA = project(null, restoredPreview, 'project-a')
+  const props = {
+    backend,
+    busy: false,
+    onError,
+    onProjectChange: vi.fn(),
+    onRefresh: vi.fn(async () => latestProjectA),
+    panel: 'scene' as const,
+  }
+  const view = render(<ConstrainedCameraWorkspace {...props} project={firstProjectA} />)
+  await waitFor(() => expect(backend.fetchPreviewArtifact).toHaveBeenCalledTimes(1))
+
+  view.rerender(<ConstrainedCameraWorkspace {...props} project={projectB} />)
+  await waitFor(() => expect(backend.fetchPreviewArtifact).toHaveBeenCalledTimes(2))
+  view.rerender(<ConstrainedCameraWorkspace {...props} project={latestProjectA} />)
+  await waitFor(() => expect(backend.fetchPreviewArtifact).toHaveBeenCalledTimes(3))
+
+  await act(async () => {
+    firstA.resolve(new Blob(['stale-a'], { type: 'image/png' }))
+    staleB.reject(new Error('stale B failed'))
+    await Promise.resolve()
+  })
+  expect(screen.queryByAltText('Gaussian 地面选择视图')).not.toBeInTheDocument()
+  expect(onError).not.toHaveBeenCalled()
+
+  await act(async () => {
+    latestA.resolve(latestBlob)
+    await Promise.resolve()
+  })
+  expect(await screen.findByAltText('Gaussian 地面选择视图')).toHaveAttribute(
+    'src',
+    'blob:latest-a',
+  )
+  expect(createObjectUrl).toHaveBeenCalledTimes(1)
+  expect(onError).not.toHaveBeenCalled()
+})
 
 it('turns three viewport hints into one automatic ground candidate and one confirmation', async () => {
   vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:ground-view')
