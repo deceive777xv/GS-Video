@@ -6,7 +6,6 @@ import shutil
 import sys
 import uuid
 import zipfile
-from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -95,15 +94,27 @@ def _one_artifact(root: Path, directory: str, suffix: str) -> Path:
 
 
 def _read_depth(path: Path, count: int) -> tuple[np.ndarray, tuple[str, ...]]:
-    import imageio.v3 as iio  # type: ignore[import-not-found]
+    import OpenEXR  # type: ignore[import-not-found]
 
     with zipfile.ZipFile(path) as archive:
         names = tuple(sorted(name for name in archive.namelist() if name.lower().endswith(".exr")))
         if len(names) != count:
             raise ValueError("ViPE depth frame count is invalid")
-        depth = np.asarray(iio.imread(BytesIO(archive.read(names[0])), extension=".exr"))
-    if depth.ndim == 3:
-        depth = depth[..., 0]
+        with archive.open(names[0]) as stream:
+            exr = OpenEXR.InputFile(stream)
+            try:
+                data_window = exr.header()["dataWindow"]
+                width = int(data_window.max.x - data_window.min.x + 1)
+                height = int(data_window.max.y - data_window.min.y + 1)
+                channels = exr.channels(["Z"])
+                if width <= 0 or height <= 0 or len(channels) != 1:
+                    raise ValueError("ViPE anchor depth is invalid")
+                depth = np.frombuffer(channels[0], dtype=np.float16)
+                if depth.size != width * height:
+                    raise ValueError("ViPE anchor depth is invalid")
+                depth = depth.reshape((height, width))
+            finally:
+                exr.close()
     depth = np.asarray(depth, dtype=np.float64)
     if depth.ndim != 2 or not np.isfinite(depth).all() or np.any(depth < 0):
         raise ValueError("ViPE anchor depth is invalid")
