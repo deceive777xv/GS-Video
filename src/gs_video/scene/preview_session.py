@@ -25,7 +25,7 @@ from gs_video.environment.vram import (
     validated_vram_limit_mb,
 )
 from gs_video.pipeline.cancellation import CancellationToken
-from gs_video.scene.camera import OrbitCamera, matrix4_tuple
+from gs_video.scene.camera import OrbitCamera, matrix3_tuple, matrix4_tuple
 from gs_video.scene.camera import MatrixCamera
 from gs_video.scene.preview_protocol import (
     CompleteEvent,
@@ -285,6 +285,12 @@ class PreviewSession(RendererWorkerClient):
             return MatrixCameraPayload(
                 camera_to_world=matrix4_tuple(matrix),
                 fov_y_degrees=camera.fov_y_degrees,
+                intrinsics=(
+                    None
+                    if camera.intrinsics_matrix is None
+                    else matrix3_tuple(camera.intrinsics_matrix)
+                ),
+                source_size=camera.source_size,
             )
         return OrbitCameraPayload(
             target=camera.target,

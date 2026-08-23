@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from gs_video.api.routes import ApiServices
 from gs_video.api.schemas import ApiSettings
 from gs_video.app import create_app
-from gs_video.domain.models import StageName, StageState, StageStatus
+from gs_video.domain.models import PreviewState, StageName, StageState, StageStatus
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter, discard_progress
@@ -199,6 +199,50 @@ def test_project_patch_rejects_stale_project_and_ingest_context(
         "width": 2560,
         "height": 1440,
     }
+
+
+def test_lowering_composite_preview_resolution_preserves_camera_preview_and_mapping(
+    api_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    repository = api_client.app.state.services.project_repository
+
+    def seed(project: object) -> None:
+        workflow = project.workflow  # type: ignore[attr-defined]
+        workflow.preview = PreviewState(
+            artifact_id="f" * 32,
+            artifact_size=10,
+            artifact_sha256="e" * 64,
+            generation=3,
+            width=960,
+            height=540,
+            camera_revision=3,
+            pick_buffer_revision=3,
+        )
+        for name in (
+            StageName.SOLVE_CAMERA,
+            StageName.MAP_TRAJECTORY,
+            StageName.RENDER,
+            StageName.COMPOSITE,
+        ):
+            project.stages[name] = StageState(  # type: ignore[attr-defined]
+                status=StageStatus.SUCCEEDED,
+                cache_key=f"{name.value}-cache",
+            )
+
+    repository.update(seed)
+    response = api_client.patch(
+        "/api/v1/projects/current",
+        json={"preview_height": 360},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["workflow"]["preview"]["artifact_id"] == "f" * 32
+    assert body["stages"]["solve_camera"]["status"] == "succeeded"
+    assert body["stages"]["map_trajectory"]["status"] == "succeeded"
+    assert body["stages"]["render"]["status"] == "succeeded"
+    assert body["stages"]["composite"]["status"] == "stale"
 
 
 def test_local_asset_import_copies_into_project_source(

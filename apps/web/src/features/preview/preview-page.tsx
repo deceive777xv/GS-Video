@@ -21,6 +21,8 @@ export function PreviewPage({
   onBackToCamera, onReselectSubject,
 }: PreviewPageProps) {
   const [frameUrl, setFrameUrl] = useState<string | null>(null)
+  const [draftUrl, setDraftUrl] = useState<string | null>(null)
+  const [draftPending, setDraftPending] = useState(false)
   const [compositeVideo, setCompositeVideo] = useState<{
     authority: string
     artifactId: string
@@ -37,7 +39,11 @@ export function PreviewPage({
     width: String(authoritativeCrop?.width ?? 1920),
     height: String(authoritativeCrop?.height ?? 1080),
   }))
+  const [scaleText, setScaleText] = useState(String(project.workflow.gs_scale))
+  const [azimuthText, setAzimuthText] = useState(String(project.workflow.scene_azimuth))
   const frameObjectUrl = useRef<string | null>(null)
+  const draftObjectUrl = useRef<string | null>(null)
+  const draftRequest = useRef(0)
   const compositeObjectUrl = useRef<string | null>(null)
   const compositeRequest = useRef(0)
   const descriptorAuthority = useRef<string | null>(null)
@@ -61,6 +67,31 @@ export function PreviewPage({
   const cropSaved = authoritativeCrop !== null && cropValid
     && cropDraft.x === authoritativeCrop.x && cropDraft.y === authoritativeCrop.y
     && cropDraft.width === authoritativeCrop.width && cropDraft.height === authoritativeCrop.height
+  const scaleDraft = Number(scaleText)
+  const azimuthDraft = Number(azimuthText)
+  const alignmentValid = Number.isFinite(scaleDraft) && scaleDraft >= 0.001 && scaleDraft <= 1000
+    && Number.isFinite(azimuthDraft) && azimuthDraft >= -180 && azimuthDraft < 180
+  const alignmentSaved = alignmentValid
+    && scaleDraft === project.workflow.gs_scale
+    && azimuthDraft === project.workflow.scene_azimuth
+  const draftValid = cropValid && alignmentValid && groundConfirmed
+    && project.stages.solve_camera?.status === 'succeeded'
+    && project.stages.segment?.status === 'succeeded'
+  const draftDirty = draftValid && (!cropSaved || !alignmentSaved)
+  const showDraft = compositeAuthority === null || draftDirty
+  const draftKey = draftValid ? JSON.stringify([
+    project.project_id,
+    project.stages.solve_camera?.cache_key,
+    project.stages.segment?.cache_key,
+    project.workflow.target_ground?.revision,
+    project.workflow.subject_prompt?.frame_index,
+    scaleDraft,
+    azimuthDraft,
+    cropDraft.x,
+    cropDraft.y,
+    cropDraft.width,
+    cropDraft.height,
+  ]) : null
 
   useEffect(() => {
     if (authoritativeCrop === null) return
@@ -69,6 +100,11 @@ export function PreviewPage({
       width: String(authoritativeCrop.width), height: String(authoritativeCrop.height),
     })
   }, [authoritativeCrop?.x, authoritativeCrop?.y, authoritativeCrop?.width, authoritativeCrop?.height])
+
+  useEffect(() => {
+    setScaleText(String(project.workflow.gs_scale))
+    setAzimuthText(String(project.workflow.scene_azimuth))
+  }, [project.workflow.gs_scale, project.workflow.scene_azimuth])
 
   useEffect(() => {
     if (frameObjectUrl.current !== null) {
@@ -91,7 +127,50 @@ export function PreviewPage({
 
   useEffect(() => () => {
     if (frameObjectUrl.current !== null) URL.revokeObjectURL(frameObjectUrl.current)
+    if (draftObjectUrl.current !== null) URL.revokeObjectURL(draftObjectUrl.current)
   }, [])
+
+  useEffect(() => {
+    const request = ++draftRequest.current
+    if (!showDraft || draftKey === null) {
+      setDraftPending(false)
+      return
+    }
+    const controller = new AbortController()
+    setDraftPending(true)
+    const timer = window.setTimeout(() => {
+      void backend.renderDraftCompositePreview({
+        expected_project_id: project.project_id,
+        request_id: request,
+        maximum_width: 960,
+        maximum_height: 540,
+        gs_scale: scaleDraft,
+        scene_azimuth: azimuthDraft,
+        output_crop: cropDraft,
+      }, controller.signal).then((blob) => {
+        if (controller.signal.aborted || draftRequest.current !== request) return
+        const nextUrl = URL.createObjectURL(blob)
+        if (controller.signal.aborted || draftRequest.current !== request) {
+          URL.revokeObjectURL(nextUrl)
+          return
+        }
+        if (draftObjectUrl.current !== null) URL.revokeObjectURL(draftObjectUrl.current)
+        draftObjectUrl.current = nextUrl
+        setDraftUrl(nextUrl)
+      }).catch((error: unknown) => {
+        if (controller.signal.aborted || draftRequest.current !== request) return
+        onError(error instanceof Error ? error : '无法生成虚拟相机代表帧预览。')
+      }).finally(() => {
+        if (!controller.signal.aborted && draftRequest.current === request) {
+          setDraftPending(false)
+        }
+      })
+    }, 120)
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+    }
+  }, [backend, draftKey, showDraft])
 
   useEffect(() => {
     const request = ++compositeRequest.current
@@ -158,23 +237,35 @@ export function PreviewPage({
   }, [backend, compositeAuthority, onError])
 
   const generate = async (): Promise<void> => {
-    if (busy || !cropSaved) return
+    if (busy || !cropValid || !alignmentValid || !groundConfirmed) return
     setRunning(true)
-    try { await onStartStage('composite') }
+    try {
+      if (!cropSaved || !alignmentSaved) {
+        onProjectChange(await backend.updateProject({
+          expected_project_id: project.project_id,
+          gs_scale: scaleDraft,
+          scene_azimuth: azimuthDraft,
+          output_crop: cropDraft,
+        }))
+      }
+      await onStartStage('composite')
+    }
     catch (error) { onError(error instanceof Error ? error : '预览合成任务失败。') }
     finally { setRunning(false) }
   }
 
-  const saveCrop = async (): Promise<void> => {
-    if (!cropValid || busy || running) return
+  const saveDraft = async (): Promise<void> => {
+    if (!cropValid || !alignmentValid || busy || running) return
     setRunning(true)
     try {
       onProjectChange(await backend.updateProject({
         expected_project_id: project.project_id,
+        gs_scale: scaleDraft,
+        scene_azimuth: azimuthDraft,
         output_crop: cropDraft,
       }))
     } catch (error) {
-      onError(error instanceof Error ? error : '无法保存固定输出裁剪。')
+      onError(error instanceof Error ? error : '无法保存轨迹映射与固定输出裁剪。')
     } finally {
       setRunning(false)
     }
@@ -222,7 +313,7 @@ export function PreviewPage({
       <div className="preview-layout">
         <article className="preview-card">
           <div className="preview-media preview-surface">
-            {compositeAuthority !== null ? (
+            {compositeAuthority !== null && !showDraft ? (
               displayedComposite === null
                 ? <div className="viewport-empty">正在验证合成预览…</div>
                 : (
@@ -234,38 +325,49 @@ export function PreviewPage({
                       src={displayedComposite.url}
                     />
                   )
-            ) : (
-              frameUrl === null
-                ? <div className="viewport-empty">暂无相机参考帧</div>
-                : <img alt="相机参考帧（非合成视频）" src={frameUrl} />
-            )}
+            ) : draftUrl !== null ? (
+              <img alt="虚拟相机代表帧合成预览" src={draftUrl} />
+            ) : frameUrl === null ? (
+              <div className="viewport-empty">{draftPending ? '正在生成虚拟相机代表帧…' : '暂无可用的合成代表帧'}</div>
+            ) : <>
+                <img alt="相机参考帧（非合成视频）" src={frameUrl} />
+                <span aria-label="固定输出裁剪预览" className="fixed-output-crop-preview" />
+                {draftPending ? <span className="viewport-status">正在刷新真实合成代表帧…</span> : null}
+              </>}
           </div>
           <div className="preview-caption">
-            <span>{compositeAuthority === null ? '相机参考 · 非合成视频' : '后端验证 · 低分辨率合成'}</span>
+            <span>{compositeAuthority !== null && !showDraft ? '后端验证 · 低分辨率合成' : draftUrl !== null ? '当前参数 · 代表帧真实合成' : draftPending ? '相机参考 · 等待代表帧' : '相机参考 · 非合成视频'}</span>
             <span>ViPE 逐帧内参</span>
             <span>目标地面 r{project.workflow.target_ground?.revision ?? '—'}</span>
           </div>
         </article>
         <aside className="control-card">
           <h3>全片合成</h3>
-          <p>GS 比例 {project.workflow.gs_scale.toFixed(3)}× · 方位角 {project.workflow.scene_azimuth.toFixed(1)}°</p>
+          <fieldset disabled={busy || running}>
+            <legend>轨迹映射</legend>
+            <label>GS 比例<input aria-label="GS 比例" max="1000" min="0.001" onChange={(event) => setScaleText(event.currentTarget.value)} step="0.01" type="number" value={scaleText} /></label>
+            <label>场景方位角<input aria-label="场景方位角" max="179.999" min="-180" onChange={(event) => setAzimuthText(event.currentTarget.value)} step="1" type="number" value={azimuthText} /></label>
+          </fieldset>
           <fieldset disabled={busy || running}>
             <legend>固定输出裁剪</legend>
-            {(['x', 'y', 'width', 'height'] as const).map((key) => <label key={key}>{key.toUpperCase()}<input aria-label={`输出裁剪 ${key.toUpperCase()}`} onChange={(event) => setCropText((current) => ({ ...current, [key]: event.currentTarget.value }))} step={key === 'width' || key === 'height' ? 2 : 1} type="number" value={cropText[key]} /></label>)}
+            {(['x', 'y', 'width', 'height'] as const).map((key) => <label key={key}>{key.toUpperCase()}<input aria-label={`输出裁剪 ${key.toUpperCase()}`} onChange={(event) => {
+              const value = event.currentTarget.value
+              setCropText((current) => ({ ...current, [key]: value }))
+            }} step={key === 'width' || key === 'height' ? 2 : 1} type="number" value={cropText[key]} /></label>)}
           </fieldset>
           <p className="technical-note">X/Y 使用源画面像素坐标，可为负数；裁剪框允许超出源视频范围，外部区域由 GS 背景填充。宽高须为偶数，最大 3840×2160。</p>
-          <button disabled={busy || running || !cropValid || cropSaved} onClick={() => void saveCrop()} type="button">保存固定裁剪</button>
-          <button disabled={busy || running || compositeRunning || !groundConfirmed || !cropSaved} onClick={() => void generate()} type="button">{busy || running || compositeRunning ? '生成中…' : '生成预览'}</button>
+          <button disabled={busy || running || !cropValid || !alignmentValid || (cropSaved && alignmentSaved)} onClick={() => void saveDraft()} type="button">保存预览参数</button>
+          <button disabled={busy || running || compositeRunning || !groundConfirmed || !cropValid || !alignmentValid} onClick={() => void generate()} type="button">{busy || running || compositeRunning ? '生成中…' : '生成预览'}</button>
           <div className="stage-list" aria-label="预览阶段缓存状态">
             {stageRows.map((name) => <div key={name}><span>{name}</span><strong>{project.stages[name]?.status ?? 'pending'}</strong></div>)}
           </div>
         </aside>
       </div>
       <div className="honest-state">
-        <strong>{compositeAuthority === null ? '等待真实合成任务' : '合成阶段已由后端确认'}</strong>
-        <p>{compositeAuthority === null
-          ? '当前静态 Gaussian 画面仅用于机位参考，不是合成结果。'
-          : '播放器只使用当前成功合成缓存对应的后端验证视频。'}</p>
+        <strong>{compositeAuthority !== null && !showDraft ? '合成阶段已由后端确认' : '代表帧随参数实时更新'}</strong>
+        <p>{compositeAuthority !== null && !showDraft
+          ? '播放器只使用当前成功合成缓存对应的后端验证视频。'
+          : '代表帧使用当前 GS 比例、方位角和固定输出裁剪；生成预览时会保存这些参数并执行全片低分辨率合成。'}</p>
       </div>
       {recoveryFailed ? (
         <div className="recovery-actions">

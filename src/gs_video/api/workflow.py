@@ -35,7 +35,7 @@ from gs_video.environment.vram import (
 )
 from gs_video.resource_admission import fits_vram_budget
 from gs_video.pipeline.artifacts import validate_cache_key
-from gs_video.scene.camera import OrbitCamera, matrix4_tuple
+from gs_video.scene.camera import OrbitCamera, matrix3_tuple, matrix4_tuple
 from gs_video.scene.camera import MatrixCamera
 from gs_video.scene.gsplat_renderer import GsplatRenderer
 from gs_video.scene.ply import load_gaussian_ply
@@ -69,6 +69,12 @@ def _camera_payload(camera: CameraLike) -> CameraPayload:
         return MatrixCameraPayload(
             camera_to_world=matrix4_tuple(camera.camera_to_world()),
             fov_y_degrees=camera.fov_y_degrees,
+            intrinsics=(
+                None
+                if camera.intrinsics_matrix is None
+                else matrix3_tuple(camera.intrinsics_matrix)
+            ),
+            source_size=camera.source_size,
         )
     return OrbitCameraPayload(
         target=camera.target,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from gs_video.scene.camera import OrbitCamera
+from gs_video.scene.camera import MatrixCamera, OrbitCamera
 
 
 def test_intrinsics_put_principal_point_at_image_center() -> None:
@@ -64,3 +64,21 @@ def test_intrinsics_reject_non_positive_dimensions(width: int, height: int) -> N
 
     with pytest.raises(ValueError, match="dimensions"):
         camera.intrinsics(width, height)
+
+
+def test_matrix_camera_scales_authoritative_crop_intrinsics_for_preview() -> None:
+    camera = MatrixCamera(
+        np.eye(4),
+        60,
+        intrinsics_matrix=np.array(
+            [[800.0, 0.0, 920.0], [0.0, 810.0, 510.0], [0.0, 0.0, 1.0]]
+        ),
+        source_size=(1920, 1080),
+    )
+
+    np.testing.assert_allclose(
+        camera.intrinsics(960, 540),
+        np.array(
+            [[400.0, 0.0, 460.0], [0.0, 405.0, 255.0], [0.0, 0.0, 1.0]]
+        ),
+    )

@@ -74,6 +74,12 @@ class MatrixCameraPayload(_StrictModel):
         tuple[float, float, float, float],
     ]
     fov_y_degrees: float = Field(gt=0, lt=180)
+    intrinsics: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ] | None = None
+    source_size: tuple[int, int] | None = None
 
     @field_validator("camera_to_world", mode="before")
     @classmethod
@@ -99,6 +105,28 @@ class MatrixCameraPayload(_StrictModel):
     @classmethod
     def validate_number(cls, value: object) -> object:
         return _finite(value, "camera value")
+
+    @model_validator(mode="after")
+    def validate_intrinsics(self) -> MatrixCameraPayload:
+        if (self.intrinsics is None) != (self.source_size is None):
+            raise ValueError("intrinsics and source_size must be supplied together")
+        if self.intrinsics is None:
+            return self
+        matrix = np.asarray(self.intrinsics, dtype=np.float64)
+        assert self.source_size is not None
+        if (
+            matrix.shape != (3, 3)
+            or not np.all(np.isfinite(matrix))
+            or matrix[0, 0] <= 0
+            or matrix[1, 1] <= 0
+            or not np.allclose(matrix[2], (0.0, 0.0, 1.0), atol=1e-12)
+            or type(self.source_size[0]) is not int
+            or type(self.source_size[1]) is not int
+            or self.source_size[0] <= 0
+            or self.source_size[1] <= 0
+        ):
+            raise ValueError("intrinsics must be a valid pinhole calibration")
+        return self
 
 
 CameraPayload: TypeAlias = OrbitCameraPayload | MatrixCameraPayload

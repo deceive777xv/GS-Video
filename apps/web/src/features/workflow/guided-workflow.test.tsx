@@ -260,6 +260,7 @@ function createHarness(initial = project()) {
       }
     }),
     renderLivePreview: vi.fn().mockResolvedValue(new Blob()),
+    renderDraftCompositePreview: vi.fn().mockResolvedValue(new Blob()),
     closeLivePreview: vi.fn().mockResolvedValue(undefined),
     fetchPreviewArtifact: vi.fn(async () => new Blob(['preview'], { type: 'image/png' })),
     fitTargetGround: vi.fn(async () => structuredClone(current)),

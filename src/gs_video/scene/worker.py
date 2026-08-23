@@ -180,6 +180,12 @@ def _render_pick(request: RenderPickRequest) -> CompleteEvent:
                 request.camera.camera_to_world, dtype=np.float64
             ),
             fov_y_degrees=request.camera.fov_y_degrees,
+            intrinsics_matrix=(
+                None
+                if request.camera.intrinsics is None
+                else np.asarray(request.camera.intrinsics, dtype=np.float64)
+            ),
+            source_size=request.camera.source_size,
         )
         if isinstance(request.camera, MatrixCameraPayload)
         else OrbitCamera(**request.camera.model_dump())

@@ -120,6 +120,12 @@ def _camera(payload: OrbitCameraPayload | MatrixCameraPayload) -> OrbitCamera | 
         return MatrixCamera(
             camera_to_world_matrix=np.asarray(payload.camera_to_world, dtype=np.float64),
             fov_y_degrees=payload.fov_y_degrees,
+            intrinsics_matrix=(
+                None
+                if payload.intrinsics is None
+                else np.asarray(payload.intrinsics, dtype=np.float64)
+            ),
+            source_size=payload.source_size,
         )
     return OrbitCamera(**payload.model_dump())
 

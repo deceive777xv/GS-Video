@@ -312,6 +312,17 @@ class LivePreviewRequest(StrictModel):
     camera: CameraInput | MatrixCameraInput
 
 
+class DraftCompositePreviewRequest(StrictModel):
+    expected_project_id: str = Field(min_length=1)
+    request_id: int = Field(ge=1)
+    frame_index: int | None = Field(default=None, ge=0)
+    maximum_width: int = Field(default=960, ge=2, le=960)
+    maximum_height: int = Field(default=540, ge=2, le=540)
+    gs_scale: float = Field(ge=0.001, le=1000)
+    scene_azimuth: float = Field(ge=-180, lt=180)
+    output_crop: OutputCropInput
+
+
 class PreviewFrameResponse(StrictModel):
     artifact_id: str
     generation: int

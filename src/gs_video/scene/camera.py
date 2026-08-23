@@ -124,6 +124,8 @@ class MatrixCamera:
 
     camera_to_world_matrix: Float64Array
     fov_y_degrees: float
+    intrinsics_matrix: Float64Array | None = None
+    source_size: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         matrix = np.asarray(self.camera_to_world_matrix, dtype=np.float64)
@@ -138,6 +140,26 @@ class MatrixCamera:
             raise ValueError("camera_to_world_matrix must be a finite rigid transform")
         if not isfinite(self.fov_y_degrees) or not 0 < self.fov_y_degrees < 180:
             raise ValueError("fov_y_degrees must be finite and between 0 and 180")
+        intrinsics = self.intrinsics_matrix
+        source_size = self.source_size
+        if (intrinsics is None) != (source_size is None):
+            raise ValueError("authoritative intrinsics require a source size")
+        if intrinsics is not None:
+            calibration = np.asarray(intrinsics, dtype=np.float64)
+            if (
+                calibration.shape != (3, 3)
+                or not np.all(np.isfinite(calibration))
+                or calibration[0, 0] <= 0
+                or calibration[1, 1] <= 0
+                or not np.allclose(calibration[2], (0.0, 0.0, 1.0), atol=1e-12)
+                or source_size is None
+                or type(source_size[0]) is not int
+                or type(source_size[1]) is not int
+                or source_size[0] <= 0
+                or source_size[1] <= 0
+            ):
+                raise ValueError("intrinsics_matrix must be a valid pinhole calibration")
+            object.__setattr__(self, "intrinsics_matrix", calibration.copy())
         object.__setattr__(self, "camera_to_world_matrix", matrix.copy())
 
     def camera_to_world(self) -> Float64Array:
@@ -149,6 +171,12 @@ class MatrixCamera:
     def intrinsics(self, width: int, height: int) -> Float64Array:
         if width <= 0 or height <= 0:
             raise ValueError("image dimensions must be positive")
+        if self.intrinsics_matrix is not None and self.source_size is not None:
+            source_width, source_height = self.source_size
+            matrix = np.asarray(self.intrinsics_matrix, dtype=np.float64).copy()
+            matrix[0, :] *= width / source_width
+            matrix[1, :] *= height / source_height
+            return matrix
         focal_length = 0.5 * height / tan(radians(self.fov_y_degrees) * 0.5)
         return np.array(
             [

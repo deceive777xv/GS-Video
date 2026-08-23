@@ -107,6 +107,7 @@ const fakeClient = (): BackendClient => ({
   updateProject: vi.fn(),
   renderPreview: vi.fn(),
   renderLivePreview: vi.fn().mockResolvedValue(new Blob()),
+  renderDraftCompositePreview: vi.fn().mockResolvedValue(new Blob()),
   closeLivePreview: vi.fn().mockResolvedValue(undefined),
   fetchPreviewArtifact: vi.fn(),
   fitTargetGround: vi.fn(),

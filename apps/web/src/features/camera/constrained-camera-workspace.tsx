@@ -102,6 +102,10 @@ function cameraInput(pose: EulerPose): MatrixCameraInput {
   return { camera_to_world: poseMatrix(pose), fov_y_degrees: pose.fov }
 }
 
+function poseFingerprint(pose: EulerPose): string {
+  return JSON.stringify(cameraInput(pose))
+}
+
 function previewAuthority(projectId: string, preview: PreviewFrameDto | null): string | null {
   if (preview === null) return null
   return JSON.stringify([
@@ -165,21 +169,32 @@ export function ConstrainedCameraWorkspace({
   const [pose, setPose] = useState(() => matrixPose(project.workflow.exploration_camera))
   const [frame, setFrame] = useState<PreviewFrameDto | null>(null)
   const [frameUrl, setFrameUrl] = useState<string | null>(null)
+  const [liveUrl, setLiveUrl] = useState<string | null>(null)
+  const [frameFingerprint, setFrameFingerprint] = useState<string | null>(null)
+  const [settling, setSettling] = useState(false)
   const [hints, setHints] = useState<ImagePoint[]>([])
   const [pending, setPending] = useState(false)
-  const [scaleText, setScaleText] = useState(String(project.workflow.gs_scale))
-  const [azimuthText, setAzimuthText] = useState(String(project.workflow.scene_azimuth))
   const viewportRef = useRef<HTMLDivElement>(null)
   const generation = useRef(project.workflow.preview?.generation ?? 0)
   const frameUrlRef = useRef<string | null>(null)
+  const liveUrlRef = useRef<string | null>(null)
   const frameAuthorityRef = useRef<string | null>(null)
   const previewRequest = useRef(0)
+  const automaticRequest = useRef(0)
+  const dragging = useRef<{ pointerId: number; x: number; y: number } | null>(null)
   const onErrorRef = useRef(onError)
+  const onProjectChangeRef = useRef(onProjectChange)
+  const onRefreshRef = useRef(onRefresh)
   onErrorRef.current = onError
+  onProjectChangeRef.current = onProjectChange
+  onRefreshRef.current = onRefresh
   const authoritativePreview = project.workflow.preview
   const authoritativePreviewKey = previewAuthority(project.project_id, authoritativePreview)
   const targetGround = project.workflow.target_ground
+  const fingerprint = poseFingerprint(pose)
+  const frameMatchesPose = frame !== null && frameFingerprint === fingerprint
   const candidateMatchesFrame = frame !== null
+    && frameMatchesPose
     && targetGround !== null
     && targetGround.preview_artifact_id === frame.artifact_id
     && targetGround.camera_revision === frame.camera_revision
@@ -190,12 +205,18 @@ export function ConstrainedCameraWorkspace({
     frameUrlRef.current = next
     setFrameUrl(next)
   }
+  const replaceLiveUrl = (next: string | null): void => {
+    if (liveUrlRef.current !== null) URL.revokeObjectURL(liveUrlRef.current)
+    liveUrlRef.current = next
+    setLiveUrl(next)
+  }
   useEffect(() => {
     generation.current = authoritativePreview?.generation ?? 0
     const request = ++previewRequest.current
     if (authoritativePreview === null || authoritativePreviewKey === null) {
       frameAuthorityRef.current = null
       setFrame(null)
+      setFrameFingerprint(null)
       replaceFrameUrl(null)
       return
     }
@@ -206,6 +227,7 @@ export function ConstrainedCameraWorkspace({
 
     frameAuthorityRef.current = null
     setFrame(null)
+    setFrameFingerprint(null)
     replaceFrameUrl(null)
     const controller = new AbortController()
     void backend.fetchPreviewArtifact(
@@ -220,61 +242,127 @@ export function ConstrainedCameraWorkspace({
       }
       frameAuthorityRef.current = authoritativePreviewKey
       setFrame(authoritativePreview)
+      setFrameFingerprint(poseFingerprint(matrixPose(project.workflow.exploration_camera)))
       replaceFrameUrl(nextUrl)
     }).catch((error: unknown) => {
       if (controller.signal.aborted || previewRequest.current !== request) return
       onErrorRef.current(error instanceof Error ? error : '无法载入当前 Gaussian 场景预览。')
     })
     return () => controller.abort()
-  }, [authoritativePreviewKey, backend])
+  }, [authoritativePreviewKey, backend, project.workflow.exploration_camera])
   useEffect(() => () => {
+    automaticRequest.current += 1
     previewRequest.current += 1
     frameAuthorityRef.current = null
+    replaceLiveUrl(null)
     replaceFrameUrl(null)
   }, [])
 
-  const updatePose = (key: keyof EulerPose, value: number): void => {
-    setPose((current) => ({ ...current, [key]: value }))
-    frameAuthorityRef.current = null
-    setFrame(null)
-    replaceFrameUrl(null)
+  const changePose = (updater: (current: EulerPose) => EulerPose): void => {
+    setPose(updater)
     setHints([])
   }
 
-  const renderSelectionView = async (): Promise<void> => {
-    if (pending || busy) return
-    setPending(true)
-    try {
-      generation.current += 1
-      const rendered = await backend.renderPreview({
-        expected_project_id: project.project_id,
-        generation: generation.current,
-        width: 960,
-        height: 540,
-        camera: cameraInput(pose),
-      })
-      const blob = await backend.fetchPreviewArtifact(rendered.artifact_id)
-      frameAuthorityRef.current = previewAuthority(project.project_id, rendered)
-      replaceFrameUrl(URL.createObjectURL(blob))
-      setFrame(rendered)
-      setHints([])
-      onProjectChange(await onRefresh())
-    } catch (error) {
-      onError(error)
-    } finally {
-      setPending(false)
-    }
+  const updatePose = (key: keyof EulerPose, value: number): void => {
+    changePose((current) => ({ ...current, [key]: value }))
   }
 
+  const moveLocal = (right: number, down: number, forward: number): void => {
+    changePose((current) => {
+      const matrix = poseMatrix(current)
+      return {
+        ...current,
+        x: current.x + matrix[0][0] * right + matrix[0][1] * down + matrix[0][2] * forward,
+        y: current.y + matrix[1][0] * right + matrix[1][1] * down + matrix[1][2] * forward,
+        z: current.z + matrix[2][0] * right + matrix[2][1] * down + matrix[2][2] * forward,
+      }
+    })
+  }
+
+  useEffect(() => {
+    if (busy || pending || frameMatchesPose || (authoritativePreview !== null && frame === null)) return
+    const request = ++automaticRequest.current
+    generation.current += 1
+    const requestedGeneration = generation.current
+    const requestedCamera = cameraInput(pose)
+    const liveController = new AbortController()
+    const settledController = new AbortController()
+    setSettling(true)
+    const liveTimer = window.setTimeout(() => {
+      void backend.renderLivePreview({
+        expected_project_id: project.project_id,
+        request_id: request,
+        width: 960,
+        height: 540,
+        camera: requestedCamera,
+      }, liveController.signal).then((blob) => {
+        if (liveController.signal.aborted || automaticRequest.current !== request) return
+        replaceLiveUrl(URL.createObjectURL(blob))
+      }).catch((error: unknown) => {
+        if (liveController.signal.aborted || automaticRequest.current !== request) return
+        onErrorRef.current(error)
+      })
+    }, 40)
+    const settledTimer = window.setTimeout(() => {
+      void backend.renderPreview({
+        expected_project_id: project.project_id,
+        generation: requestedGeneration,
+        width: 960,
+        height: 540,
+        camera: requestedCamera,
+      }, settledController.signal).then(async (rendered) => {
+        const blob = await backend.fetchPreviewArtifact(rendered.artifact_id, settledController.signal)
+        if (settledController.signal.aborted || automaticRequest.current !== request) return
+        const nextUrl = URL.createObjectURL(blob)
+        if (settledController.signal.aborted || automaticRequest.current !== request) {
+          URL.revokeObjectURL(nextUrl)
+          return
+        }
+        frameAuthorityRef.current = previewAuthority(project.project_id, rendered)
+        setFrame(rendered)
+        setFrameFingerprint(fingerprint)
+        replaceFrameUrl(nextUrl)
+        replaceLiveUrl(null)
+        setHints([])
+        const refreshed = await onRefreshRef.current()
+        if (settledController.signal.aborted || automaticRequest.current !== request) return
+        onProjectChangeRef.current(refreshed)
+      }).catch((error: unknown) => {
+        if (settledController.signal.aborted || automaticRequest.current !== request) return
+        onErrorRef.current(error)
+      }).finally(() => {
+        if (automaticRequest.current === request) setSettling(false)
+      })
+    }, 140)
+    return () => {
+      window.clearTimeout(liveTimer)
+      window.clearTimeout(settledTimer)
+      liveController.abort()
+      settledController.abort()
+    }
+  }, [authoritativePreview, backend, busy, fingerprint, frame, frameMatchesPose, pending, pose, project.project_id])
+
+  useEffect(() => {
+    const viewport = viewportRef.current
+    if (viewport === null) return
+    const onWheel = (event: WheelEvent): void => {
+      event.preventDefault()
+      event.stopPropagation()
+      if (!busy && !pending) moveLocal(0, 0, event.deltaY > 0 ? -0.25 : 0.25)
+    }
+    viewport.addEventListener('wheel', onWheel, { passive: false })
+    return () => viewport.removeEventListener('wheel', onWheel)
+  })
+
   const addHint = (event: ReactPointerEvent<HTMLDivElement>): void => {
-    if (frame === null || viewportRef.current === null || hints.length >= 3 || pending || busy) return
+    if (event.button !== 0 || !frameMatchesPose || frame === null || viewportRef.current === null || hints.length >= 3 || pending || busy) return
     const point = toImagePoint(event, viewportRef.current.getBoundingClientRect(), frame)
     if (point === null || hints.some((item) => item.x === point.x && item.y === point.y)) return
     setHints((current) => [...current, point])
   }
 
   const fitGround = async (): Promise<void> => {
-    if (frame === null || hints.length !== 3 || pending || busy) return
+    if (!frameMatchesPose || frame === null || hints.length !== 3 || pending || busy) return
     setPending(true)
     try {
       const [p0, p1, p2] = hints
@@ -305,25 +393,6 @@ export function ConstrainedCameraWorkspace({
     }
   }
 
-  const saveAlignment = async (): Promise<void> => {
-    const gsScale = Number(scaleText)
-    const sceneAzimuth = Number(azimuthText)
-    if (!Number.isFinite(gsScale) || gsScale < 0.001 || gsScale > 1000
-      || !Number.isFinite(sceneAzimuth) || sceneAzimuth < -180 || sceneAzimuth >= 180) return
-    setPending(true)
-    try {
-      onProjectChange(await backend.updateProject({
-        expected_project_id: project.project_id,
-        gs_scale: gsScale,
-        scene_azimuth: sceneAzimuth,
-      }))
-    } catch (error) {
-      onError(error)
-    } finally {
-      setPending(false)
-    }
-  }
-
   const shownHints = candidateMatchesFrame && targetGround !== null
     ? targetGround.hint_pixels.map(([x, y]) => ({ x, y }))
     : hints
@@ -340,38 +409,56 @@ export function ConstrainedCameraWorkspace({
         <div
           aria-label="Gaussian 地面提示视口"
           className="viewport-frame preview-surface exploration-viewport"
-          onPointerDown={addHint}
+          onPointerDown={(event) => {
+            if (event.button === 1 && !busy && !pending) {
+              event.preventDefault()
+              event.currentTarget.setPointerCapture?.(event.pointerId)
+              dragging.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY }
+              return
+            }
+            addHint(event)
+          }}
+          onPointerMove={(event) => {
+            const drag = dragging.current
+            if (drag === null || drag.pointerId !== event.pointerId || busy || pending) return
+            const dx = event.clientX - drag.x
+            const dy = event.clientY - drag.y
+            dragging.current = { ...drag, x: event.clientX, y: event.clientY }
+            if (event.shiftKey) moveLocal(-dx * 0.01, -dy * 0.01, 0)
+            else changePose((current) => ({
+              ...current,
+              yaw: current.yaw + dx * 0.2,
+              pitch: Math.max(-89, Math.min(89, current.pitch - dy * 0.2)),
+            }))
+          }}
+          onPointerUp={(event) => {
+            if (dragging.current?.pointerId === event.pointerId) dragging.current = null
+          }}
+          onPointerCancel={() => { dragging.current = null }}
           ref={viewportRef}
         >
-          {frameUrl === null ? <div className="viewport-empty">调整探索相机后，生成可点选视图</div> : <img alt="Gaussian 地面选择视图" draggable={false} src={frameUrl} />}
-          {frame === null ? null : shownHints.map((point, index) => <Marker frame={frame} key={`${point.x}:${point.y}:${index}`} label={`H${index}`} point={point} />)}
-          {frame !== null && shownHints.length === 3 ? <svg aria-label="自动地面候选范围" className="ground-plane-overlay" preserveAspectRatio="none" viewBox={`0 0 ${frame.width} ${frame.height}`}><polygon points={shownHints.map((point) => `${point.x + 0.5},${point.y + 0.5}`).join(' ')} /></svg> : null}
+          {(liveUrl ?? frameUrl) === null ? <div className="viewport-empty">正在准备 Gaussian 实时预览…</div> : <img alt="Gaussian 地面选择视图" draggable={false} src={(liveUrl ?? frameUrl) ?? ''} />}
+          {!frameMatchesPose || frame === null ? null : shownHints.map((point, index) => <Marker frame={frame} key={`${point.x}:${point.y}:${index}`} label={`H${index}`} point={point} />)}
+          {frameMatchesPose && frame !== null && shownHints.length === 3 ? <svg aria-label="自动地面候选范围" className="ground-plane-overlay" preserveAspectRatio="none" viewBox={`0 0 ${frame.width} ${frame.height}`}><polygon points={shownHints.map((point) => `${point.x + 0.5},${point.y + 0.5}`).join(' ')} /></svg> : null}
+          {settling ? <span className="viewport-status">交互预览 · 停止后自动启用地面拾取</span> : null}
         </div>
         <aside className="viewport-controls">
           <div className="camera-readout sixdof-readout">
             {(['x', 'y', 'z', 'yaw', 'pitch', 'roll'] as const).map((key) => <NumberField disabled={busy || pending} key={key} label={`探索相机 ${key.toUpperCase()}`} onChange={(value) => updatePose(key, value)} value={pose[key]} />)}
           </div>
           <NumberField disabled={busy || pending} label="探索相机 FOV" max={120} min={10} onChange={(value) => updatePose('fov', value)} value={pose.fov} />
-          <button disabled={busy || pending} onClick={() => { setPose(DEFAULT_POSE); frameAuthorityRef.current = null; setFrame(null); replaceFrameUrl(null); setHints([]) }} type="button">重置探索相机</button>
-          <button disabled={busy || pending} onClick={() => void renderSelectionView()} type="button">更新地面选择视图</button>
+          <button disabled={busy || pending} onClick={() => changePose(() => DEFAULT_POSE)} type="button">重置探索相机</button>
+          <p className="technical-note">中键拖拽环视，Shift + 中键平移，滚轮前后移动；停止操作后会自动生成可拾取帧。</p>
         </aside>
       </div>
       <div className="camera-secondary-panel">
         <p>{shownHints.length}/3 个地面提示。P0 对应源锚帧相机在源地面上的垂直投影。重新生成视图会清除未拟合提示。</p>
         <div className="secondary-actions">
           <button disabled={busy || pending || hints.length === 0} onClick={() => setHints([])} type="button">重选三点</button>
-          <button disabled={busy || pending || frame === null || hints.length !== 3} onClick={() => void fitGround()} type="button">自动寻找真正地面</button>
+          <button disabled={busy || pending || !frameMatchesPose || frame === null || hints.length !== 3} onClick={() => void fitGround()} type="button">自动寻找真正地面</button>
           <button disabled={busy || pending || targetGround === null || targetGround.confirmed} onClick={() => void confirmGround()} type="button">确认地面</button>
         </div>
         {targetGround === null ? null : <p className="technical-note">置信度 {(targetGround.confidence * 100).toFixed(1)}%，三邻域支持 {targetGround.support_counts.join(' / ')}，RMS {targetGround.rms_residual.toPrecision(3)}。</p>}
-      </div>
-      <div className="camera-secondary-panel">
-        <h4>轨迹映射</h4>
-        <div className="secondary-actions">
-          <label>GS 比例<input aria-label="GS 比例" disabled={busy || pending} min="0.001" max="1000" onChange={(event) => setScaleText(event.currentTarget.value)} step="0.01" type="number" value={scaleText} /></label>
-          <label>场景方位角<input aria-label="场景方位角" disabled={busy || pending} min="-180" max="179.999" onChange={(event) => setAzimuthText(event.currentTarget.value)} step="1" type="number" value={azimuthText} /></label>
-          <button disabled={busy || pending || targetGround?.confirmed !== true} onClick={() => void saveAlignment()} type="button">保存轨迹对齐</button>
-        </div>
       </div>
     </section>
   )

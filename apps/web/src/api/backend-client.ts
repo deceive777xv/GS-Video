@@ -8,6 +8,7 @@ import type {
   ProjectPatch,
   PreviewFrameDto,
   LivePreviewRequest,
+  DraftCompositePreviewRequest,
   PreviewRequest,
   StageName,
   TaskDto,
@@ -68,6 +69,10 @@ export interface BackendClient {
     signal?: AbortSignal,
   ): Promise<PreviewFrameDto>
   renderLivePreview(input: LivePreviewRequest, signal?: AbortSignal): Promise<Blob>
+  renderDraftCompositePreview(
+    input: DraftCompositePreviewRequest,
+    signal?: AbortSignal,
+  ): Promise<Blob>
   closeLivePreview(): Promise<void>
   fetchPreviewArtifact(id: string, signal?: AbortSignal): Promise<Blob>
   fitTargetGround(input: TargetGroundCandidateInput): Promise<ProjectDto>

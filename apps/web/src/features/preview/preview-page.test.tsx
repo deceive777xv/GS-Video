@@ -1,11 +1,14 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
 
 import type { BackendClient } from '../../api/backend-client'
 import type { ProjectDto, TaskDto } from '../../api/types'
 import { PreviewPage } from './preview-page'
 
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => {
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+})
 
 it('does not admit a second composite task while the authoritative owner is active', () => {
   const project = {
@@ -171,6 +174,129 @@ it('revokes and removes a displayed frame when preview authority becomes null', 
   await waitFor(() => expect(screen.queryByRole('img', { name: '相机参考帧（非合成视频）' })).toBeNull())
   expect(createUrl).toHaveBeenCalledOnce()
   expect(revokeUrl).toHaveBeenCalledWith('blob:preview')
+})
+
+it('does not retain React change events across batched crop edits', () => {
+  const project = failedProject()
+  project.workflow.source_summary = {
+    filename: 'portrait.mp4', size: 1, sha256: 'a'.repeat(64),
+    width: 480, height: 852, duration_seconds: 1, fps: '30',
+    has_audio: false, frame_count: 30,
+  }
+  render(
+    <PreviewPage
+      activeTask={null}
+      backend={{} as BackendClient}
+      busy={false}
+      latestEvent={null}
+      onBackToCamera={vi.fn()}
+      onError={vi.fn()}
+      onProjectChange={vi.fn()}
+      onReselectSubject={vi.fn()}
+      onStartStage={vi.fn()}
+      project={project}
+    />,
+  )
+  const cropX = screen.getByLabelText('输出裁剪 X')
+  const cropY = screen.getByLabelText('输出裁剪 Y')
+
+  expect(() => {
+    act(() => {
+      fireEvent.change(cropX, { target: { value: '-20' } })
+      fireEvent.change(cropY, { target: { value: '12' } })
+    })
+  }).not.toThrow()
+  expect(cropX).toHaveValue(-20)
+  expect(cropY).toHaveValue(12)
+})
+
+it('shows the fixed output crop on the camera reference before generating', async () => {
+  vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:camera-reference')
+  vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+  const backend = {
+    fetchPreviewArtifact: vi.fn(async () => new Blob(['camera'], { type: 'image/png' })),
+  } as unknown as BackendClient
+  const current = compositeProject(null, 'pending')
+  current.workflow.source_summary = {
+    filename: 'portrait.mp4', size: 1, sha256: 'a'.repeat(64),
+    width: 480, height: 852, duration_seconds: 1, fps: '30',
+    has_audio: false, frame_count: 30,
+  }
+
+  render(<PreviewPage {...compositeProps(backend, current)} />)
+  expect(await screen.findByRole('img', { name: '相机参考帧（非合成视频）' })).toBeVisible()
+  expect(screen.getByLabelText('固定输出裁剪预览')).toBeVisible()
+})
+
+function draftProject(): ProjectDto {
+  const current = compositeProject(null, 'pending')
+  current.project_id = 'project-draft'
+  current.workflow.source_summary = {
+    filename: 'portrait.mp4', size: 1, sha256: 'a'.repeat(64),
+    width: 480, height: 852, duration_seconds: 1, fps: '30',
+    has_audio: false, frame_count: 30,
+  }
+  current.workflow.output_crop = { x: 0, y: 0, width: 480, height: 852 }
+  current.workflow.subject_prompt = { frame_index: 4, x: 10, y: 20 }
+  current.workflow.target_ground = { confirmed: true, revision: 3 } as ProjectDto['workflow']['target_ground']
+  current.stages.solve_camera = {
+    status: 'succeeded', cache_key: 'solve-key', output_paths: [], error_code: null, artifacts: {},
+  }
+  current.stages.segment = {
+    status: 'succeeded', cache_key: 'segment-key', output_paths: [], error_code: null, artifacts: {},
+  }
+  return current
+}
+
+it('renders a real representative composite for draft alignment and crop values', async () => {
+  vi.useFakeTimers()
+  vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:draft-composite')
+  vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+  const backend = {
+    fetchPreviewArtifact: vi.fn(async () => new Blob(['camera'], { type: 'image/png' })),
+    renderDraftCompositePreview: vi.fn(async () => new Blob(['draft'], { type: 'image/png' })),
+  } as unknown as BackendClient
+
+  render(<PreviewPage {...compositeProps(backend, draftProject())} />)
+  await act(async () => { await vi.advanceTimersByTimeAsync(150) })
+
+  expect(backend.renderDraftCompositePreview).toHaveBeenCalledWith(
+    expect.objectContaining({
+      expected_project_id: 'project-draft',
+      gs_scale: 1,
+      scene_azimuth: 0,
+      output_crop: { x: 0, y: 0, width: 480, height: 852 },
+    }),
+    expect.any(AbortSignal),
+  )
+  expect(screen.getByRole('img', { name: '虚拟相机代表帧合成预览' })).toHaveAttribute(
+    'src',
+    'blob:draft-composite',
+  )
+})
+
+it('saves unsaved preview parameters before directly starting generation', async () => {
+  const current = draftProject()
+  const saved = draftProject()
+  saved.workflow.scene_azimuth = 12
+  const backend = {
+    fetchPreviewArtifact: vi.fn(async () => new Blob(['camera'], { type: 'image/png' })),
+    renderDraftCompositePreview: vi.fn(() => new Promise<Blob>(() => undefined)),
+    updateProject: vi.fn(async () => saved),
+  } as unknown as BackendClient
+  const onProjectChange = vi.fn()
+  const onStartStage = vi.fn(async () => undefined)
+  render(<PreviewPage {...compositeProps(backend, current)} onProjectChange={onProjectChange} onStartStage={onStartStage} />)
+
+  fireEvent.change(screen.getByLabelText('场景方位角'), { target: { value: '12' } })
+  fireEvent.click(screen.getByRole('button', { name: '生成预览' }))
+
+  await waitFor(() => expect(backend.updateProject).toHaveBeenCalledWith(expect.objectContaining({
+    expected_project_id: 'project-draft', scene_azimuth: 12,
+  })))
+  expect(onProjectChange).toHaveBeenCalledWith(saved)
+  expect(onStartStage).toHaveBeenCalledWith('composite')
+  expect(backend.updateProject).toHaveBeenCalledBefore(onStartStage)
 })
 
 const compositeDescriptor = (artifactId: string) => ({

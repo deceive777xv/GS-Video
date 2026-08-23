@@ -52,6 +52,7 @@ const fakeBackendClient = (currentTask = task()): BackendClient => ({
   updateProject: vi.fn(),
   renderPreview: vi.fn(),
   renderLivePreview: vi.fn().mockResolvedValue(new Blob()),
+  renderDraftCompositePreview: vi.fn().mockResolvedValue(new Blob()),
   closeLivePreview: vi.fn().mockResolvedValue(undefined),
   fetchPreviewArtifact: vi.fn(),
   fitTargetGround: vi.fn(),
@@ -507,6 +508,42 @@ describe('HttpBackendClient', () => {
       camera: {
         target: [0, 0, 0], distance: 4, yaw: 5, pitch: 0, fov_y_degrees: 55,
       },
+    }))
+  })
+
+  it('returns an unsaved draft composite preview as a blob', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(new Blob(['png'], { type: 'image/png' }), {
+        status: 200,
+        headers: { 'Content-Type': 'image/png', 'X-Preview-Request-Id': '8' },
+      }),
+    )
+    const client = new HttpBackendClient({
+      origin: 'http://127.0.0.1:49152', token: 'secret', fetchImpl,
+    })
+
+    const frame = await client.renderDraftCompositePreview({
+      expected_project_id: 'project-1',
+      request_id: 8,
+      maximum_width: 960,
+      maximum_height: 540,
+      gs_scale: 1.25,
+      scene_azimuth: 12,
+      output_crop: { x: -20, y: 12, width: 640, height: 360 },
+    })
+
+    expect(frame.type).toBe('image/png')
+    expect(String(fetchImpl.mock.calls[0]?.[0])).toContain(
+      '/projects/current/preview/composite-draft',
+    )
+    expect(fetchImpl.mock.calls[0]?.[1]?.body).toBe(JSON.stringify({
+      expected_project_id: 'project-1',
+      request_id: 8,
+      maximum_width: 960,
+      maximum_height: 540,
+      gs_scale: 1.25,
+      scene_azimuth: 12,
+      output_crop: { x: -20, y: 12, width: 640, height: 360 },
     }))
   })
 

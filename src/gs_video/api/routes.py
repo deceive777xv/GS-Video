@@ -17,6 +17,11 @@ from fastapi import APIRouter, Depends, Request, Response, WebSocket, status
 
 from gs_video.api.auth import require_session
 from gs_video.api.assets import AssetInspectorLike, ExportInspectorLike
+from gs_video.api.draft_preview import (
+    composite_draft,
+    draft_authority,
+    prepare_draft_composite,
+)
 from gs_video.api.events import EventBus, TaskService, serve_events
 from gs_video.api.export_routes import build_export_router
 from gs_video.api.preview_routes import build_composite_preview_router
@@ -34,6 +39,7 @@ from gs_video.api.schemas import (
     CameraInput,
     MatrixCameraInput,
     EnvironmentRepairSnapshot,
+    DraftCompositePreviewRequest,
     HealthResponse,
     LivePreviewRequest,
     PreviewFrameRequest,
@@ -1233,8 +1239,7 @@ def build_router() -> APIRouter:
                     project.workflow.export_result = None
                 if patch.preview_height is not None:
                     project.workflow.preview_height = patch.preview_height
-                    invalidate_for_change(project, ChangeKind.TARGET_CAMERA)
-                    _clear_preview_authority(project)
+                    invalidate_for_change(project, ChangeKind.EDGE_SETTINGS)
                     project.workflow.export_result = None
 
             if patch.model_fields_set == {"name"} and services.project_manager is not None:
@@ -1458,6 +1463,86 @@ def build_router() -> APIRouter:
     async def close_live_preview(request: Request) -> Response:
         await asyncio.to_thread(_preview_service(request).close_live)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @protected.post(
+        "/api/v1/projects/current/preview/composite-draft",
+        response_class=Response,
+    )
+    async def render_draft_composite_preview(
+        request: Request, preview: DraftCompositePreviewRequest
+    ) -> Response:
+        services = _services(request)
+        repository = services.project_repository
+        project = _load_project(repository)
+        if project.project_id != preview.expected_project_id:
+            raise ApiError(
+                409,
+                code="project_context_changed",
+                category="conflict",
+                message="The active project changed before draft composition began.",
+            )
+        scene_summary = project.workflow.scene_summary
+        if scene_summary is None:
+            raise ApiError(
+                409,
+                code="scene_required",
+                category="project",
+                message="Import a Gaussian scene before previewing composition.",
+            )
+        authority = draft_authority(project)
+        artifact_root = (
+            repository.root
+            if services.artifact_store is None
+            else services.artifact_store.lookup_project_root(project.project_id)
+        )
+        plan = await asyncio.to_thread(
+            prepare_draft_composite,
+            project,
+            artifact_root,
+            services.artifact_store,
+            preview,
+        )
+        scene_path, scene_reference = _scene_input(services, project)
+        preview_root = _preview_workspace(services, project)
+        render_live_kwargs = (
+            {} if preview_root is None else {"preview_root": preview_root}
+        )
+        background = await asyncio.to_thread(
+            _preview_service(request).render_live,
+            repository.root,
+            scene_path,
+            scene_summary,
+            preview.request_id,
+            plan.camera,
+            plan.width,
+            plan.height,
+            **render_live_kwargs,
+        )
+        payload = await asyncio.to_thread(composite_draft, plan, background)
+        latest = _load_project(repository)
+        if (
+            draft_authority(latest) != authority
+            or (latest.scene_ply_asset_id or latest.scene_ply) != scene_reference
+        ):
+            raise ApiError(
+                409,
+                code="draft_preview_stale",
+                category="conflict",
+                message="Project authority changed while the draft preview was rendered.",
+                retryable=True,
+            )
+        return Response(
+            content=payload,
+            media_type="image/png",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "X-Preview-Request-Id": str(preview.request_id),
+                "X-Preview-Frame-Index": str(plan.frame_index),
+                "X-Preview-Width": str(plan.width),
+                "X-Preview-Height": str(plan.height),
+            },
+        )
 
     @protected.post(
         "/api/v1/projects/current/preview",

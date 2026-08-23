@@ -399,6 +399,17 @@ export interface LivePreviewRequest {
   camera: CameraInput | MatrixCameraInput
 }
 
+export interface DraftCompositePreviewRequest {
+  expected_project_id: string
+  request_id: number
+  frame_index?: number
+  maximum_width: number
+  maximum_height: number
+  gs_scale: number
+  scene_azimuth: number
+  output_crop: OutputCropDto
+}
+
 export interface TargetGroundCandidateInput {
   expected_project_id: string
   preview_artifact_id: string

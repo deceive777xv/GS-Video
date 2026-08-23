@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import Iterator
 from dataclasses import replace
 import hashlib
+from io import BytesIO
 from pathlib import Path
 from threading import Event
 from concurrent.futures import ThreadPoolExecutor
@@ -15,6 +16,9 @@ from PIL import Image
 from gs_video.api.routes import ApiServices
 from gs_video.api.schemas import ApiSettings
 from gs_video.app import create_app
+from gs_video.camera.classify import CameraKind
+from gs_video.camera.serialization import write_camera_solution
+from gs_video.camera.solution import CameraSolution, SourceGroundEstimate
 from gs_video.domain.contracts import PickBuffer
 from gs_video.domain.models import (
     ArtifactCategory,
@@ -27,6 +31,8 @@ from gs_video.domain.models import (
     StageState,
     StageStatus,
     SubjectPromptState,
+    TargetGroundState,
+    VideoSummary,
     SceneSummary,
 )
 from gs_video.environment.doctor import EnvironmentReport
@@ -262,6 +268,104 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
     )
     with TestClient(create_app(settings, services)) as client:
         yield client
+
+
+def test_draft_composite_preview_renders_current_mapped_camera_and_crop(
+    workflow_client: TestClient,
+) -> None:
+    repository = workflow_client.app.state.services.project_repository
+    project = repository.load()
+    camera_key = "5" * 64
+    camera_root = repository.root / "camera" / camera_key
+    camera_root.mkdir(parents=True)
+    calibration = np.array(
+        [[20.0, 0.0, 8.0], [0.0, 20.0, 5.0], [0.0, 0.0, 1.0]]
+    )
+    write_camera_solution(
+        camera_root / "solution.json",
+        CameraSolution(
+            intrinsics=calibration,
+            frame_intrinsics=[calibration] * 5,
+            camera_to_world=[np.eye(4)] * 5,
+            kind=CameraKind.FIXED,
+            confidence=0.9,
+            source_ground=SourceGroundEstimate(
+                normal=(0.0, 1.0, 0.0),
+                offset=0.0,
+                anchor_frame_index=4,
+                confidence=0.9,
+                support_ratio=0.9,
+                rms_residual=0.01,
+            ),
+        ),
+    )
+    identity = tuple(tuple(float(value) for value in row) for row in np.eye(4))
+
+    def seed(current: object) -> None:
+        current.workflow.source_summary = VideoSummary(  # type: ignore[attr-defined]
+            filename="source.mp4",
+            size=1,
+            sha256="a" * 64,
+            width=16,
+            height=10,
+            duration_seconds=1,
+            fps="30",
+            has_audio=False,
+            frame_count=5,
+        )
+        current.workflow.target_ground = TargetGroundState(  # type: ignore[attr-defined]
+            scene_asset_id="source/scene.ply",
+            hint_pixels=((1, 1), (2, 1), (1, 2)),
+            p0_world=(0.0, 0.0, 0.0),
+            p1_world=(0.0, 0.0, 1.0),
+            p2_world=(1.0, 0.0, 0.0),
+            plane_normal=(0.0, 1.0, 0.0),
+            plane_offset=0.0,
+            exploration_camera_to_world=identity,
+            camera_fingerprint="c" * 64,
+            preview_artifact_id="preview",
+            camera_revision=1,
+            pick_buffer_revision=1,
+            support_counts=(20, 20, 20),
+            weighted_inlier_ratio=0.9,
+            rms_residual=0.01,
+            confidence=0.9,
+            revision=1,
+            confirmed=True,
+        )
+        current.stages[StageName.SOLVE_CAMERA] = StageState(  # type: ignore[attr-defined]
+            status=StageStatus.SUCCEEDED,
+            cache_key=camera_key,
+            artifacts={
+                ArtifactRole.CAMERA_SOLUTION: ArtifactRef(
+                    project_id=project.project_id,
+                    category=ArtifactCategory.CAMERA,
+                    cache_key=camera_key,
+                    member="solution.json",
+                )
+            },
+        )
+
+    repository.update(seed)
+    response = workflow_client.post(
+        "/api/v1/projects/current/preview/composite-draft",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        json={
+            "expected_project_id": project.project_id,
+            "request_id": 11,
+            "maximum_width": 320,
+            "maximum_height": 180,
+            "gs_scale": 1,
+            "scene_azimuth": 0,
+            "output_crop": {"x": 0, "y": 0, "width": 16, "height": 10},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.headers["x-preview-frame-index"] == "4"
+    with Image.open(BytesIO(response.content)) as image:
+        assert image.size == (16, 10)
 
 
 def test_three_viewport_hints_fit_one_confirmable_target_ground_without_camera_freeze(

@@ -10,6 +10,7 @@ import type {
   ProjectPatch,
   PreviewFrameDto,
   LivePreviewRequest,
+  DraftCompositePreviewRequest,
   PreviewRequest,
   SessionConfig,
   StageName,
@@ -345,6 +346,15 @@ export class HttpBackendClient implements BackendClient {
     const options: RequestOptions = { method: 'POST', json: input, response: 'blob' }
     if (signal !== undefined) options.signal = signal
     return this.#request('/projects/current/preview/live', options)
+  }
+
+  renderDraftCompositePreview(
+    input: DraftCompositePreviewRequest,
+    signal?: AbortSignal,
+  ): Promise<Blob> {
+    const options: RequestOptions = { method: 'POST', json: input, response: 'blob' }
+    if (signal !== undefined) options.signal = signal
+    return this.#request('/projects/current/preview/composite-draft', options)
   }
 
   closeLivePreview(): Promise<void> {
