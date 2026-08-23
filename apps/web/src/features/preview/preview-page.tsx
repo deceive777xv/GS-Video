@@ -70,7 +70,7 @@ export function PreviewPage({
   const scaleDraft = Number(scaleText)
   const azimuthDraft = Number(azimuthText)
   const alignmentValid = Number.isFinite(scaleDraft) && scaleDraft >= 0.001 && scaleDraft <= 1000
-    && Number.isFinite(azimuthDraft) && azimuthDraft >= -180 && azimuthDraft < 180
+    && Number.isFinite(azimuthDraft) && azimuthDraft >= -180 && azimuthDraft <= 180
   const alignmentSaved = alignmentValid
     && scaleDraft === project.workflow.gs_scale
     && azimuthDraft === project.workflow.scene_azimuth
@@ -340,24 +340,47 @@ export function PreviewPage({
             <span>ViPE 逐帧内参</span>
             <span>目标地面 r{project.workflow.target_ground?.revision ?? '—'}</span>
           </div>
+          <fieldset className="preview-alignment-controls" disabled={busy || running}>
+            <legend>轨迹映射</legend>
+            <div className="preview-alignment-grid">
+              <label>
+                <span>GS 比例</span>
+                <input aria-label="GS 比例" max="1000" min="0.001" onChange={(event) => setScaleText(event.currentTarget.value)} step="0.01" type="number" value={scaleText} />
+              </label>
+              <label>
+                <span className="preview-field-heading">场景方位角 <small>负值逆时针 · 正值顺时针</small></span>
+                <div className="range-number">
+                  <input
+                    aria-label="场景方位角滑杆"
+                    max="180"
+                    min="-180"
+                    onChange={(event) => setAzimuthText(event.currentTarget.value)}
+                    step="1"
+                    type="range"
+                    value={Number.isFinite(azimuthDraft) ? Math.min(180, Math.max(-180, azimuthDraft)) : 0}
+                  />
+                  <input aria-label="场景方位角" max="180" min="-180" onChange={(event) => setAzimuthText(event.currentTarget.value)} step="1" type="number" value={azimuthText} />
+                </div>
+              </label>
+            </div>
+          </fieldset>
         </article>
-        <aside className="control-card">
+        <aside className="viewport-controls preview-controls">
           <h3>全片合成</h3>
           <fieldset disabled={busy || running}>
-            <legend>轨迹映射</legend>
-            <label>GS 比例<input aria-label="GS 比例" max="1000" min="0.001" onChange={(event) => setScaleText(event.currentTarget.value)} step="0.01" type="number" value={scaleText} /></label>
-            <label>场景方位角<input aria-label="场景方位角" max="179.999" min="-180" onChange={(event) => setAzimuthText(event.currentTarget.value)} step="1" type="number" value={azimuthText} /></label>
-          </fieldset>
-          <fieldset disabled={busy || running}>
             <legend>固定输出裁剪</legend>
-            {(['x', 'y', 'width', 'height'] as const).map((key) => <label key={key}>{key.toUpperCase()}<input aria-label={`输出裁剪 ${key.toUpperCase()}`} onChange={(event) => {
-              const value = event.currentTarget.value
-              setCropText((current) => ({ ...current, [key]: value }))
-            }} step={key === 'width' || key === 'height' ? 2 : 1} type="number" value={cropText[key]} /></label>)}
+            <div className="camera-readout preview-crop-grid">
+              {(['x', 'y', 'width', 'height'] as const).map((key) => <label key={key}>{key.toUpperCase()}<input aria-label={`输出裁剪 ${key.toUpperCase()}`} onChange={(event) => {
+                const value = event.currentTarget.value
+                setCropText((current) => ({ ...current, [key]: value }))
+              }} step={key === 'width' || key === 'height' ? 2 : 1} type="number" value={cropText[key]} /></label>)}
+            </div>
           </fieldset>
           <p className="technical-note">X/Y 使用源画面像素坐标，可为负数；裁剪框允许超出源视频范围，外部区域由 GS 背景填充。宽高须为偶数，最大 3840×2160。</p>
-          <button disabled={busy || running || !cropValid || !alignmentValid || (cropSaved && alignmentSaved)} onClick={() => void saveDraft()} type="button">保存预览参数</button>
-          <button disabled={busy || running || compositeRunning || !groundConfirmed || !cropValid || !alignmentValid} onClick={() => void generate()} type="button">{busy || running || compositeRunning ? '生成中…' : '生成预览'}</button>
+          <div className="preview-actions">
+            <button disabled={busy || running || !cropValid || !alignmentValid || (cropSaved && alignmentSaved)} onClick={() => void saveDraft()} type="button">保存参数</button>
+            <button disabled={busy || running || compositeRunning || !groundConfirmed || !cropValid || !alignmentValid} onClick={() => void generate()} type="button">{busy || running || compositeRunning ? '生成中…' : '生成预览'}</button>
+          </div>
           <div className="stage-list" aria-label="预览阶段缓存状态">
             {stageRows.map((name) => <div key={name}><span>{name}</span><strong>{project.stages[name]?.status ?? 'pending'}</strong></div>)}
           </div>

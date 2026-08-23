@@ -182,6 +182,7 @@ def test_project_patch_rejects_stale_project_and_ingest_context(
             "expected_project_id": current["project_id"],
             "expected_ingest_cache_key": current["stages"].get("ingest", {}).get("cache_key"),
             "gs_scale": 2,
+            "scene_azimuth": 180,
             "output_crop": {"x": -320, "y": -180, "width": 2560, "height": 1440},
         },
         headers=auth_headers,
@@ -193,6 +194,7 @@ def test_project_patch_rejects_stale_project_and_ingest_context(
     assert stale_ingest.json()["code"] == "project_context_changed"
     assert accepted.status_code == 200
     assert accepted.json()["workflow"]["gs_scale"] == 2
+    assert accepted.json()["workflow"]["scene_azimuth"] == 180
     assert accepted.json()["workflow"]["output_crop"] == {
         "x": -320,
         "y": -180,

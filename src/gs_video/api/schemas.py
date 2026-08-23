@@ -230,7 +230,7 @@ class ProjectPatch(StrictModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     subject_prompt: SubjectPromptInput | None = None
     gs_scale: float | None = Field(default=None, ge=0.001, le=1000)
-    scene_azimuth: float | None = Field(default=None, ge=-180, lt=180)
+    scene_azimuth: float | None = Field(default=None, ge=-180, le=180)
     output_crop: OutputCropInput | None = None
     preview_height: int | None = Field(default=None, ge=180, le=540)
 
@@ -319,7 +319,7 @@ class DraftCompositePreviewRequest(StrictModel):
     maximum_width: int = Field(default=960, ge=2, le=960)
     maximum_height: int = Field(default=540, ge=2, le=540)
     gs_scale: float = Field(ge=0.001, le=1000)
-    scene_azimuth: float = Field(ge=-180, lt=180)
+    scene_azimuth: float = Field(ge=-180, le=180)
     output_crop: OutputCropInput
 
 

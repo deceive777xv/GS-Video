@@ -341,7 +341,7 @@ class WorkflowState(BaseModel):
     target_ground_generation: int = Field(default=0, ge=0)
     target_ground: TargetGroundState | None = None
     gs_scale: float = Field(default=1.0, ge=0.001, le=1000, allow_inf_nan=False)
-    scene_azimuth: float = Field(default=0.0, ge=-180, lt=180, allow_inf_nan=False)
+    scene_azimuth: float = Field(default=0.0, ge=-180, le=180, allow_inf_nan=False)
     output_crop: OutputCropState | None = None
     preview_height: int = Field(default=540, ge=180, le=540)
     active_task_id: str | None = None

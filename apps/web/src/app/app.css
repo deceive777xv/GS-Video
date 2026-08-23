@@ -319,7 +319,8 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 .has-issues .status-dot { background: var(--danger); }
 .inline-status { margin: 0; color: var(--cyan); font-size: 0.8rem; }
 
-.subject-layout, .preview-layout { display: grid; grid-template-columns: minmax(0, 1.8fr) minmax(260px, 0.7fr); gap: 1rem; align-items: start; }
+.subject-layout { display: grid; grid-template-columns: minmax(0, 1.8fr) minmax(260px, 0.7fr); gap: 1rem; align-items: start; }
+.preview-layout { display: grid; grid-template-columns: minmax(0, 1fr) 290px; gap: 1rem; align-items: start; }
 .subject-frame, .preview-card, .viewport-frame { position: relative; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: #050708; display: grid; place-items: center; }
 .preview-surface { width: 100%; height: auto; min-height: 0; aspect-ratio: 16 / 9; align-self: start; }
 .subject-frame img, .preview-media img, .preview-media video, .viewport-frame img { width: 100%; height: 100%; object-fit: contain; user-select: none; }
@@ -376,12 +377,26 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
   .viewport-controls .image-point-editor { gap: 0.45rem; }
 }
 
-.preview-card { min-width: 0; display: grid; grid-template-rows: auto auto; place-items: stretch; }
+.preview-card { min-width: 0; display: grid; grid-template-rows: auto auto auto; place-items: stretch; }
 .preview-media { min-width: 0; min-height: 0; overflow: hidden; display: grid; place-items: center; }
 .preview-media > img, .preview-media > video { min-width: 0; min-height: 0; max-width: 100%; max-height: 100%; }
 .fixed-output-crop-preview { position: absolute; inset: 8%; border: 2px solid var(--acid); box-shadow: 0 0 0 999px rgba(5,7,8,.28), 0 0 14px rgba(183,246,61,.35); pointer-events: none; }
 .preview-surface > .viewport-empty { height: 100%; min-height: 0; }
 .preview-caption { width: 100%; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.35rem 0.75rem; padding: 0.75rem 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.7rem; background: #0d1215; }
+.preview-alignment-controls { width: 100%; min-width: 0; margin: 0; border: 0; border-top: 1px solid var(--line); padding: 0.65rem 0.8rem 0.8rem; background: #11171a; }
+.preview-alignment-controls legend { padding: 0 0.35rem; color: var(--acid); font-size: 0.65rem; font-weight: 700; letter-spacing: 0.06em; }
+.preview-alignment-grid { display: grid; grid-template-columns: minmax(130px, 0.32fr) minmax(280px, 1fr); gap: 0.7rem; align-items: end; }
+.preview-alignment-controls label { min-width: 0; display: grid; gap: 0.35rem; color: #bdc7c2; font-size: 0.7rem; }
+.preview-alignment-controls input:not([type="range"]) { width: 100%; min-width: 0; border: 1px solid #3a464d; border-radius: 6px; background: #090d10; color: var(--text); padding: 0.48rem 0.58rem; }
+.preview-alignment-controls input[type="range"] { width: 100%; accent-color: var(--acid); }
+.preview-field-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 0.65rem; }
+.preview-field-heading small { color: #7f8e87; font-size: 0.62rem; font-weight: 400; }
+.preview-controls { gap: 0.65rem; padding: 0.9rem; }
+.preview-controls .preview-crop-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.preview-controls .technical-note { padding: 0.65rem 0.75rem; font-size: 0.68rem; }
+.preview-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.5rem; }
+.preview-actions button { min-width: 0; padding-inline: 0.6rem; }
+.preview-controls .stage-list { margin-top: 0; }
 .stage-list { display: grid; gap: 0.35rem; margin-top: 0.25rem; }
 .stage-list div { display: flex; justify-content: space-between; padding: 0.45rem 0.55rem; background: #090d10; font: 0.65rem ui-monospace, monospace; }
 .stage-list strong { color: var(--cyan); }
@@ -439,6 +454,7 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
   .viewport-layout, .subject-layout, .preview-layout { grid-template-columns: 1fr; }
   .viewport-controls { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); }
   .viewport-controls fieldset { grid-column: 1 / -1; }
+  .preview-controls { display: flex; }
   .hub-hero { grid-template-columns: 1fr; }
   .project-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
 }
@@ -461,6 +477,7 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
   .workflow-rail li button small { display: none; }
   .workflow-main, .page-grid, .preview-layout { width: 100%; min-width: 0; max-width: 100%; }
   .workflow-main { padding: 1rem; }
+  .preview-alignment-grid { grid-template-columns: 1fr; }
   .import-grid { grid-template-columns: 1fr; }
   .asset-drop { min-height: 210px; }
   .page-heading-row { display: block; }

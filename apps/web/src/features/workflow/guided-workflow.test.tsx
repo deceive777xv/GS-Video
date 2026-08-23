@@ -562,6 +562,7 @@ describe('guided workflow', () => {
     )
 
     expect(await screen.findByRole('heading', { name: '对齐自动相机轨迹与 GS 地面' })).toBeInTheDocument()
+    expect(screen.queryByText(/GS 比例/)).not.toBeInTheDocument()
     expect(harness.client.activateProject).toHaveBeenCalledWith('project-2')
     expect(window.location.hash).toBe('#/projects/project-2/workflow/camera')
   })

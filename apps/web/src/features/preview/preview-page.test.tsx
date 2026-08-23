@@ -278,7 +278,7 @@ it('renders a real representative composite for draft alignment and crop values'
 it('saves unsaved preview parameters before directly starting generation', async () => {
   const current = draftProject()
   const saved = draftProject()
-  saved.workflow.scene_azimuth = 12
+  saved.workflow.scene_azimuth = 180
   const backend = {
     fetchPreviewArtifact: vi.fn(async () => new Blob(['camera'], { type: 'image/png' })),
     renderDraftCompositePreview: vi.fn(() => new Promise<Blob>(() => undefined)),
@@ -288,11 +288,14 @@ it('saves unsaved preview parameters before directly starting generation', async
   const onStartStage = vi.fn(async () => undefined)
   render(<PreviewPage {...compositeProps(backend, current)} onProjectChange={onProjectChange} onStartStage={onStartStage} />)
 
-  fireEvent.change(screen.getByLabelText('场景方位角'), { target: { value: '12' } })
+  const azimuthSlider = screen.getByLabelText('场景方位角滑杆')
+  expect(azimuthSlider).toHaveAttribute('min', '-180')
+  expect(azimuthSlider).toHaveAttribute('max', '180')
+  fireEvent.change(screen.getByLabelText('场景方位角'), { target: { value: '180' } })
   fireEvent.click(screen.getByRole('button', { name: '生成预览' }))
 
   await waitFor(() => expect(backend.updateProject).toHaveBeenCalledWith(expect.objectContaining({
-    expected_project_id: 'project-draft', scene_azimuth: 12,
+    expected_project_id: 'project-draft', scene_azimuth: 180,
   })))
   expect(onProjectChange).toHaveBeenCalledWith(saved)
   expect(onStartStage).toHaveBeenCalledWith('composite')

@@ -27,7 +27,6 @@ export function CameraPage({ backend, busy, project, onError, onProjectChange, o
         <div className="authority-chips">
           <span className={project.stages.solve_camera?.status === 'succeeded' ? 'chip chip-ok' : 'chip'}>ViPE {project.stages.solve_camera?.status === 'succeeded' ? '已解算' : '待解算'}</span>
           <span className={ground?.confirmed === true ? 'chip chip-ok' : 'chip'}>目标地面 {ground === null ? '未拟合' : ground.confirmed ? `r${ground.revision}` : '待确认'}</span>
-          <span className="chip">GS 比例 {workflow.gs_scale.toFixed(3)}×</span>
         </div>
       </div>
       <ConstrainedCameraWorkspace
