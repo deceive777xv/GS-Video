@@ -274,7 +274,6 @@ export function ConstrainedCameraWorkspace({
           {targetGround === null ? '尚无候选' : targetGround.confirmed ? `已确认 r${targetGround.revision}` : `候选 r${targetGround.revision}`}
         </span>
       </div>
-      <p>三个点击只是近似提示。系统会在各自邻域中检查 Opacity、深度连续性和 GS 表面支持，自动拟合真正的地面。</p>
       <div className="viewport-layout">
         <div
           aria-label="Gaussian 地面提示视口"
@@ -306,7 +305,7 @@ export function ConstrainedCameraWorkspace({
       </div>
       <div className="camera-secondary-panel">
         <h4>轨迹映射</h4>
-        <p>P0 对应源锚帧相机在源地面上的垂直投影；这里没有人物位置、脚底接触或独立人物缩放。</p>
+        <p>P0 对应源锚帧相机在源地面上的垂直投影。</p>
         <div className="secondary-actions">
           <label>GS 比例<input aria-label="GS 比例" disabled={busy || pending} min="0.001" max="1000" onChange={(event) => setScaleText(event.currentTarget.value)} step="0.01" type="number" value={scaleText} /></label>
           <label>场景方位角<input aria-label="场景方位角" disabled={busy || pending} min="-180" max="179.999" onChange={(event) => setAzimuthText(event.currentTarget.value)} step="1" type="number" value={azimuthText} /></label>
