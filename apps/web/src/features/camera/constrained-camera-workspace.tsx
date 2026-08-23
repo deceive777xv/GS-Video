@@ -173,6 +173,7 @@ export function ConstrainedCameraWorkspace({
   const [frameFingerprint, setFrameFingerprint] = useState<string | null>(null)
   const [settling, setSettling] = useState(false)
   const [hints, setHints] = useState<ImagePoint[]>([])
+  const [reselecting, setReselecting] = useState(false)
   const [pending, setPending] = useState(false)
   const viewportRef = useRef<HTMLDivElement>(null)
   const generation = useRef(project.workflow.preview?.generation ?? 0)
@@ -191,6 +192,7 @@ export function ConstrainedCameraWorkspace({
   const authoritativePreview = project.workflow.preview
   const authoritativePreviewKey = previewAuthority(project.project_id, authoritativePreview)
   const targetGround = project.workflow.target_ground
+  const selectionOpen = targetGround === null || reselecting
   const fingerprint = poseFingerprint(pose)
   const frameMatchesPose = frame !== null && frameFingerprint === fingerprint
   const candidateMatchesFrame = frame !== null
@@ -257,6 +259,10 @@ export function ConstrainedCameraWorkspace({
     replaceLiveUrl(null)
     replaceFrameUrl(null)
   }, [])
+  useEffect(() => {
+    setHints([])
+    setReselecting(false)
+  }, [project.project_id, targetGround?.confirmed, targetGround?.revision])
 
   const changePose = (updater: (current: EulerPose) => EulerPose): void => {
     setPose(updater)
@@ -355,25 +361,27 @@ export function ConstrainedCameraWorkspace({
   })
 
   const addHint = (event: ReactPointerEvent<HTMLDivElement>): void => {
-    if (event.button !== 0 || !frameMatchesPose || frame === null || viewportRef.current === null || hints.length >= 3 || pending || busy) return
+    if (!selectionOpen || event.button !== 0 || !frameMatchesPose || frame === null || viewportRef.current === null || hints.length >= 3 || pending || busy) return
     const point = toImagePoint(event, viewportRef.current.getBoundingClientRect(), frame)
     if (point === null || hints.some((item) => item.x === point.x && item.y === point.y)) return
     setHints((current) => [...current, point])
   }
 
   const fitGround = async (): Promise<void> => {
-    if (!frameMatchesPose || frame === null || hints.length !== 3 || pending || busy) return
+    if (!selectionOpen || !frameMatchesPose || frame === null || hints.length !== 3 || pending || busy) return
     setPending(true)
     try {
       const [p0, p1, p2] = hints
       if (p0 === undefined || p1 === undefined || p2 === undefined) return
-      onProjectChange(await backend.fitTargetGround({
+      const updated = await backend.fitTargetGround({
         expected_project_id: project.project_id,
         preview_artifact_id: frame.artifact_id,
         camera_revision: frame.camera_revision,
         pick_buffer_revision: frame.pick_buffer_revision,
         hints: [[p0.x, p0.y], [p1.x, p1.y], [p2.x, p2.y]],
-      }))
+      })
+      onProjectChange(updated)
+      setReselecting(false)
     } catch (error) {
       onError(error)
     } finally {
@@ -382,7 +390,7 @@ export function ConstrainedCameraWorkspace({
   }
 
   const confirmGround = async (): Promise<void> => {
-    if (targetGround === null || targetGround.confirmed || pending || busy) return
+    if (reselecting || targetGround === null || targetGround.confirmed || pending || busy) return
     setPending(true)
     try {
       onProjectChange(await backend.confirmTargetGround(project.project_id, targetGround.revision))
@@ -393,16 +401,22 @@ export function ConstrainedCameraWorkspace({
     }
   }
 
-  const shownHints = candidateMatchesFrame && targetGround !== null
+  const shownHints = !reselecting && candidateMatchesFrame && targetGround !== null
     ? targetGround.hint_pixels.map(([x, y]) => ({ x, y }))
     : hints
+  const canResetHints = hints.length > 0 || (targetGround !== null && !reselecting)
+
+  const resetHints = (): void => {
+    setHints([])
+    setReselecting(targetGround !== null)
+  }
 
   return (
     <section aria-busy={busy || pending} className="calibration-card" aria-labelledby="target-ground-title">
       <div className="calibration-card-heading">
         <div><span className="step-kicker">GS · 自动地面对齐</span><h3 id="target-ground-title">探索场景并给出三个地面提示</h3></div>
-        <span className={targetGround?.confirmed === true ? 'chip chip-ok' : 'chip'}>
-          {targetGround === null ? '尚无候选' : targetGround.confirmed ? `已确认 r${targetGround.revision}` : `候选 r${targetGround.revision}`}
+        <span className={targetGround?.confirmed === true && !reselecting ? 'chip chip-ok' : 'chip'}>
+          {reselecting ? '重新选择中' : targetGround === null ? '尚无候选' : targetGround.confirmed ? `已确认 r${targetGround.revision}` : `候选 r${targetGround.revision}`}
         </span>
       </div>
       <div className="viewport-layout">
@@ -454,11 +468,11 @@ export function ConstrainedCameraWorkspace({
       <div className="camera-secondary-panel">
         <p>{shownHints.length}/3 个地面提示。P0 对应源锚帧相机在源地面上的垂直投影。重新生成视图会清除未拟合提示。</p>
         <div className="secondary-actions">
-          <button disabled={busy || pending || hints.length === 0} onClick={() => setHints([])} type="button">重选三点</button>
-          <button disabled={busy || pending || !frameMatchesPose || frame === null || hints.length !== 3} onClick={() => void fitGround()} type="button">自动寻找真正地面</button>
-          <button disabled={busy || pending || targetGround === null || targetGround.confirmed} onClick={() => void confirmGround()} type="button">确认地面</button>
+          <button disabled={busy || pending || !canResetHints} onClick={resetHints} type="button">重选三点</button>
+          <button disabled={busy || pending || !selectionOpen || !frameMatchesPose || frame === null || hints.length !== 3} onClick={() => void fitGround()} type="button">自动寻找真正地面</button>
+          <button disabled={busy || pending || reselecting || targetGround === null || targetGround.confirmed} onClick={() => void confirmGround()} type="button">确认地面</button>
         </div>
-        {targetGround === null ? null : <p className="technical-note">置信度 {(targetGround.confidence * 100).toFixed(1)}%，三邻域支持 {targetGround.support_counts.join(' / ')}，RMS {targetGround.rms_residual.toPrecision(3)}。</p>}
+        {targetGround === null || reselecting ? null : <p className="technical-note">置信度 {(targetGround.confidence * 100).toFixed(1)}%，三邻域支持 {targetGround.support_counts.join(' / ')}，RMS {targetGround.rms_residual.toPrecision(3)}。</p>}
       </div>
     </section>
   )

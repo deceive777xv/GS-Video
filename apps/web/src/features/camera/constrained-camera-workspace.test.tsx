@@ -176,7 +176,6 @@ it('turns three viewport hints into one automatic ground candidate and one confi
     confirmed: false,
   }
   const candidateProject = project(candidate)
-  const confirmedProject = project({ ...candidate, confirmed: true })
   const backend = {
     renderLivePreview: vi.fn(async () => new Blob(['live'], { type: 'image/jpeg' })),
     renderPreview: vi.fn(async () => ({
@@ -185,7 +184,7 @@ it('turns three viewport hints into one automatic ground candidate and one confi
     })),
     fetchPreviewArtifact: vi.fn(async () => new Blob(['png'], { type: 'image/png' })),
     fitTargetGround: vi.fn(async () => candidateProject),
-    confirmTargetGround: vi.fn(async () => confirmedProject),
+    confirmTargetGround: vi.fn(async () => project({ ...candidate, confirmed: true })),
     updateProject: vi.fn(),
   } as unknown as BackendClient
   const onProjectChange = vi.fn()
@@ -222,6 +221,76 @@ it('turns three viewport hints into one automatic ground candidate and one confi
   view.rerender(<ConstrainedCameraWorkspace {...props} project={candidateProject} />)
   await user.click(screen.getByRole('button', { name: '确认地面' }))
   expect(backend.confirmTargetGround).toHaveBeenCalledWith('project-1', 1)
+})
+
+it('locks confirmed ground hints until reselect clears the existing markers', async () => {
+  vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:confirmed-ground')
+  vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+  const confirmedGround: TargetGroundDto = {
+    scene_asset_id: 'scene-1',
+    hint_pixels: [[100, 100], [400, 100], [250, 300]],
+    p0_world: [0, 0, 0],
+    p1_world: [1, 0, 0],
+    p2_world: [0, 0, 1],
+    plane_normal: [0, 1, 0],
+    plane_offset: 0,
+    exploration_camera_to_world: identity.map((row) => [...row]) as TargetGroundDto['exploration_camera_to_world'],
+    camera_fingerprint: 'f'.repeat(64),
+    preview_artifact_id: restoredPreview.artifact_id,
+    camera_revision: restoredPreview.camera_revision,
+    pick_buffer_revision: restoredPreview.pick_buffer_revision,
+    support_counts: [20, 21, 22],
+    weighted_inlier_ratio: 0.9,
+    rms_residual: 0.01,
+    confidence: 0.92,
+    revision: 2,
+    confirmed: true,
+  }
+  const initial = project(confirmedGround, restoredPreview)
+  const backend = {
+    fetchPreviewArtifact: vi.fn(async () => new Blob(['png'], { type: 'image/png' })),
+    renderLivePreview: vi.fn(() => new Promise<Blob>(() => undefined)),
+    renderPreview: vi.fn(() => new Promise<PreviewFrameDto>(() => undefined)),
+  } as unknown as BackendClient
+  const user = userEvent.setup()
+  render(
+    <ConstrainedCameraWorkspace
+      backend={backend}
+      busy={false}
+      onError={vi.fn()}
+      onProjectChange={vi.fn()}
+      onRefresh={vi.fn(async () => initial)}
+      panel="scene"
+      project={initial}
+    />,
+  )
+
+  await screen.findByAltText('Gaussian 地面选择视图')
+  const viewport = screen.getByLabelText('Gaussian 地面提示视口')
+  vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue({
+    x: 0, y: 0, left: 0, top: 0, right: 960, bottom: 540,
+    width: 960, height: 540, toJSON: () => ({}),
+  })
+  expect(screen.getByText('H0')).toBeInTheDocument()
+  expect(screen.getByText('H1')).toBeInTheDocument()
+  expect(screen.getByText('H2')).toBeInTheDocument()
+  const fitButton = screen.getByRole('button', { name: '自动寻找真正地面' })
+  expect(fitButton).toBeDisabled()
+
+  fireEvent.pointerDown(viewport, { clientX: 150, clientY: 150 })
+  fireEvent.pointerDown(viewport, { clientX: 450, clientY: 150 })
+  fireEvent.pointerDown(viewport, { clientX: 300, clientY: 350 })
+  expect(fitButton).toBeDisabled()
+
+  await user.click(screen.getByRole('button', { name: '重选三点' }))
+  expect(screen.queryByText('H0')).not.toBeInTheDocument()
+  expect(screen.queryByText('H1')).not.toBeInTheDocument()
+  expect(screen.queryByText('H2')).not.toBeInTheDocument()
+
+  fireEvent.pointerDown(viewport, { clientX: 150, clientY: 150 })
+  fireEvent.pointerDown(viewport, { clientX: 450, clientY: 150 })
+  fireEvent.pointerDown(viewport, { clientX: 300, clientY: 350 })
+  expect(fitButton).toBeEnabled()
 })
 
 it('keeps the GS frame visible while pose edits request live and settled pick frames', async () => {
