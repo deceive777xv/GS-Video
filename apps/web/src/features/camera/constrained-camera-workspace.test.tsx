@@ -55,14 +55,28 @@ const restoredPreview: PreviewFrameDto = {
   pick_buffer_revision: 9,
 }
 
-it('restores an existing authoritative GS preview when the scene page opens', async () => {
-  vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:restored-preview')
+it('shows a restored preview but regenerates its missing pick buffer before enabling hints', async () => {
+  const regeneratedPreview = deferred<PreviewFrameDto>()
+  const restoredBlob = new Blob(['restored'], { type: 'image/png' })
+  const regeneratedBlob = new Blob(['regenerated'], { type: 'image/png' })
+  vi.spyOn(URL, 'createObjectURL').mockImplementation((blob) => (
+    blob === restoredBlob ? 'blob:restored-preview' : 'blob:regenerated-preview'
+  ))
   vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
   const initial = project(null, restoredPreview)
+  const regenerated = {
+    ...restoredPreview,
+    artifact_id: 'preview-regenerated',
+    generation: restoredPreview.generation + 1,
+    camera_revision: restoredPreview.camera_revision + 1,
+    pick_buffer_revision: restoredPreview.pick_buffer_revision + 1,
+  }
   const backend = {
-    fetchPreviewArtifact: vi.fn(async () => new Blob(['png'], { type: 'image/png' })),
+    fetchPreviewArtifact: vi.fn(async (artifactId: string) => (
+      artifactId === restoredPreview.artifact_id ? restoredBlob : regeneratedBlob
+    )),
     renderLivePreview: vi.fn(() => new Promise<Blob>(() => undefined)),
-    renderPreview: vi.fn(() => new Promise<PreviewFrameDto>(() => undefined)),
+    renderPreview: vi.fn(() => regeneratedPreview.promise),
   } as unknown as BackendClient
   const props = {
     backend,
@@ -82,15 +96,39 @@ it('restores an existing authoritative GS preview when the scene page opens', as
     'preview-restored',
     expect.any(AbortSignal),
   )
+  await waitFor(() => expect(backend.renderPreview).toHaveBeenCalledWith(
+    expect.objectContaining({
+      expected_project_id: 'project-1',
+      generation: restoredPreview.generation + 1,
+    }),
+    expect.any(AbortSignal),
+  ))
 
-  fireEvent.change(screen.getByLabelText('探索相机 X'), { target: { value: '1' } })
-  expect(screen.getByAltText('Gaussian 地面选择视图')).toHaveAttribute(
+  const viewport = screen.getByLabelText('Gaussian 地面提示视口')
+  vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue({
+    x: 0, y: 0, left: 0, top: 0, right: 960, bottom: 540,
+    width: 960, height: 540, toJSON: () => ({}),
+  })
+  fireEvent.pointerDown(viewport, { clientX: 100, clientY: 100 })
+  fireEvent.pointerDown(viewport, { clientX: 400, clientY: 100 })
+  fireEvent.pointerDown(viewport, { clientX: 250, clientY: 300 })
+  expect(screen.getByText(/0\/3 个地面提示/)).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '自动寻找真正地面' })).toBeDisabled()
+
+  await act(async () => {
+    regeneratedPreview.resolve(regenerated)
+    await Promise.resolve()
+  })
+  expect(await screen.findByAltText('Gaussian 地面选择视图')).toHaveAttribute(
     'src',
-    'blob:restored-preview',
+    'blob:regenerated-preview',
   )
-  view.rerender(<ConstrainedCameraWorkspace {...props} onError={vi.fn()} project={initial} />)
-  expect(backend.fetchPreviewArtifact).toHaveBeenCalledTimes(1)
-  expect(screen.getByAltText('Gaussian 地面选择视图')).toBeInTheDocument()
+
+  fireEvent.pointerDown(viewport, { clientX: 100, clientY: 100 })
+  fireEvent.pointerDown(viewport, { clientX: 400, clientY: 100 })
+  fireEvent.pointerDown(viewport, { clientX: 250, clientY: 300 })
+  expect(screen.getByText(/3\/3 个地面提示/)).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '自动寻找真正地面' })).toBeEnabled()
 
   view.unmount()
   expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:restored-preview')
@@ -246,26 +284,27 @@ it('locks confirmed ground hints until reselect clears the existing markers', as
     revision: 2,
     confirmed: true,
   }
-  const initial = project(confirmedGround, restoredPreview)
+  const firstProject = project()
+  const restoredProject = project(null, restoredPreview)
+  const confirmedProject = project(confirmedGround, restoredPreview)
   const backend = {
     fetchPreviewArtifact: vi.fn(async () => new Blob(['png'], { type: 'image/png' })),
     renderLivePreview: vi.fn(() => new Promise<Blob>(() => undefined)),
-    renderPreview: vi.fn(() => new Promise<PreviewFrameDto>(() => undefined)),
+    renderPreview: vi.fn(async () => restoredPreview),
   } as unknown as BackendClient
   const user = userEvent.setup()
-  render(
-    <ConstrainedCameraWorkspace
-      backend={backend}
-      busy={false}
-      onError={vi.fn()}
-      onProjectChange={vi.fn()}
-      onRefresh={vi.fn(async () => initial)}
-      panel="scene"
-      project={initial}
-    />,
-  )
+  const props = {
+    backend,
+    busy: false,
+    onError: vi.fn(),
+    onProjectChange: vi.fn(),
+    onRefresh: vi.fn(async () => restoredProject),
+    panel: 'scene' as const,
+  }
+  const view = render(<ConstrainedCameraWorkspace {...props} project={firstProject} />)
 
   await screen.findByAltText('Gaussian 地面选择视图')
+  view.rerender(<ConstrainedCameraWorkspace {...props} project={confirmedProject} />)
   const viewport = screen.getByLabelText('Gaussian 地面提示视口')
   vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue({
     x: 0, y: 0, left: 0, top: 0, right: 960, bottom: 540,
@@ -340,7 +379,7 @@ it('keeps the GS frame visible while pose edits request live and settled pick fr
   expect(backend.renderLivePreview).toHaveBeenCalled()
   expect(backend.renderPreview).toHaveBeenCalledWith(expect.objectContaining({
     expected_project_id: 'project-1',
-    generation: 5,
+    generation: 6,
   }), expect.any(AbortSignal))
   expect(screen.getByAltText('Gaussian 地面选择视图')).toHaveAttribute(
     'src',

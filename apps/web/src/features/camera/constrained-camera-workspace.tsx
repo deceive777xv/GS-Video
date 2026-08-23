@@ -171,6 +171,7 @@ export function ConstrainedCameraWorkspace({
   const [frameUrl, setFrameUrl] = useState<string | null>(null)
   const [liveUrl, setLiveUrl] = useState<string | null>(null)
   const [frameFingerprint, setFrameFingerprint] = useState<string | null>(null)
+  const [pickBufferReady, setPickBufferReady] = useState(false)
   const [settling, setSettling] = useState(false)
   const [hints, setHints] = useState<ImagePoint[]>([])
   const [reselecting, setReselecting] = useState(false)
@@ -195,6 +196,7 @@ export function ConstrainedCameraWorkspace({
   const selectionOpen = targetGround === null || reselecting
   const fingerprint = poseFingerprint(pose)
   const frameMatchesPose = frame !== null && frameFingerprint === fingerprint
+  const pickFrameReady = frameMatchesPose && pickBufferReady
   const candidateMatchesFrame = frame !== null
     && frameMatchesPose
     && targetGround !== null
@@ -219,6 +221,7 @@ export function ConstrainedCameraWorkspace({
       frameAuthorityRef.current = null
       setFrame(null)
       setFrameFingerprint(null)
+      setPickBufferReady(false)
       replaceFrameUrl(null)
       return
     }
@@ -230,6 +233,7 @@ export function ConstrainedCameraWorkspace({
     frameAuthorityRef.current = null
     setFrame(null)
     setFrameFingerprint(null)
+    setPickBufferReady(false)
     replaceFrameUrl(null)
     const controller = new AbortController()
     void backend.fetchPreviewArtifact(
@@ -286,13 +290,14 @@ export function ConstrainedCameraWorkspace({
   }
 
   useEffect(() => {
-    if (busy || pending || frameMatchesPose || (authoritativePreview !== null && frame === null)) return
+    if (busy || pending || pickFrameReady || (authoritativePreview !== null && frame === null)) return
     const request = ++automaticRequest.current
     generation.current += 1
     const requestedGeneration = generation.current
     const requestedCamera = cameraInput(pose)
     const liveController = new AbortController()
     const settledController = new AbortController()
+    setPickBufferReady(false)
     setSettling(true)
     const liveTimer = window.setTimeout(() => {
       void backend.renderLivePreview({
@@ -327,6 +332,7 @@ export function ConstrainedCameraWorkspace({
         frameAuthorityRef.current = previewAuthority(project.project_id, rendered)
         setFrame(rendered)
         setFrameFingerprint(fingerprint)
+        setPickBufferReady(true)
         replaceFrameUrl(nextUrl)
         replaceLiveUrl(null)
         setHints([])
@@ -346,7 +352,7 @@ export function ConstrainedCameraWorkspace({
       liveController.abort()
       settledController.abort()
     }
-  }, [authoritativePreview, backend, busy, fingerprint, frame, frameMatchesPose, pending, pose, project.project_id])
+  }, [authoritativePreview, backend, busy, fingerprint, frame, pending, pickFrameReady, pose, project.project_id])
 
   useEffect(() => {
     const viewport = viewportRef.current
@@ -361,14 +367,14 @@ export function ConstrainedCameraWorkspace({
   })
 
   const addHint = (event: ReactPointerEvent<HTMLDivElement>): void => {
-    if (!selectionOpen || event.button !== 0 || !frameMatchesPose || frame === null || viewportRef.current === null || hints.length >= 3 || pending || busy) return
+    if (!selectionOpen || event.button !== 0 || !pickFrameReady || frame === null || viewportRef.current === null || hints.length >= 3 || pending || busy) return
     const point = toImagePoint(event, viewportRef.current.getBoundingClientRect(), frame)
     if (point === null || hints.some((item) => item.x === point.x && item.y === point.y)) return
     setHints((current) => [...current, point])
   }
 
   const fitGround = async (): Promise<void> => {
-    if (!selectionOpen || !frameMatchesPose || frame === null || hints.length !== 3 || pending || busy) return
+    if (!selectionOpen || !pickFrameReady || frame === null || hints.length !== 3 || pending || busy) return
     setPending(true)
     try {
       const [p0, p1, p2] = hints
@@ -454,7 +460,9 @@ export function ConstrainedCameraWorkspace({
           {(liveUrl ?? frameUrl) === null ? <div className="viewport-empty">正在准备 Gaussian 实时预览…</div> : <img alt="Gaussian 地面选择视图" draggable={false} src={(liveUrl ?? frameUrl) ?? ''} />}
           {!frameMatchesPose || frame === null ? null : shownHints.map((point, index) => <Marker frame={frame} key={`${point.x}:${point.y}:${index}`} label={`H${index}`} point={point} />)}
           {frameMatchesPose && frame !== null && shownHints.length === 3 ? <svg aria-label="自动地面候选范围" className="ground-plane-overlay" preserveAspectRatio="none" viewBox={`0 0 ${frame.width} ${frame.height}`}><polygon points={shownHints.map((point) => `${point.x + 0.5},${point.y + 0.5}`).join(' ')} /></svg> : null}
-          {settling ? <span className="viewport-status">交互预览 · 停止后自动启用地面拾取</span> : null}
+          {!pickFrameReady && frameMatchesPose && frame !== null
+            ? <span className="viewport-status">正在生成可拾取帧…</span>
+            : settling ? <span className="viewport-status">交互预览 · 停止后自动启用地面拾取</span> : null}
         </div>
         <aside className="viewport-controls">
           <div className="camera-readout sixdof-readout">
@@ -469,7 +477,7 @@ export function ConstrainedCameraWorkspace({
         <p>{shownHints.length}/3 个地面提示。P0 对应源锚帧相机在源地面上的垂直投影。重新生成视图会清除未拟合提示。</p>
         <div className="secondary-actions">
           <button disabled={busy || pending || !canResetHints} onClick={resetHints} type="button">重选三点</button>
-          <button disabled={busy || pending || !selectionOpen || !frameMatchesPose || frame === null || hints.length !== 3} onClick={() => void fitGround()} type="button">自动寻找真正地面</button>
+          <button disabled={busy || pending || !selectionOpen || !pickFrameReady || frame === null || hints.length !== 3} onClick={() => void fitGround()} type="button">自动寻找真正地面</button>
           <button disabled={busy || pending || reselecting || targetGround === null || targetGround.confirmed} onClick={() => void confirmGround()} type="button">确认地面</button>
         </div>
         {targetGround === null || reselecting ? null : <p className="technical-note">置信度 {(targetGround.confidence * 100).toFixed(1)}%，三邻域支持 {targetGround.support_counts.join(' / ')}，RMS {targetGround.rms_residual.toPrecision(3)}。</p>}

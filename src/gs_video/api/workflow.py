@@ -1331,7 +1331,10 @@ class PreviewArtifactStore:
                     409,
                     code="pick_buffer_unavailable",
                     category="render",
-                    message="Regenerate the preview before choosing a foot point.",
+                    message=(
+                        "Regenerate the current exploration preview before fitting "
+                        "ground hints."
+                    ),
                     retryable=True,
                 ) from error
             self._buffers.move_to_end(artifact_id)

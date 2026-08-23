@@ -353,6 +353,20 @@ def test_preview_artifacts_are_bounded_while_preserving_authoritative_file(
     assert len(list((root / "previews").glob("*.png"))) == 2
 
 
+def test_missing_pick_buffer_error_uses_current_ground_hint_language(
+    tmp_path: Path,
+) -> None:
+    store = PreviewArtifactStore(tmp_path / "project")
+
+    with pytest.raises(ApiError) as caught:
+        store.pick_buffer("missing-preview")
+
+    assert caught.value.envelope.code == "pick_buffer_unavailable"
+    assert caught.value.envelope.message == (
+        "Regenerate the current exploration preview before fitting ground hints."
+    )
+
+
 def test_preview_scene_cache_rejects_bytes_that_do_not_match_import_summary(
     tmp_path: Path,
 ) -> None:
