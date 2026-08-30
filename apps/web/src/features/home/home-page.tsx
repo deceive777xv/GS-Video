@@ -49,7 +49,7 @@ export function HomePage({
   }
 
   return (
-    <main className="hub-main">
+    <main className="hub-main" id="main-content" tabIndex={-1}>
       <section className="hub-hero">
         <div>
           <p className="eyebrow">PROJECT HOME</p>

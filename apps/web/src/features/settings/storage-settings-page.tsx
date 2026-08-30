@@ -131,7 +131,7 @@ export function StorageSettingsPage({
     value === undefined ? '正在统计…' : formatBytes(value)
 
   return (
-    <main className="hub-main storage-settings-main">
+    <main className="hub-main storage-settings-main" id="main-content" tabIndex={-1}>
       <section className="storage-settings-heading">
         <p className="eyebrow">STORAGE</p>
         <h1>项目库与缓存目录</h1>

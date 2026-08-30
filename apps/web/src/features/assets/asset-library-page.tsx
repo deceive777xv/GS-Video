@@ -115,7 +115,7 @@ export function AssetLibraryPage({ backend, busy, kind, platform, project, retur
   }
 
   return (
-    <main className="hub-main asset-library-main">
+    <main className="hub-main asset-library-main" id="main-content" tabIndex={-1}>
       <section className="section-heading asset-library-heading">
         <div><p className="eyebrow">ASSET LIBRARY</p><h1>素材库</h1><p>视频与 PLY 分开管理，同一份素材可供多个项目复用。</p></div>
         <button disabled={importing} onClick={() => void importAsset()} type="button">{importing ? '正在导入…' : `导入${kind === 'video' ? '视频' : ' PLY'}`}</button>

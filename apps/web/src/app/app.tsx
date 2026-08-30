@@ -66,8 +66,11 @@ function uiError(error: unknown): UiError {
     return { message: error, code: null, category: null, retryable: true }
   }
   if (error instanceof BackendClientError) {
+    const message = error.code === 'composite_preview_changed'
+      ? '合成预览已失效。请返回“预览”步骤重新生成合成预览，再打开后期处理。'
+      : error.message
     return {
-      message: error.message,
+      message,
       code: error.code,
       category: error.category,
       retryable: error.retryable,
@@ -119,7 +122,15 @@ function formatTaskSeconds(value: number): string {
 }
 
 function AppShell({ children }: { children: ReactNode }) {
-  return <div className="app-shell">{children}</div>
+  return (
+    <div className="app-shell">
+      <a className="skip-link" href="#main-content" onClick={(event) => {
+        event.preventDefault()
+        document.getElementById('main-content')?.focus()
+      }}>跳到主要内容</a>
+      {children}
+    </div>
+  )
 }
 
 function HubHeader({ project }: { project: ProjectDto | null }) {
@@ -602,7 +613,7 @@ export function App({
   if (loading || bootstrap === null) {
     return (
       <AppShell>
-        <main className="loading-screen" aria-live="polite">
+        <main className="loading-screen" id="main-content" tabIndex={-1} aria-live="polite">
           <div className="loading-mark"><span /></div>
           <p>正在恢复本地项目权威状态…</p>
         </main>
@@ -726,7 +737,7 @@ export function App({
           />
         ) : view === 'settings' ? (
           bootstrap.storage_layout === null || bootstrap.storage_layout === undefined ? (
-            <main className="hub-main"><div className="empty-state"><strong>存储设置不可用</strong><p>当前后端未提供机器级目录控制。</p></div></main>
+            <main className="hub-main" id="main-content" tabIndex={-1}><div className="empty-state"><strong>存储设置不可用</strong><p>当前后端未提供机器级目录控制。</p></div></main>
           ) : (
             <StorageSettingsPage
               backend={backend}
@@ -897,7 +908,7 @@ export function App({
           </ol>
         </nav>
 
-        <main className="workflow-main" id="workflow-main">
+        <main className="workflow-main" id="main-content" tabIndex={-1}>
           {visibleError !== null ? (
             <div aria-atomic="true" className="error-banner" ref={errorRef} role="alert" tabIndex={-1}>
               <div><strong>{visibleError.category === 'repairable' ? '可以修复' : '操作未完成'}</strong><p>{visibleError.message}</p>{visibleError.code !== null ? <code>{visibleError.code}</code> : null}</div>
