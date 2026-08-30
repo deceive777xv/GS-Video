@@ -10,7 +10,7 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-it('does not admit a second composite task while the authoritative owner is active', () => {
+it('does not admit a second preview task while the authoritative owner is active', () => {
   const project = {
     stages: { composite: { status: 'running' } },
     workflow: {
@@ -22,7 +22,7 @@ it('does not admit a second composite task while the authoritative owner is acti
     },
   } as unknown as ProjectDto
   const task: TaskDto = {
-    id: 'task-composite', target_stage: 'composite', status: 'running',
+    id: 'task-preview', target_stage: 'post_process', status: 'running',
     revision: 1, error: null,
   }
   const onStartStage = vi.fn()
@@ -118,7 +118,7 @@ it('does not claim preview downscaling can recover a full-resolution render OOM'
 
 it('offers retry only for a failed task whose event says it is retryable', () => {
   const task: TaskDto = {
-    id: 'task-composite', target_stage: 'composite', status: 'failed', revision: 3,
+    id: 'task-preview', target_stage: 'post_process', status: 'failed', revision: 3,
     error: 'transient_render_failure',
   }
   render(
@@ -135,7 +135,7 @@ it('offers retry only for a failed task whose event says it is retryable', () =>
       onProjectChange={vi.fn()}
       onReselectSubject={vi.fn()}
       onStartStage={vi.fn()}
-      project={failedProject()}
+      project={failedProject('post_process')}
     />,
   )
   expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument()
@@ -298,13 +298,37 @@ it('saves unsaved preview parameters before directly starting generation', async
     expected_project_id: 'project-draft', scene_azimuth: 180,
   })))
   expect(onProjectChange).toHaveBeenCalledWith(saved)
-  expect(onStartStage).toHaveBeenCalledWith('composite')
+  expect(onStartStage).toHaveBeenCalledWith('post_process')
   expect(backend.updateProject).toHaveBeenCalledBefore(onStartStage)
+})
+
+it('waits for post-process authority and starts it for the full preview', async () => {
+  const current = draftProject()
+  current.stages.composite = {
+    status: 'succeeded', cache_key: 'composite-key', output_paths: [],
+    error_code: null, artifacts: {},
+  }
+  current.stages.post_process = {
+    status: 'pending', cache_key: null, output_paths: [], error_code: null, artifacts: {},
+  }
+  const backend = {
+    fetchPreviewArtifact: vi.fn(async () => new Blob(['camera'], { type: 'image/png' })),
+    renderDraftCompositePreview: vi.fn(() => new Promise<Blob>(() => undefined)),
+    getCompositePreview: vi.fn(() => new Promise(() => undefined)),
+  } as unknown as BackendClient
+  const props = compositeProps(backend, current)
+
+  render(<PreviewPage {...props} />)
+  await Promise.resolve()
+
+  expect(backend.getCompositePreview).not.toHaveBeenCalled()
+  fireEvent.click(screen.getByRole('button', { name: '生成预览' }))
+  await waitFor(() => expect(props.onStartStage).toHaveBeenCalledWith('post_process'))
 })
 
 const compositeDescriptor = (artifactId: string) => ({
   artifact_id: artifactId,
-  filename: 'composite-preview.mp4' as const,
+  filename: 'post-process-preview.mp4' as const,
   size: 12,
   sha256: artifactId.padEnd(64, 'a'),
   duration_seconds: 2,
@@ -325,6 +349,13 @@ function compositeProject(cacheKey: string | null, status: 'pending' | 'succeede
     artifact_id: 'camera-preview', generation: 1, width: 640, height: 360,
     camera_revision: 1, pick_buffer_revision: 1,
     artifact_size: 7, artifact_sha256: 'b'.repeat(64),
+  }
+  current.stages.post_process = {
+    status,
+    cache_key: cacheKey,
+    output_paths: [],
+    error_code: null,
+    artifacts: {},
   }
   return current
 }

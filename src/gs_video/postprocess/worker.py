@@ -17,7 +17,14 @@ MAX_SESSION_COMMAND_BYTES = 32 * 1024
 
 
 def _emit(payload: dict[str, object]) -> None:
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n")
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    binary = getattr(sys.stdout, "buffer", None)
+    if binary is None:
+        sys.stdout.write(encoded.decode("utf-8"))
+    else:
+        binary.write(encoded)
     sys.stdout.flush()
 
 

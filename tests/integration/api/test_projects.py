@@ -164,6 +164,24 @@ def test_project_patch_is_strict_and_persists(
     assert set(invalid.json()) == {"code", "category", "message", "retryable"}
 
 
+def test_project_patch_accepts_rec709_interpretation_from_json(
+    api_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    current = api_client.get("/api/v1/projects/current", headers=auth_headers).json()
+
+    response = api_client.patch(
+        "/api/v1/projects/current",
+        json={
+            "expected_project_id": current["project_id"],
+            "source_color_interpretation": "assumed_rec709",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["workflow"]["source_color_interpretation"] == "assumed_rec709"
+
+
 def test_project_patch_rejects_stale_project_and_ingest_context(
     api_client: TestClient, auth_headers: dict[str, str]
 ) -> None:

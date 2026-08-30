@@ -20,7 +20,6 @@ from gs_video.domain.models import (
     ExportEncodingSettings,
     MatteRefinementSettings,
     Project,
-    SourceColorInterpretation,
     StageName,
 )
 from gs_video.environment.doctor import EnvironmentReport
@@ -240,7 +239,7 @@ class ProjectPatch(StrictModel):
     scene_azimuth: float | None = Field(default=None, ge=-180, le=180)
     output_crop: OutputCropInput | None = None
     preview_height: int | None = Field(default=None, ge=180, le=540)
-    source_color_interpretation: SourceColorInterpretation | None = None
+    source_color_interpretation: Literal["rec709_metadata", "assumed_rec709"] | None = None
     matte_refinement: MatteRefinementSettings | None = None
     effect_chain: list[EffectInstance] | None = Field(default=None, max_length=32)
     expected_effect_chain_revision: int | None = Field(default=None, ge=0)

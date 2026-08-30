@@ -11,7 +11,7 @@ interface PreviewPageProps {
   activeTask: TaskDto | null
   onError(value: unknown): void
   onProjectChange(project: ProjectDto): void
-  onStartStage(stage: 'composite'): Promise<unknown>
+  onStartStage(stage: 'post_process'): Promise<unknown>
   onBackToCamera(): void
   onReselectSubject(): void
 }
@@ -60,12 +60,12 @@ export function PreviewPage({
   const compositeRequest = useRef(0)
   const descriptorAuthority = useRef<string | null>(null)
   const preview = project.workflow.preview
-  const composite = project.stages.composite
+  const postProcess = project.stages.post_process
   const groundConfirmed = project.workflow.target_ground?.confirmed === true
-  const compositeAuthority = composite?.status === 'succeeded'
-    && composite.cache_key !== null
-    && composite.cache_key !== undefined
-    ? composite.cache_key
+  const previewAuthority = postProcess?.status === 'succeeded'
+    && postProcess.cache_key !== null
+    && postProcess.cache_key !== undefined
+    ? postProcess.cache_key
     : null
   const cropDraft = {
     x: Number(cropText.x), y: Number(cropText.y),
@@ -92,7 +92,7 @@ export function PreviewPage({
     && project.stages.solve_camera?.status === 'succeeded'
     && project.stages.segment?.status === 'succeeded'
   const draftDirty = draftValid && (!cropSaved || !alignmentSaved || !matteSaved)
-  const showDraft = compositeAuthority === null || draftDirty
+  const showDraft = previewAuthority === null || draftDirty
   const draftKey = draftValid ? JSON.stringify([
     project.project_id,
     project.stages.solve_camera?.cache_key,
@@ -137,7 +137,7 @@ export function PreviewPage({
       frameObjectUrl.current = null
     }
     setFrameUrl(null)
-    if (preview === null || compositeAuthority !== null) return
+    if (preview === null || previewAuthority !== null) return
     const controller = new AbortController()
     void backend.fetchPreviewArtifact(preview.artifact_id, controller.signal).then((blob) => {
       if (controller.signal.aborted) return
@@ -148,7 +148,7 @@ export function PreviewPage({
       if (!controller.signal.aborted) onError(error instanceof Error ? error : '无法载入已验证的场景帧。')
     })
     return () => controller.abort()
-  }, [backend, compositeAuthority, onError, preview?.artifact_id])
+  }, [backend, onError, preview?.artifact_id, previewAuthority])
 
   useEffect(() => () => {
     if (frameObjectUrl.current !== null) URL.revokeObjectURL(frameObjectUrl.current)
@@ -206,7 +206,7 @@ export function PreviewPage({
       compositeObjectUrl.current = null
     }
     setCompositeVideo(null)
-    if (compositeAuthority === null) return
+    if (previewAuthority === null) return
 
     const controller = new AbortController()
     void backend.getCompositePreview(controller.signal).then(async (descriptor) => {
@@ -235,7 +235,7 @@ export function PreviewPage({
       }
       compositeObjectUrl.current = nextUrl
       setCompositeVideo({
-        authority: compositeAuthority,
+        authority: previewAuthority,
         artifactId: descriptor.artifact_id,
         url: nextUrl,
       })
@@ -260,7 +260,7 @@ export function PreviewPage({
         compositeObjectUrl.current = null
       }
     }
-  }, [backend, compositeAuthority, onError])
+  }, [backend, onError, previewAuthority])
 
   const generate = async (): Promise<void> => {
     if (busy || !cropValid || !alignmentValid || !groundConfirmed || !colorReady) return
@@ -275,7 +275,7 @@ export function PreviewPage({
           matte_refinement: matte,
         }))
       }
-      await onStartStage('composite')
+      await onStartStage('post_process')
     }
     catch (error) { onError(error instanceof Error ? error : '预览合成任务失败。') }
     finally { setRunning(false) }
@@ -299,19 +299,19 @@ export function PreviewPage({
     }
   }
 
-  const displayedComposite = compositeVideo?.authority === compositeAuthority
+  const displayedComposite = compositeVideo?.authority === previewAuthority
     ? compositeVideo
     : null
-  const compositeRunning = activeTask?.target_stage === 'composite'
+  const previewRunning = activeTask?.target_stage === 'post_process'
     && ['queued', 'running'].includes(activeTask.status)
-  const stageRows = ['map_trajectory', 'render', 'composite'] as const
+  const stageRows = ['map_trajectory', 'render', 'composite', 'post_process'] as const
   const eventError = latestEvent?.type === 'task_event'
     && latestEvent.task_id === activeTask?.id
     ? latestEvent.error
     : null
   const eventCode = typeof eventError?.code === 'string' ? eventError.code : null
   const eventCategory = typeof eventError?.category === 'string' ? eventError.category : null
-  const recoveryTarget = activeTask?.target_stage ?? 'composite'
+  const recoveryTarget = activeTask?.target_stage ?? 'post_process'
   const recoveryStage = project.stages[recoveryTarget]
   const recoveryCode = eventCode ?? activeTask?.error ?? recoveryStage?.error_code ?? ''
   const recoveryKey = `${recoveryTarget}:${eventCategory ?? ''}:${recoveryCode}`.toLowerCase()
@@ -324,11 +324,12 @@ export function PreviewPage({
   )
   const resourceRecovery = !subjectRecovery && !cameraRecovery && (
     recoveryTarget === 'composite'
+    || recoveryTarget === 'post_process'
     || /(composite|encode|preview)/.test(recoveryKey)
   )
   const retryable = activeTask?.status === 'failed'
     && eventError?.retryable === true
-    && activeTask.target_stage === 'composite'
+    && activeTask.target_stage === 'post_process'
   const recoveryFailed = activeTask?.status === 'failed'
     || recoveryStage?.status === 'failed'
   return (
@@ -341,7 +342,7 @@ export function PreviewPage({
       <div className="preview-layout">
         <article className="preview-card">
           <div className="preview-media preview-surface">
-            {compositeAuthority !== null && !showDraft ? (
+            {previewAuthority !== null && !showDraft ? (
               displayedComposite === null
                 ? <div className="viewport-empty">正在验证合成预览…</div>
                 : (
@@ -364,7 +365,7 @@ export function PreviewPage({
               </>}
           </div>
           <div className="preview-caption">
-            <span>{compositeAuthority !== null && !showDraft ? '后端验证 · 低分辨率合成' : draftUrl !== null ? '当前参数 · 代表帧真实合成' : draftPending ? '相机参考 · 等待代表帧' : '相机参考 · 非合成视频'}</span>
+            <span>{previewAuthority !== null && !showDraft ? '后端验证 · 低分辨率合成' : draftUrl !== null ? '当前参数 · 代表帧真实合成' : draftPending ? '相机参考 · 等待代表帧' : '相机参考 · 非合成视频'}</span>
             <span>ViPE 逐帧内参</span>
             <span>目标地面 r{project.workflow.target_ground?.revision ?? '—'}</span>
           </div>
@@ -416,7 +417,7 @@ export function PreviewPage({
           <p className="technical-note">X/Y 使用源画面像素坐标，可为负数；裁剪框允许超出源视频范围，外部区域由 GS 背景填充。宽高须为偶数，最大 3840×2160。</p>
           <div className="preview-actions">
             <button disabled={busy || running || !cropValid || !alignmentValid || (cropSaved && alignmentSaved && matteSaved)} onClick={() => void saveDraft()} type="button">保存参数</button>
-            <button disabled={busy || running || compositeRunning || !groundConfirmed || !cropValid || !alignmentValid || !colorReady} onClick={() => void generate()} type="button">{busy || running || compositeRunning ? '生成中…' : '生成预览'}</button>
+            <button disabled={busy || running || previewRunning || !groundConfirmed || !cropValid || !alignmentValid || !colorReady} onClick={() => void generate()} type="button">{busy || running || previewRunning ? '生成中…' : '生成预览'}</button>
           </div>
           <div className="stage-list" aria-label="预览阶段缓存状态">
             {stageRows.map((name) => <div key={name}><span>{name}</span><strong>{project.stages[name]?.status ?? 'pending'}</strong></div>)}
@@ -424,8 +425,8 @@ export function PreviewPage({
         </aside>
       </div>
       <div className="honest-state">
-        <strong>{compositeAuthority !== null && !showDraft ? '合成阶段已由后端确认' : '代表帧随参数实时更新'}</strong>
-        <p>{compositeAuthority !== null && !showDraft
+        <strong>{previewAuthority !== null && !showDraft ? '预览阶段已由后端确认' : '代表帧随参数实时更新'}</strong>
+        <p>{previewAuthority !== null && !showDraft
           ? '播放器只使用当前成功合成缓存对应的后端验证视频。'
           : '代表帧使用当前 GS 比例、方位角和固定输出裁剪；生成预览时会保存这些参数并执行全片低分辨率合成。'}</p>
       </div>
