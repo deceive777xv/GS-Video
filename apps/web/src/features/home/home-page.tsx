@@ -7,6 +7,7 @@ const STEP_LABELS: Record<ProjectSummaryDto['workflow_step'], string> = {
   subject: '选择人物',
   camera: '调整机位',
   preview: '预览合成',
+  postprocess: '合成后处理',
   export: '导出成片',
 }
 

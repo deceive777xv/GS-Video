@@ -2,6 +2,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from threading import Event
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,7 +10,13 @@ from fastapi.testclient import TestClient
 from gs_video.api.routes import ApiServices
 from gs_video.api.schemas import ApiSettings
 from gs_video.app import create_app
-from gs_video.domain.models import PreviewState, StageName, StageState, StageStatus
+from gs_video.domain.models import (
+    BloomEffect,
+    PreviewState,
+    StageName,
+    StageState,
+    StageStatus,
+)
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter, discard_progress
@@ -203,6 +210,99 @@ def test_project_patch_rejects_stale_project_and_ingest_context(
     }
 
 
+def test_effect_chain_save_uses_optimistic_revision_and_preserves_stale_draft(
+    api_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    effect = {
+        "instance_id": str(uuid4()),
+        "type": "primary_correction",
+        "params_version": 1,
+        "display_name": None,
+        "enabled": True,
+        "mix": 100.0,
+        "parameters": {
+            "exposure": 0.5,
+            "contrast": 0.0,
+            "highlights": 0.0,
+            "shadows": 0.0,
+            "temperature": 0.0,
+            "tint": 0.0,
+            "saturation": 100.0,
+            "vibrance": 0.0,
+        },
+    }
+    saved = api_client.patch(
+        "/api/v1/projects/current",
+        json={"effect_chain": [effect], "expected_effect_chain_revision": 0},
+        headers=auth_headers,
+    )
+    stale = api_client.patch(
+        "/api/v1/projects/current",
+        json={"effect_chain": [], "expected_effect_chain_revision": 0},
+        headers=auth_headers,
+    )
+
+    assert saved.status_code == 200
+    assert saved.json()["workflow"]["effect_chain_revision"] == 1
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "effect_chain_revision_conflict"
+    current = api_client.get("/api/v1/projects/current", headers=auth_headers).json()
+    assert current["workflow"]["effect_chain"] == [effect]
+
+
+def test_effect_display_name_does_not_invalidate_pixels_but_encoding_does(
+    api_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    repository = api_client.app.state.services.project_repository
+    effect_id = str(uuid4())
+
+    def seed(project: object) -> None:
+        project.workflow.effect_chain = [BloomEffect(instance_id=effect_id)]  # type: ignore[attr-defined]
+        project.workflow.effect_chain_revision = 4  # type: ignore[attr-defined]
+        for name in (StageName.COMPOSITE, StageName.POST_PROCESS, StageName.EXPORT):
+            project.stages[name] = StageState(  # type: ignore[attr-defined]
+                status=StageStatus.SUCCEEDED,
+                cache_key="a" * 64,
+            )
+
+    repository.update(seed)
+    renamed = api_client.patch(
+        "/api/v1/projects/current",
+        json={
+            "effect_chain": [
+                {
+                    "instance_id": effect_id,
+                    "type": "bloom",
+                    "display_name": "Soft halo",
+                    "parameters": {},
+                }
+            ],
+            "expected_effect_chain_revision": 4,
+        },
+        headers=auth_headers,
+    )
+    encoded = api_client.patch(
+        "/api/v1/projects/current",
+        json={
+            "export_settings": {
+                "codec": "h265",
+                "rate_control": "constant_quality",
+                "quality": 70,
+                "target_bitrate_mbps": 12.0,
+                "compression_preset": "balanced",
+            }
+        },
+        headers=auth_headers,
+    )
+
+    assert renamed.status_code == 200
+    assert renamed.json()["workflow"]["effect_chain_revision"] == 5
+    assert renamed.json()["stages"]["post_process"]["status"] == "succeeded"
+    assert encoded.status_code == 200
+    assert encoded.json()["stages"]["post_process"]["status"] == "succeeded"
+    assert encoded.json()["stages"]["export"]["status"] == "stale"
+
+
 def test_lowering_composite_preview_resolution_preserves_camera_preview_and_mapping(
     api_client: TestClient, auth_headers: dict[str, str]
 ) -> None:
@@ -223,8 +323,9 @@ def test_lowering_composite_preview_resolution_preserves_camera_preview_and_mapp
         for name in (
             StageName.SOLVE_CAMERA,
             StageName.MAP_TRAJECTORY,
-            StageName.RENDER,
-            StageName.COMPOSITE,
+                StageName.RENDER,
+                StageName.COMPOSITE,
+                StageName.POST_PROCESS,
         ):
             project.stages[name] = StageState(  # type: ignore[attr-defined]
                 status=StageStatus.SUCCEEDED,
@@ -244,7 +345,8 @@ def test_lowering_composite_preview_resolution_preserves_camera_preview_and_mapp
     assert body["stages"]["solve_camera"]["status"] == "succeeded"
     assert body["stages"]["map_trajectory"]["status"] == "succeeded"
     assert body["stages"]["render"]["status"] == "succeeded"
-    assert body["stages"]["composite"]["status"] == "stale"
+    assert body["stages"]["composite"]["status"] == "succeeded"
+    assert body["stages"]["post_process"]["status"] == "stale"
 
 
 def test_local_asset_import_copies_into_project_source(

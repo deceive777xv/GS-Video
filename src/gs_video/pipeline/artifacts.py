@@ -19,6 +19,7 @@ PUBLISHABLE_CATEGORIES = frozenset(
         "trajectories",
         "renders",
         "composites",
+        "post_processes",
         "previews",
         "exports",
     }

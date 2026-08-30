@@ -1,4 +1,4 @@
-export type AssetKind = 'source_video' | 'scene_ply'
+export type AssetKind = 'source_video' | 'scene_ply' | 'lut_3d'
 
 export type StageName =
   | 'ingest'
@@ -7,6 +7,7 @@ export type StageName =
   | 'map_trajectory'
   | 'render'
   | 'composite'
+  | 'post_process'
   | 'export'
 
 export type TaskStatus =
@@ -16,11 +17,17 @@ export type TaskStatus =
   | 'failed'
   | 'cancelled'
 
-export type ArtifactRole = 'proxy_frames' | 'subject_masks' | 'export_video'
+export type ArtifactRole =
+  | 'proxy_frames'
+  | 'subject_masks'
+  | 'composite_frames'
+  | 'post_process_frames'
+  | 'post_process_preview'
+  | 'export_video'
 
 export interface ArtifactRefDto {
   project_id: string
-  category: 'frames' | 'proxies' | 'masks' | 'camera' | 'trajectories' | 'renders' | 'composites' | 'previews' | 'exports'
+  category: 'frames' | 'proxies' | 'masks' | 'camera' | 'trajectories' | 'renders' | 'composites' | 'post_processes' | 'previews' | 'exports'
   cache_key: string
   member: string | null
 }
@@ -57,6 +64,10 @@ export interface VideoSummaryDto {
   fps: string
   has_audio: boolean
   frame_count: number | null
+  color_primaries?: string | null
+  color_transfer?: string | null
+  color_matrix?: string | null
+  color_range?: string | null
 }
 
 export interface SceneSummaryDto {
@@ -152,6 +163,70 @@ export interface ExportResultDto {
   verified: boolean
 }
 
+export interface MatteRefinementSettings {
+  enabled: boolean
+  edge_offset: number
+  feather_radius: number
+  decontaminate_strength: number
+  decontaminate_radius: number
+}
+
+export interface PrimaryCorrectionParameters {
+  exposure: number
+  contrast: number
+  highlights: number
+  shadows: number
+  temperature: number
+  tint: number
+  saturation: number
+  vibrance: number
+}
+
+export interface Lut3DParameters { asset_id: string }
+export interface BloomParameters {
+  threshold: number
+  soft_knee: number
+  radius: number
+  intensity: number
+  tint: [number, number, number]
+}
+export interface VignetteParameters {
+  amount: number
+  midpoint: number
+  feather: number
+  roundness: number
+  center_x: number
+  center_y: number
+}
+export interface SharpenParameters {
+  amount: number
+  radius: number
+  threshold: number
+}
+
+interface EffectInstanceBase {
+  instance_id: string
+  params_version: 1
+  display_name: string | null
+  enabled: boolean
+  mix: number
+}
+
+export type EffectInstance =
+  | (EffectInstanceBase & { type: 'primary_correction'; parameters: PrimaryCorrectionParameters })
+  | (EffectInstanceBase & { type: 'lut_3d'; parameters: Lut3DParameters })
+  | (EffectInstanceBase & { type: 'bloom'; parameters: BloomParameters })
+  | (EffectInstanceBase & { type: 'vignette'; parameters: VignetteParameters })
+  | (EffectInstanceBase & { type: 'sharpen'; parameters: SharpenParameters })
+
+export interface ExportEncodingSettings {
+  codec: 'h264' | 'h265'
+  rate_control: 'constant_quality' | 'two_pass_vbr'
+  quality: number
+  target_bitrate_mbps: number
+  compression_preset: 'fast' | 'balanced' | 'high_compression'
+}
+
 export interface WorkflowDto {
   source_summary: VideoSummaryDto | null
   scene_summary: SceneSummaryDto | null
@@ -164,6 +239,11 @@ export interface WorkflowDto {
   scene_azimuth: number
   output_crop: OutputCropDto | null
   preview_height: number
+  source_color_interpretation: 'rec709_metadata' | 'assumed_rec709' | null
+  matte_refinement: MatteRefinementSettings
+  effect_chain: EffectInstance[]
+  effect_chain_revision: number
+  export_settings: ExportEncodingSettings
   active_task_id: string | null
   preview: PreviewDto | null
   export_result: ExportResultDto | null
@@ -176,7 +256,7 @@ export type VerifiedExportDto = Omit<
 
 export interface CompositePreviewDto {
   artifact_id: string
-  filename: 'composite-preview.mp4'
+  filename: 'post-process-preview.mp4'
   size: number
   sha256: string
   duration_seconds: number
@@ -275,9 +355,9 @@ export interface BootstrapDto {
   storage_layout?: StorageLayoutStatusDto | null
 }
 
-export type LibraryAssetKind = 'video' | 'ply'
+export type LibraryAssetKind = 'video' | 'ply' | 'lut'
 
-export type WorkflowStepName = 'import' | 'subject' | 'camera' | 'preview' | 'export'
+export type WorkflowStepName = 'import' | 'subject' | 'camera' | 'preview' | 'postprocess' | 'export'
 
 export interface ProjectSummaryDto {
   project_id: string
@@ -298,6 +378,14 @@ export interface LibraryAssetRecordDto {
   imported_at: string
   video_summary: VideoSummaryDto | null
   scene_summary: SceneSummaryDto | null
+  lut_summary?: {
+    filename: string
+    size: number
+    sha256: string
+    lut_size: number
+    domain_min: [number, number, number]
+    domain_max: [number, number, number]
+  } | null
 }
 
 export interface AssetListItemDto {
@@ -344,6 +432,11 @@ export interface ProjectPatch {
   scene_azimuth?: number
   output_crop?: OutputCropDto | null
   preview_height?: number
+  source_color_interpretation?: 'rec709_metadata' | 'assumed_rec709'
+  matte_refinement?: MatteRefinementSettings
+  effect_chain?: EffectInstance[]
+  expected_effect_chain_revision?: number
+  export_settings?: ExportEncodingSettings
 }
 
 export interface AssetDto {
@@ -408,6 +501,17 @@ export interface DraftCompositePreviewRequest {
   gs_scale: number
   scene_azimuth: number
   output_crop: OutputCropDto
+  matte_refinement: MatteRefinementSettings
+}
+
+export interface DraftPostProcessPreviewRequest {
+  expected_project_id: string
+  request_id: number
+  frame_index: number
+  maximum_width: number
+  maximum_height: number
+  effect_chain: EffectInstance[]
+  bypass: boolean
 }
 
 export interface TargetGroundCandidateInput {

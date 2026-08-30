@@ -171,7 +171,7 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
         repository.root
         / "previews"
         / composite_cache_key
-        / "composite-preview.mp4"
+        / "post-process-preview.mp4"
     )
     preview_path.parent.mkdir(parents=True)
     preview_path.write_bytes(b"composite-preview")
@@ -231,7 +231,7 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
             )
         },
     )
-    project.stages[StageName.COMPOSITE] = StageState(
+    project.stages[StageName.POST_PROCESS] = StageState(
         status=StageStatus.SUCCEEDED,
         cache_key=composite_cache_key,
         output_paths=[
@@ -239,15 +239,15 @@ def workflow_client(tmp_path: Path) -> Iterator[TestClient]:
                 project_id=project.project_id,
                 category=ArtifactCategory.PREVIEWS,
                 cache_key=composite_cache_key,
-                member="composite-preview.mp4",
+                member="post-process-preview.mp4",
             )
         ],
         artifacts={
-            ArtifactRole.COMPOSITE_PREVIEW: ArtifactRef(
+            ArtifactRole.POST_PROCESS_PREVIEW: ArtifactRef(
                 project_id=project.project_id,
                 category=ArtifactCategory.PREVIEWS,
                 cache_key=composite_cache_key,
-                member="composite-preview.mp4",
+                member="post-process-preview.mp4",
             )
         },
     )
@@ -1137,7 +1137,7 @@ def test_composite_preview_is_opaque_authenticated_and_cache_bound(
     workflow_client: TestClient, auth_headers: dict[str, str]
 ) -> None:
     descriptor = workflow_client.get(
-        "/api/v1/projects/current/composite-preview", headers=auth_headers
+        "/api/v1/projects/current/post-process-preview", headers=auth_headers
     )
 
     assert descriptor.status_code == 200
@@ -1153,7 +1153,7 @@ def test_composite_preview_is_opaque_authenticated_and_cache_bound(
     }
     assert "path" not in payload
     video = workflow_client.get(
-        f"/api/v1/artifacts/composite-previews/{payload['artifact_id']}",
+        f"/api/v1/artifacts/post-process-previews/{payload['artifact_id']}",
         headers=auth_headers,
     )
 
@@ -1169,36 +1169,36 @@ def test_composite_preview_blob_rejects_stale_descriptor_identity(
     mutation: str,
 ) -> None:
     descriptor = workflow_client.get(
-        "/api/v1/projects/current/composite-preview", headers=auth_headers
+        "/api/v1/projects/current/post-process-preview", headers=auth_headers
     ).json()
     repository = workflow_client.app.state.services.project_repository
     cache_key = COMPOSITE_CACHE_KEY
-    relative = f"previews/{cache_key}/composite-preview.mp4"
+    relative = f"previews/{cache_key}/post-process-preview.mp4"
 
     if mutation == "bytes":
         (repository.root / relative).write_bytes(b"changed-composite-preview")
     elif mutation == "cache_key":
         replacement_key = "5" * 64
-        replacement_relative = f"previews/{replacement_key}/composite-preview.mp4"
+        replacement_relative = f"previews/{replacement_key}/post-process-preview.mp4"
         replacement = repository.root / replacement_relative
         replacement.parent.mkdir()
         replacement.write_bytes(b"composite-preview")
 
         def change_cache(project: object) -> None:
-            stage = project.stages[StageName.COMPOSITE]  # type: ignore[attr-defined]
+            stage = project.stages[StageName.POST_PROCESS]  # type: ignore[attr-defined]
             stage.cache_key = replacement_key
             replacement_ref = ArtifactRef(
                 project_id=project.project_id,  # type: ignore[attr-defined]
                 category=ArtifactCategory.PREVIEWS,
                 cache_key=replacement_key,
-                member="composite-preview.mp4",
+                member="post-process-preview.mp4",
             )
             stage.output_paths = [replacement_ref]
-            stage.artifacts = {ArtifactRole.COMPOSITE_PREVIEW: replacement_ref}
+            stage.artifacts = {ArtifactRole.POST_PROCESS_PREVIEW: replacement_ref}
 
         repository.update(change_cache)
     stale = workflow_client.get(
-        f"/api/v1/artifacts/composite-previews/{descriptor['artifact_id']}",
+        f"/api/v1/artifacts/post-process-previews/{descriptor['artifact_id']}",
         headers=auth_headers,
     )
 
@@ -1212,9 +1212,9 @@ def test_composite_preview_requires_exact_registered_preview_path(
     repository = workflow_client.app.state.services.project_repository
 
     def mismatch_registration(project: object) -> None:
-        stage = project.stages[StageName.COMPOSITE]  # type: ignore[attr-defined]
+        stage = project.stages[StageName.POST_PROCESS]  # type: ignore[attr-defined]
         stage.artifacts = {
-            ArtifactRole.COMPOSITE_PREVIEW: ArtifactRef(
+            ArtifactRole.POST_PROCESS_PREVIEW: ArtifactRef(
                 project_id=project.project_id,  # type: ignore[attr-defined]
                 category=ArtifactCategory.EXPORTS,
                 cache_key=COMPOSITE_CACHE_KEY,
@@ -1225,7 +1225,7 @@ def test_composite_preview_requires_exact_registered_preview_path(
     repository.update(mismatch_registration)
 
     response = workflow_client.get(
-        "/api/v1/projects/current/composite-preview", headers=auth_headers
+        "/api/v1/projects/current/post-process-preview", headers=auth_headers
     )
 
     assert response.status_code == 409

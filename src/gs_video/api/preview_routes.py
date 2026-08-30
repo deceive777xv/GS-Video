@@ -69,16 +69,16 @@ def _preview_changed() -> ApiError:
 
 
 def _authoritative_preview_relative(project: Project) -> tuple[ArtifactRef, str]:
-    stage = project.stages.get(StageName.COMPOSITE)
+    stage = project.stages.get(StageName.POST_PROCESS)
     if stage is None or stage.cache_key is None:
         raise _preview_changed()
     expected = ArtifactRef(
         project_id=project.project_id,
         category=ArtifactCategory.PREVIEWS,
         cache_key=stage.cache_key,
-        member="composite-preview.mp4",
+        member="post-process-preview.mp4",
     )
-    registered = stage.artifacts.get(ArtifactRole.COMPOSITE_PREVIEW)
+    registered = stage.artifacts.get(ArtifactRole.POST_PROCESS_PREVIEW)
     if (
         stage.status is not StageStatus.SUCCEEDED
         or registered != expected
@@ -114,7 +114,7 @@ def _opaque_preview_id(
 ) -> str:
     material = "\0".join(
         (
-            "composite-preview",
+            "post-process-preview",
             project_id,
             cache_key,
             *(str(part) for part in identity),
@@ -213,7 +213,7 @@ def _resolve_composite_preview(
         artifact_id=_opaque_preview_id(
             project.project_id, cache_key, identity, len(payload), digest
         ),
-        filename="composite-preview.mp4",
+        filename="post-process-preview.mp4",
         size=len(payload),
         sha256=digest,
         duration_seconds=metadata.duration,
@@ -260,6 +260,11 @@ def build_composite_preview_router() -> APIRouter:
     @router.get(
         "/api/v1/projects/current/composite-preview",
         response_model=CompositePreviewResponse,
+        include_in_schema=False,
+    )
+    @router.get(
+        "/api/v1/projects/current/post-process-preview",
+        response_model=CompositePreviewResponse,
     )
     async def get_composite_preview(request: Request) -> CompositePreviewResponse:
         services = _services(request)
@@ -271,7 +276,11 @@ def build_composite_preview_router() -> APIRouter:
             _preview_inspector(request),
         )
 
-    @router.get("/api/v1/artifacts/composite-previews/{artifact_id}")
+    @router.get(
+        "/api/v1/artifacts/composite-previews/{artifact_id}",
+        include_in_schema=False,
+    )
+    @router.get("/api/v1/artifacts/post-process-previews/{artifact_id}")
     async def get_composite_preview_artifact(
         request: Request, artifact_id: str
     ) -> Response:

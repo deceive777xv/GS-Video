@@ -36,6 +36,7 @@ from gs_video.pipeline.services import (
     CompositeWorkflowService,
     ExportWorkflowService,
     MediaIngestService,
+    PostProcessWorkflowService,
     RendererWorkflowService,
     SegmentWorkflowService,
     TrajectoryMapWorkflowService,
@@ -54,6 +55,7 @@ from gs_video.project.manager import (
     ActiveProjectSession,
 )
 from gs_video.project.repository import ProjectInstanceLock
+from gs_video.postprocess.worker_client import PostProcessWorkerClient
 from gs_video.scene.worker_client import RendererWorkerClient
 from gs_video.scene.preview_session import PreviewSession
 from gs_video.segmentation.client import VideoSegmenterClient
@@ -542,6 +544,12 @@ def assemble_api_services(
         total_vram_probe=total_vram_probe,
         initial_limit_mb=config.available_vram_limit_mb,
     )
+    post_processor = PostProcessWorkerClient(
+        worker_prefix=config.renderer_worker_prefix,
+        available_vram_limit_mb=config.available_vram_limit_mb,
+        vram_limit_provider=vram_budget.current_limit_mb,
+        gpu_gate=gpu_gate,
+    )
     preview_session = PreviewSession(
         worker_prefix=config.renderer_worker_prefix,
         sh_degree=config.renderer_sh_degree,
@@ -551,9 +559,11 @@ def assemble_api_services(
         gpu_gate=gpu_gate,
     )
     def resolve_asset(asset_id: str, kind: str) -> Path:
-        expected = (
-            LibraryAssetKind.VIDEO if kind == "video" else LibraryAssetKind.PLY
-        )
+        expected = {
+            "video": LibraryAssetKind.VIDEO,
+            "ply": LibraryAssetKind.PLY,
+            "lut": LibraryAssetKind.LUT,
+        }[kind]
         return asset_library.resolve(asset_id, expected)
 
     def build_project_session(project_id: str) -> ActiveProjectSession:
@@ -584,6 +594,7 @@ def assemble_api_services(
                     vram_limit_provider=vram_budget.current_limit_mb,
                 ),
                 compositor=CompositeWorkflowService(paths),
+                post_processor=PostProcessWorkflowService(paths, post_processor),
                 exporter=ExportWorkflowService(paths),
             )
             runner = build_mvp_workflow(
@@ -699,6 +710,7 @@ def assemble_api_services(
         worker_registry=WorkerRegistry(
             segmentation,
             renderer,
+            post_processor,
             preview_session,
             gpu_gate=gpu_gate,
             project_manager=project_manager,
@@ -714,6 +726,7 @@ def assemble_api_services(
         upload_root=cache_library_root / "upload-staging",
         artifact_store=artifact_store,
         storage_layout=storage_layout,
+        postprocess_backend=post_processor,
     )
     return settings, services
 

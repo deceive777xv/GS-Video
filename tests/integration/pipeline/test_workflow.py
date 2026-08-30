@@ -36,6 +36,8 @@ from gs_video.pipeline.services import (
     CompositeWorkflowService,
     ExportWorkflowService,
     MediaIngestService,
+    NumpyPostProcessBackend,
+    PostProcessWorkflowService,
     SegmentWorkflowService,
     TrajectoryMapWorkflowService,
     WorkflowPaths,
@@ -51,6 +53,7 @@ EXPECTED_STAGE_ORDER = [
     "map_trajectory",
     "render",
     "composite",
+    "post_process",
     "export",
 ]
 
@@ -132,6 +135,7 @@ def fake_services(
         trajectory_mapper=RecordingService("map_trajectory", calls),
         renderer=RecordingRenderer(calls, render_namespaces),
         compositor=RecordingService("composite", calls),
+        post_processor=RecordingService("post_process", calls),
         exporter=RecordingService("export", calls),
     )
 
@@ -166,6 +170,7 @@ def test_mvp_workflow_skips_succeeded_stages_until_explicit_invalidation() -> No
         "map_trajectory",
         "render",
         "composite",
+        "post_process",
         "export",
     ]
 
@@ -227,6 +232,7 @@ def test_dependency_terminal_state_stops_downstream_stages(cancel_solver: bool) 
             StageName.MAP_TRAJECTORY,
             StageName.RENDER,
             StageName.COMPOSITE,
+            StageName.POST_PROCESS,
             StageName.EXPORT,
         ):
             if name in snapshot.stages:
@@ -235,6 +241,7 @@ def test_dependency_terminal_state_stops_downstream_stages(cancel_solver: bool) 
         StageName.MAP_TRAJECTORY,
         StageName.RENDER,
         StageName.COMPOSITE,
+        StageName.POST_PROCESS,
         StageName.EXPORT,
     ):
         assert saved[-1].stages[name].status is StageStatus.PENDING
@@ -445,6 +452,7 @@ def test_concrete_cpu_services_progress_through_export_and_persist_artifacts(
         frame_count=2,
     )
     project.workflow.subject_prompt = SubjectPromptState(frame_index=0, x=1, y=1)
+    project.workflow.source_color_interpretation = "assumed_rec709"
     project.scene_ply = "scene/scene.ply"
     paths = WorkflowPaths(tmp_path)
     exporter = _IntegrationExporter()
@@ -456,8 +464,10 @@ def test_concrete_cpu_services_progress_through_export_and_persist_artifacts(
         ),
         trajectory_mapper=TrajectoryMapWorkflowService(paths),
         renderer=_IntegrationRenderer(tmp_path),
-        compositor=CompositeWorkflowService(
+        compositor=CompositeWorkflowService(paths),
+        post_processor=PostProcessWorkflowService(
             paths,
+            NumpyPostProcessBackend(),
             exporter=exporter,
             exporter_identity="integration-preview-exporter-v1",
             prober=_IntegrationProber(),

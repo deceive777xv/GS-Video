@@ -60,6 +60,10 @@ class AssetInspector:
                 fps=str(metadata.fps),
                 has_audio=metadata.has_audio,
                 frame_count=metadata.frame_count,
+                color_primaries=metadata.color_primaries,
+                color_transfer=metadata.color_transfer,
+                color_matrix=metadata.color_matrix,
+                color_range=metadata.color_range,
             )
         scene = load_gaussian_ply(path)
         estimated_bytes = estimate_scene_vram(scene, 1920, 1080)

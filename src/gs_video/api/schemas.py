@@ -15,7 +15,14 @@ from pydantic import (
     model_validator,
 )
 
-from gs_video.domain.models import Project, StageName
+from gs_video.domain.models import (
+    EffectInstance,
+    ExportEncodingSettings,
+    MatteRefinementSettings,
+    Project,
+    SourceColorInterpretation,
+    StageName,
+)
 from gs_video.environment.doctor import EnvironmentReport
 from gs_video.environment.vram import VramBudgetMode, VramBudgetSnapshot
 from gs_video.project.assets import AssetKind as LibraryAssetKind, AssetRecord
@@ -233,6 +240,19 @@ class ProjectPatch(StrictModel):
     scene_azimuth: float | None = Field(default=None, ge=-180, le=180)
     output_crop: OutputCropInput | None = None
     preview_height: int | None = Field(default=None, ge=180, le=540)
+    source_color_interpretation: SourceColorInterpretation | None = None
+    matte_refinement: MatteRefinementSettings | None = None
+    effect_chain: list[EffectInstance] | None = Field(default=None, max_length=32)
+    expected_effect_chain_revision: int | None = Field(default=None, ge=0)
+    export_settings: ExportEncodingSettings | None = None
+
+    @model_validator(mode="after")
+    def validate_effect_chain_revision(self) -> ProjectPatch:
+        if self.effect_chain is not None and self.expected_effect_chain_revision is None:
+            raise ValueError("effect_chain requires expected_effect_chain_revision")
+        if self.effect_chain is None and self.expected_effect_chain_revision is not None:
+            raise ValueError("expected_effect_chain_revision requires effect_chain")
+        return self
 
 
 class ProjectCreate(StrictModel):
@@ -321,6 +341,19 @@ class DraftCompositePreviewRequest(StrictModel):
     gs_scale: float = Field(ge=0.001, le=1000)
     scene_azimuth: float = Field(ge=-180, le=180)
     output_crop: OutputCropInput
+    matte_refinement: MatteRefinementSettings = Field(
+        default_factory=MatteRefinementSettings
+    )
+
+
+class DraftPostProcessPreviewRequest(StrictModel):
+    expected_project_id: str = Field(min_length=1)
+    request_id: int = Field(ge=1)
+    frame_index: int = Field(ge=0)
+    maximum_width: int = Field(default=960, ge=2, le=1920)
+    maximum_height: int = Field(default=540, ge=2, le=1080)
+    effect_chain: list[EffectInstance] = Field(default_factory=list, max_length=32)
+    bypass: bool = False
 
 
 class PreviewFrameResponse(StrictModel):
@@ -377,7 +410,7 @@ class VerifiedExportResponse(StrictModel):
 
 class CompositePreviewResponse(StrictModel):
     artifact_id: str = Field(pattern=r"^[0-9a-f]{32}$")
-    filename: Literal["composite-preview.mp4"]
+    filename: Literal["post-process-preview.mp4"]
     size: int = Field(gt=0, le=256 * 1024 * 1024)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     duration_seconds: float = Field(gt=0, allow_inf_nan=False)
@@ -407,6 +440,7 @@ class SubjectMediaResponse(StrictModel):
 class AssetKind(StrEnum):
     SOURCE_VIDEO = "source_video"
     SCENE_PLY = "scene_ply"
+    LUT_3D = "lut_3d"
 
 
 class AssetImportRequest(StrictModel):
@@ -421,6 +455,12 @@ class AssetImportRequest(StrictModel):
             return AssetKind(value).value
         except ValueError as error:
             raise ValueError("unsupported asset kind") from error
+
+    @model_validator(mode="after")
+    def validate_assignment(self) -> AssetImportRequest:
+        if self.kind == AssetKind.LUT_3D.value and self.assign_to_current:
+            raise ValueError("LUT assets are selected by effect instances")
+        return self
 
 
 class AssetResponse(StrictModel):
@@ -542,6 +582,12 @@ class UploadCreateRequest(StrictModel):
         if len(normalized) != 64 or any(character not in "0123456789abcdef" for character in normalized):
             raise ValueError("sha256 must contain 64 hexadecimal characters")
         return normalized
+
+    @model_validator(mode="after")
+    def validate_assignment(self) -> UploadCreateRequest:
+        if self.kind == AssetKind.LUT_3D.value and self.assign_to_current:
+            raise ValueError("LUT assets are selected by effect instances")
+        return self
 
 
 class UploadCreated(StrictModel):

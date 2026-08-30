@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from collections.abc import Awaitable, Callable
+from threading import Lock
 from typing import Any, BinaryIO, Protocol, cast
 from uuid import uuid4
 
 import numpy as np
+import cv2
 from fastapi import APIRouter, Depends, Request, Response, WebSocket, status
 
 from gs_video.api.auth import require_session
@@ -40,6 +42,7 @@ from gs_video.api.schemas import (
     MatrixCameraInput,
     EnvironmentRepairSnapshot,
     DraftCompositePreviewRequest,
+    DraftPostProcessPreviewRequest,
     HealthResponse,
     LivePreviewRequest,
     PreviewFrameRequest,
@@ -73,7 +76,11 @@ from gs_video.api.workflow import (
 
 from gs_video.domain.contracts import PickBuffer
 from gs_video.domain.models import (
+    ArtifactCategory,
+    ArtifactRole,
     CameraPose,
+    EffectInstance,
+    Lut3DEffect,
     ExplorationCameraPose,
     OutputCropState,
     PreviewState,
@@ -81,6 +88,8 @@ from gs_video.domain.models import (
     SceneSummary,
     StageName,
     StageState,
+    StageStatus,
+    SourceColorInterpretation,
     SubjectPromptState,
     TargetGroundState,
     VideoSummary,
@@ -99,6 +108,7 @@ from gs_video.environment.vram import (
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter, discard_progress
 from gs_video.pipeline.workflow import ChangeKind, invalidate_for_change
+from gs_video.postprocess.lut import inspect_cube
 from gs_video.project.assets import (
     AssetKind as LibraryAssetKind,
     AssetLibrary,
@@ -224,6 +234,7 @@ class ApiServices:
     upload_root: Path | None = None
     artifact_store: ArtifactStore | None = None
     storage_layout: StorageLayoutManager | None = None
+    postprocess_backend: Any | None = None
 
 
 def _services(request: Request) -> ApiServices:
@@ -274,8 +285,11 @@ _VRAM_BLOCKING_STAGES = {
     StageName.SEGMENT,
     StageName.RENDER,
     StageName.COMPOSITE,
+    StageName.POST_PROCESS,
     StageName.EXPORT,
 }
+_POSTPROCESS_PREVIEW_LOCK = Lock()
+_POSTPROCESS_PREVIEW_LATEST: dict[str, int] = {}
 
 
 def _runtime_change_lock(request: Request) -> asyncio.Lock:
@@ -361,6 +375,19 @@ def _close_live_preview_if_supported(service: object | None) -> None:
     close_live = getattr(service, "close_live", None)
     if callable(close_live):
         close_live()
+
+
+def _close_postprocess_preview_if_supported(service: object | None) -> None:
+    if service is None:
+        return
+    close_preview = getattr(service, "close_preview", None)
+    if callable(close_preview):
+        close_preview()
+
+
+def _close_runtime_previews(services: ApiServices) -> None:
+    _close_live_preview_if_supported(services.preview_service)
+    _close_postprocess_preview_if_supported(services.postprocess_backend)
 
 
 def _suspend_live_preview_if_supported(service: object | None) -> object | None:
@@ -607,13 +634,17 @@ def _import_asset_sync(
             message="The selected asset is unavailable.",
         )
     if services.asset_library is not None:
-        library_kind = (
-            LibraryAssetKind.VIDEO
-            if asset.kind == AssetKind.SOURCE_VIDEO.value
-            else LibraryAssetKind.PLY
-        )
+        library_kind = {
+            AssetKind.SOURCE_VIDEO.value: LibraryAssetKind.VIDEO,
+            AssetKind.SCENE_PLY.value: LibraryAssetKind.PLY,
+            AssetKind.LUT_3D.value: LibraryAssetKind.LUT,
+        }[asset.kind]
 
         def inspect(path: Path, size: int, sha256: str) -> Any:
+            if library_kind is LibraryAssetKind.LUT:
+                if source.suffix.lower() != ".cube":
+                    raise ValueError("3D LUT assets must use the .cube extension")
+                return inspect_cube(path, size, sha256)
             if services.asset_inspector is None:
                 raise ValueError("asset inspection is unavailable")
             return services.asset_inspector.inspect(
@@ -639,7 +670,7 @@ def _import_asset_sync(
                 message="The selected asset could not be imported.",
                 retryable=True,
             ) from error
-        if asset.assign_to_current:
+        if asset.assign_to_current and library_kind is not LibraryAssetKind.LUT:
             current = services.project_repository.load()
             _require_combined_vram_admission(
                 services,
@@ -669,6 +700,13 @@ def _import_asset_sync(
             size=record.size,
             sha256=record.sha256,
             asset_id=record.asset_id,
+        )
+    if asset.kind == AssetKind.LUT_3D.value:
+        raise ApiError(
+            503,
+            code="asset_library_unavailable",
+            category="asset",
+            message="The managed LUT library is unavailable.",
         )
     suspension = (
         _suspend_live_preview_if_supported(services.preview_service)
@@ -724,6 +762,9 @@ def _import_asset_sync(
 def _replace_source_video(project: Project, relative: str, summary: Any) -> None:
     project.source_video = relative
     project.workflow.source_summary = summary
+    project.workflow.source_color_interpretation = _source_color_interpretation(
+        cast(VideoSummary | None, summary)
+    )
     project.workflow.subject_prompt = None
     _clear_source_synthesis_authority(project)
     _clear_preview_authority(project)
@@ -737,6 +778,9 @@ def _select_library_asset(project: Project, record: AssetRecord) -> None:
         project.source_video_asset_id = record.asset_id
         project.source_video = None
         project.workflow.source_summary = record.video_summary
+        project.workflow.source_color_interpretation = _source_color_interpretation(
+            record.video_summary
+        )
         project.workflow.subject_prompt = None
         _clear_source_synthesis_authority(project)
         project.workflow.active_task_id = None
@@ -807,8 +851,31 @@ def _clear_source_synthesis_authority(project: Project) -> None:
     project.workflow.export_result = None
 
 
+def _source_color_interpretation(
+    summary: VideoSummary | None,
+) -> SourceColorInterpretation | None:
+    if summary is None:
+        return None
+    if (
+        summary.color_primaries in {"bt709", "BT.709"}
+        and summary.color_transfer in {"bt709", "BT.709"}
+        and summary.color_matrix in {"bt709", "BT.709"}
+    ):
+        return SourceColorInterpretation.REC709_METADATA
+    return None
+
+
 def _clear_scene_synthesis_authority(project: Project) -> None:
     project.workflow.target_ground = None
+
+
+def _effect_chain_pixel_semantics(
+    effects: list[EffectInstance],
+) -> list[dict[str, object]]:
+    return [
+        effect.model_dump(exclude={"instance_id", "display_name"}, mode="json")
+        for effect in effects
+    ]
 
 
 def build_router() -> APIRouter:
@@ -1180,6 +1247,45 @@ def build_router() -> APIRouter:
                     message="The active project or ingest context changed before the update was applied.",
                     retryable=True,
                 )
+            if (
+                patch.effect_chain is not None
+                and current.workflow.effect_chain_revision
+                != patch.expected_effect_chain_revision
+            ):
+                raise ApiError(
+                    409,
+                    code="effect_chain_revision_conflict",
+                    category="conflict",
+                    message=(
+                        "The effect chain changed after this draft was opened. "
+                        "The local draft was not overwritten."
+                    ),
+                    retryable=True,
+                )
+            if patch.effect_chain is not None:
+                lut_ids = {
+                    effect.parameters.asset_id
+                    for effect in patch.effect_chain
+                    if isinstance(effect, Lut3DEffect)
+                }
+                if lut_ids and services.asset_library is None:
+                    raise ApiError(
+                        503,
+                        code="asset_library_unavailable",
+                        category="asset",
+                        message="The managed LUT library is unavailable.",
+                    )
+                for asset_id in lut_ids:
+                    try:
+                        assert services.asset_library is not None
+                        services.asset_library.resolve(asset_id, LibraryAssetKind.LUT)
+                    except (KeyError, OSError, ValueError) as error:
+                        raise ApiError(
+                            409,
+                            code="lut_unavailable",
+                            category="asset",
+                            message="The effect chain references an unavailable LUT.",
+                        ) from error
             if patch.name is not None and services.project_manager is not None:
                 try:
                     await asyncio.to_thread(
@@ -1239,8 +1345,42 @@ def build_router() -> APIRouter:
                     project.workflow.export_result = None
                 if patch.preview_height is not None:
                     project.workflow.preview_height = patch.preview_height
+                    invalidate_for_change(project, ChangeKind.POST_PROCESS_SETTINGS)
+                    project.workflow.export_result = None
+                if patch.source_color_interpretation is not None:
+                    project.workflow.source_color_interpretation = (
+                        SourceColorInterpretation(patch.source_color_interpretation)
+                    )
                     invalidate_for_change(project, ChangeKind.EDGE_SETTINGS)
                     project.workflow.export_result = None
+                if patch.matte_refinement is not None:
+                    if project.workflow.matte_refinement != patch.matte_refinement:
+                        project.workflow.matte_refinement = patch.matte_refinement.model_copy(
+                            deep=True
+                        )
+                        invalidate_for_change(project, ChangeKind.EDGE_SETTINGS)
+                        project.workflow.export_result = None
+                if patch.effect_chain is not None:
+                    previous_pixels = _effect_chain_pixel_semantics(
+                        project.workflow.effect_chain
+                    )
+                    next_chain = [effect.model_copy(deep=True) for effect in patch.effect_chain]
+                    next_pixels = _effect_chain_pixel_semantics(next_chain)
+                    if project.workflow.effect_chain != next_chain:
+                        project.workflow.effect_chain = next_chain
+                        project.workflow.effect_chain_revision += 1
+                        if previous_pixels != next_pixels:
+                            invalidate_for_change(
+                                project, ChangeKind.POST_PROCESS_SETTINGS
+                            )
+                            project.workflow.export_result = None
+                if patch.export_settings is not None:
+                    if project.workflow.export_settings != patch.export_settings:
+                        project.workflow.export_settings = patch.export_settings.model_copy(
+                            deep=True
+                        )
+                        invalidate_for_change(project, ChangeKind.EXPORT_SETTINGS)
+                        project.workflow.export_result = None
 
             if patch.model_fields_set == {"name"} and services.project_manager is not None:
                 return _load_project(repository)
@@ -1283,9 +1423,7 @@ def build_router() -> APIRouter:
                 return await asyncio.to_thread(
                     require_project_manager(request).create,
                     body.name,
-                    lambda: _close_live_preview_if_supported(
-                        _services(request).preview_service
-                    ),
+                    lambda: _close_runtime_previews(_services(request)),
                 )
             except ValueError as error:
                 raise ApiError(
@@ -1307,9 +1445,7 @@ def build_router() -> APIRouter:
                 return await asyncio.to_thread(
                     require_project_manager(request).activate,
                     project_id,
-                    lambda: _close_live_preview_if_supported(
-                        services.preview_service
-                    ),
+                    lambda: _close_runtime_previews(services),
                 )
             except (KeyError, ValueError) as error:
                 raise ApiError(
@@ -1367,9 +1503,7 @@ def build_router() -> APIRouter:
                     require_project_manager(request).delete,
                     project_id,
                     (
-                        lambda: _close_live_preview_if_supported(
-                            services.preview_service
-                        )
+                        lambda: _close_runtime_previews(services)
                         if active is not None and active.project_id == project_id
                         else None
                     ),
@@ -1464,6 +1598,17 @@ def build_router() -> APIRouter:
         await asyncio.to_thread(_preview_service(request).close_live)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+    @protected.delete(
+        "/api/v1/projects/current/preview/post-process-live",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def close_postprocess_preview(request: Request) -> Response:
+        await asyncio.to_thread(
+            _close_postprocess_preview_if_supported,
+            _services(request).postprocess_backend,
+        )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
     @protected.post(
         "/api/v1/projects/current/preview/composite-draft",
         response_class=Response,
@@ -1543,6 +1688,200 @@ def build_router() -> APIRouter:
                 "X-Preview-Height": str(plan.height),
             },
         )
+
+    @protected.post(
+        "/api/v1/projects/current/preview/post-process-draft",
+        response_class=Response,
+    )
+    async def render_draft_postprocess_preview(
+        request: Request, preview: DraftPostProcessPreviewRequest
+    ) -> Response:
+        services = _services(request)
+        project = _load_project(services.project_repository)
+        if project.project_id != preview.expected_project_id:
+            raise ApiError(
+                409,
+                code="project_context_changed",
+                category="conflict",
+                message="The active project changed before post-processing began.",
+            )
+        backend = services.postprocess_backend
+        if backend is None or services.artifact_store is None:
+            raise ApiError(
+                503,
+                code="postprocess_preview_unavailable",
+                category="post_process",
+                message="The isolated CUDA post-process preview is unavailable.",
+                retryable=True,
+            )
+        stage = project.stages.get(StageName.COMPOSITE)
+        reference = (
+            None
+            if stage is None
+            else stage.artifacts.get(ArtifactRole.COMPOSITE_FRAMES)
+        )
+        if (
+            stage is None
+            or stage.status is not StageStatus.SUCCEEDED
+            or stage.cache_key is None
+            or reference is None
+            or reference.category is not ArtifactCategory.COMPOSITES
+            or reference.cache_key != stage.cache_key
+        ):
+            raise ApiError(
+                409,
+                code="composite_required",
+                category="project",
+                message="Generate the authoritative base composite before previewing effects.",
+            )
+        try:
+            frame_directory = services.artifact_store.resolve(reference, directory=True)
+        except OSError as error:
+            raise ApiError(
+                409,
+                code="composite_changed",
+                category="conflict",
+                message="The base composite is unavailable.",
+            ) from error
+        summary = project.workflow.source_summary
+        if summary is None or preview.frame_index >= (summary.frame_count or 0):
+            raise ApiError(
+                422,
+                code="frame_out_of_range",
+                category="validation",
+                message="The requested representative frame is outside the source duration.",
+            )
+        source_path = frame_directory / f"{preview.frame_index + 1:06d}.png"
+        raw = await asyncio.to_thread(cv2.imread, str(source_path), cv2.IMREAD_UNCHANGED)
+        if raw is None or raw.dtype != np.uint16 or raw.ndim != 3 or raw.shape[2] != 3:
+            raise ApiError(
+                409,
+                code="composite_changed",
+                category="conflict",
+                message="The representative base frame is invalid.",
+            )
+        source_rgb = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+        height, width = source_rgb.shape[:2]
+        scale = min(
+            1.0,
+            preview.maximum_width / width,
+            preview.maximum_height / height,
+        )
+        target = (
+            max(2, int(round(width * scale))),
+            max(2, int(round(height * scale))),
+        )
+        if target != (width, height):
+            source_rgb = cv2.resize(
+                source_rgb, target, interpolation=cv2.INTER_LANCZOS4
+            )
+        preview_root = services.artifact_store.project_root(project.project_id) / "previews"
+        preview_root.mkdir(exist_ok=True)
+        workspace = preview_root / f".postprocess-draft-{uuid4().hex}"
+        workspace.mkdir()
+        input_path = workspace / "000001.png"
+        output_dir = workspace / "output"
+        output_dir.mkdir()
+        output_path = output_dir / "000001.png"
+        with _POSTPROCESS_PREVIEW_LOCK:
+            latest_request = _POSTPROCESS_PREVIEW_LATEST.get(project.project_id, 0)
+            _POSTPROCESS_PREVIEW_LATEST[project.project_id] = max(
+                latest_request, preview.request_id
+            )
+        lut_paths: dict[str, Path] = {}
+        try:
+            if not cv2.imwrite(
+                str(input_path), cv2.cvtColor(source_rgb, cv2.COLOR_RGB2BGR)
+            ):
+                raise OSError("could not stage representative frame")
+            for effect in preview.effect_chain:
+                asset_id = getattr(effect.parameters, "asset_id", None)
+                if asset_id is None or asset_id in lut_paths:
+                    continue
+                if services.asset_library is None:
+                    raise ApiError(
+                        503,
+                        code="asset_library_unavailable",
+                        category="asset",
+                        message="The managed LUT library is unavailable.",
+                    )
+                try:
+                    lut_paths[asset_id] = services.asset_library.resolve(
+                        asset_id, LibraryAssetKind.LUT
+                    )
+                except (KeyError, OSError, ValueError) as error:
+                    raise ApiError(
+                        409,
+                        code="lut_unavailable",
+                        category="asset",
+                        message="A draft effect references an unavailable LUT.",
+                    ) from error
+            processor = getattr(
+                backend, "process_preview_sequence", backend.process_sequence
+            )
+            await asyncio.to_thread(
+                processor,
+                (input_path,),
+                output_dir,
+                [] if preview.bypass else preview.effect_chain,
+                lut_paths,
+                spatial_scale=scale,
+                emit=discard_progress,
+                token=CancellationToken(),
+            )
+            with _POSTPROCESS_PREVIEW_LOCK:
+                if _POSTPROCESS_PREVIEW_LATEST.get(project.project_id) != preview.request_id:
+                    raise ApiError(
+                        409,
+                        code="postprocess_preview_superseded",
+                        category="conflict",
+                        message="A newer post-process preview replaced this request.",
+                        retryable=True,
+                    )
+            processed = cv2.imread(str(output_path), cv2.IMREAD_UNCHANGED)
+            if (
+                processed is None
+                or processed.dtype != np.uint16
+                or processed.shape != source_rgb.shape
+            ):
+                raise ApiError(
+                    500,
+                    code="postprocess_preview_failed",
+                    category="post_process",
+                    message="The CUDA preview worker returned an invalid frame.",
+                    retryable=True,
+                )
+            encoded = np.asarray(
+                np.rint(processed.astype(np.float32) / 257.0), dtype=np.uint8
+            )
+            ok, payload = cv2.imencode(".png", encoded)
+            if not ok:
+                raise ApiError(
+                    500,
+                    code="postprocess_preview_failed",
+                    category="post_process",
+                    message="The processed representative frame could not be encoded.",
+                )
+            return Response(
+                content=payload.tobytes(),
+                media_type="image/png",
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                    "X-Preview-Request-Id": str(preview.request_id),
+                    "X-Preview-Frame-Index": str(preview.frame_index),
+                    "X-Preview-Width": str(target[0]),
+                    "X-Preview-Height": str(target[1]),
+                },
+            )
+        finally:
+            for path in (input_path, output_path):
+                path.unlink(missing_ok=True)
+            for directory in (output_dir, workspace):
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
 
     @protected.post(
         "/api/v1/projects/current/preview",
@@ -2114,6 +2453,10 @@ def build_router() -> APIRouter:
 
         async def prepare_task() -> None:
             nonlocal suspension
+            await asyncio.to_thread(
+                _close_postprocess_preview_if_supported,
+                services.postprocess_backend,
+            )
             suspension = await asyncio.to_thread(
                 _suspend_live_preview_if_supported,
                 services.preview_service,
@@ -2262,13 +2605,17 @@ def build_router() -> APIRouter:
             nonlocal library_record
             if services.asset_library is not None:
                 assert services.upload_root is not None
-                library_kind = (
-                    LibraryAssetKind.VIDEO
-                    if completed.kind == AssetKind.SOURCE_VIDEO.value
-                    else LibraryAssetKind.PLY
-                )
+                library_kind = {
+                    AssetKind.SOURCE_VIDEO.value: LibraryAssetKind.VIDEO,
+                    AssetKind.SCENE_PLY.value: LibraryAssetKind.PLY,
+                    AssetKind.LUT_3D.value: LibraryAssetKind.LUT,
+                }[completed.kind]
 
                 def inspect(path: Path, size: int, sha256: str) -> Any:
+                    if library_kind is LibraryAssetKind.LUT:
+                        if Path(completed.filename).suffix.lower() != ".cube":
+                            raise ValueError("3D LUT assets must use the .cube extension")
+                        return inspect_cube(path, size, sha256)
                     if services.asset_inspector is None:
                         raise ValueError("asset inspection is unavailable")
                     return services.asset_inspector.inspect(
@@ -2281,7 +2628,10 @@ def build_router() -> APIRouter:
                     source_stream,
                     inspect,
                 )
-                if completed.assign_to_current:
+                if (
+                    completed.assign_to_current
+                    and library_kind is not LibraryAssetKind.LUT
+                ):
                     current = services.project_repository.load()
                     _require_combined_vram_admission(
                         services,
@@ -2308,6 +2658,13 @@ def build_router() -> APIRouter:
                             services.preview_service, suspension
                         )
                 return
+            if completed.kind == AssetKind.LUT_3D.value:
+                raise ApiError(
+                    503,
+                    code="asset_library_unavailable",
+                    category="asset",
+                    message="The managed LUT library is unavailable.",
+                )
             summary = None
             if services.asset_inspector is not None:
                 path = services.project_repository.root / completed.path

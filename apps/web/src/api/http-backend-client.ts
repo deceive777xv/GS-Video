@@ -11,6 +11,7 @@ import type {
   PreviewFrameDto,
   LivePreviewRequest,
   DraftCompositePreviewRequest,
+  DraftPostProcessPreviewRequest,
   PreviewRequest,
   SessionConfig,
   StageName,
@@ -269,7 +270,7 @@ export class HttpBackendClient implements BackendClient {
     return this.#request(`/projects/${encodeURIComponent(id)}`, { method: 'DELETE' })
   }
 
-  listAssets(kind: 'video' | 'ply'): Promise<AssetListItemDto[]> {
+  listAssets(kind: 'video' | 'ply' | 'lut'): Promise<AssetListItemDto[]> {
     return this.#request(`/assets?kind=${encodeURIComponent(kind)}`)
   }
 
@@ -357,6 +358,19 @@ export class HttpBackendClient implements BackendClient {
     return this.#request('/projects/current/preview/composite-draft', options)
   }
 
+  renderDraftPostProcessPreview(
+    input: DraftPostProcessPreviewRequest,
+    signal?: AbortSignal,
+  ): Promise<Blob> {
+    const options: RequestOptions = { method: 'POST', json: input, response: 'blob' }
+    if (signal !== undefined) options.signal = signal
+    return this.#request('/projects/current/preview/post-process-draft', options)
+  }
+
+  closePostProcessPreview(): Promise<void> {
+    return this.#request('/projects/current/preview/post-process-live', { method: 'DELETE' })
+  }
+
   closeLivePreview(): Promise<void> {
     return this.#request('/projects/current/preview/live', { method: 'DELETE' })
   }
@@ -385,15 +399,15 @@ export class HttpBackendClient implements BackendClient {
 
   getCompositePreview(signal?: AbortSignal): Promise<CompositePreviewDto> {
     return signal === undefined
-      ? this.#request('/projects/current/composite-preview')
-      : this.#request('/projects/current/composite-preview', { signal })
+      ? this.#request('/projects/current/post-process-preview')
+      : this.#request('/projects/current/post-process-preview', { signal })
   }
 
   fetchCompositePreviewArtifact(id: string, signal?: AbortSignal): Promise<Blob> {
     const options: RequestOptions = { response: 'blob' }
     if (signal !== undefined) options.signal = signal
     return this.#request(
-      `/artifacts/composite-previews/${encodeURIComponent(id)}`,
+      `/artifacts/post-process-previews/${encodeURIComponent(id)}`,
       options,
     )
   }

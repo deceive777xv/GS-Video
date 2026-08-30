@@ -22,6 +22,7 @@ import { ImportPage } from '../features/import/import-page'
 import { HomePage } from '../features/home/home-page'
 import { AssetLibraryPage, type AssetSelectionContext } from '../features/assets/asset-library-page'
 import { PreviewPage } from '../features/preview/preview-page'
+import { PostProcessPage } from '../features/postprocess/postprocess-page'
 import { SubjectPage } from '../features/subject/subject-page'
 import { VramBudgetControl } from '../features/settings/vram-budget-control'
 import { StorageSettingsPage } from '../features/settings/storage-settings-page'
@@ -40,7 +41,8 @@ const STEP_LABELS: Record<WorkflowStep, { number: string; title: string; detail:
   subject: { number: '02', title: '人物', detail: '一次提示' },
   camera: { number: '03', title: '场景对齐', detail: 'ViPE 轨迹 + 自动 GS 地面' },
   preview: { number: '04', title: '预览', detail: '运动与合成' },
-  export: { number: '05', title: '导出', detail: '验证 MP4' },
+  postprocess: { number: '05', title: '后期', detail: '可组合效果链' },
+  export: { number: '06', title: '导出', detail: '验证 MP4' },
 }
 
 export interface AppProps {
@@ -142,7 +144,7 @@ interface WorkflowRoute {
 }
 
 function workflowRouteFromHash(hash: string): WorkflowRoute | null {
-  const match = /^#\/projects\/([^/]+)\/workflow\/(import|subject|camera|preview|export)(?:\/(source|scene|synthesis))?$/.exec(hash)
+  const match = /^#\/projects\/([^/]+)\/workflow\/(import|subject|camera|preview|postprocess|export)(?:\/(source|scene|synthesis))?$/.exec(hash)
   if (match === null) return null
   if (match[3] !== undefined && match[2] !== 'camera') return null
   return {
@@ -205,6 +207,7 @@ export function App({
   const [dismissedTaskErrorKey, setDismissedTaskErrorKey] = useState<string | null>(null)
   const [loading, setLoading] = useState(initialBootstrap === undefined)
   const [startingStage, setStartingStage] = useState(false)
+  const [postProcessDirty, setPostProcessDirty] = useState(false)
   const [missingTaskOwnerId, setMissingTaskOwnerId] = useState<string | null>(null)
   const errorRef = useRef<HTMLDivElement>(null)
   const disposalCycle = useRef(0)
@@ -243,6 +246,16 @@ export function App({
       window.location.hash = hash
     }
   }, [])
+
+  const confirmPostProcessNavigation = useCallback((): boolean => (
+    !postProcessDirty
+    || window.confirm('效果链有未保存修改。选择“取消”返回保存，选择“确定”放弃修改。')
+  ), [postProcessDirty])
+
+  const navigateWorkflowFromUser = useCallback((projectId: string, nextStep: WorkflowStep): void => {
+    if (nextStep !== step && !confirmPostProcessNavigation()) return
+    navigateWorkflow(projectId, nextStep)
+  }, [confirmPostProcessNavigation, navigateWorkflow, step])
 
   useEffect(() => {
     if (!loading && bootstrap !== null && project === null && view === 'workflow'
@@ -836,16 +849,19 @@ export function App({
     case 'export':
       page = <ExportPage activeTask={activeTask} backend={backend} busy={workflowBusy} onError={reportError} onProjectChange={acceptProject} onStartStage={runStage} platform={platform} project={project} />
       break
+    case 'postprocess':
+      page = <PostProcessPage activeTask={activeTask} backend={backend} busy={workflowBusy} onDirtyChange={setPostProcessDirty} onError={reportError} onProjectChange={acceptProject} onStartStage={runStage} project={project} />
+      break
   }
 
   return (
     <AppShell>
       <header className="topbar">
-        <a className="brand" href="#/" aria-label="返回项目首页">
+        <a className="brand" href="#/" aria-label="返回项目首页" onClick={(event) => { if (!confirmPostProcessNavigation()) event.preventDefault() }}>
           <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
           <span><strong>GS VIDEO</strong><small>GAUSSIAN COMPOSITOR</small></span>
         </a>
-        <nav className="workflow-global-nav" aria-label="主导航"><a href="#/">项目</a><a href="#/assets/video">素材库</a><a href="#/settings">设置</a></nav>
+        <nav className="workflow-global-nav" aria-label="主导航"><a href="#/" onClick={(event) => { if (!confirmPostProcessNavigation()) event.preventDefault() }}>项目</a><a href="#/assets/video" onClick={(event) => { if (!confirmPostProcessNavigation()) event.preventDefault() }}>素材库</a><a href="#/settings" onClick={(event) => { if (!confirmPostProcessNavigation()) event.preventDefault() }}>设置</a></nav>
         <div className="project-heading">
           <span>当前项目</span><strong>{project.name}</strong>
         </div>
@@ -871,7 +887,7 @@ export function App({
               const completed = WORKFLOW_STEPS.indexOf(item) < WORKFLOW_STEPS.indexOf(workflowStepForProject(project))
               return (
                 <li className={`${item === step ? 'is-current' : ''} ${completed ? 'is-complete' : ''}`} key={item}>
-                  <button disabled={!reachable} onClick={() => navigateWorkflow(project.project_id, item)} type="button">
+                  <button disabled={!reachable} onClick={() => navigateWorkflowFromUser(project.project_id, item)} type="button">
                     <span className="step-number">{completed ? '✓' : meta.number}</span>
                     <span><strong>{meta.title}</strong><small>{meta.detail}</small></span>
                   </button>
@@ -942,8 +958,8 @@ export function App({
         <div className="footer-actions">
           {activeTaskRunning ? <button className="button-danger" onClick={() => void cancelActiveTask()} type="button">取消任务</button> : null}
           {activeTask !== null && retryableTask ? <button className="button-secondary" onClick={() => void runStage(activeTask.target_stage)} type="button">重试阶段</button> : null}
-          <button className="button-secondary" disabled={previous === undefined} onClick={() => previous !== undefined && navigateWorkflow(project.project_id, previous)} type="button">上一步</button>
-          <button disabled={next === undefined || !canAdvance(project, step)} onClick={() => next !== undefined && navigateWorkflow(project.project_id, next)} type="button">下一步</button>
+          <button className="button-secondary" disabled={previous === undefined} onClick={() => previous !== undefined && navigateWorkflowFromUser(project.project_id, previous)} type="button">上一步</button>
+          <button disabled={next === undefined || !canAdvance(project, step)} onClick={() => next !== undefined && navigateWorkflowFromUser(project.project_id, next)} type="button">下一步</button>
         </div>
       </footer>
     </AppShell>

@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 from gs_video.domain.models import ArtifactCategory
 
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 
 
 def _canonical_project_id(value: object) -> str:
@@ -214,6 +214,64 @@ def migrate_project_dict(raw: dict[str, object]) -> dict[str, object]:
             workflow_value.setdefault("output_crop", None)
             data["schema_version"] = 8
             version = 8
+        elif version == 8:
+            workflow_value = data.setdefault("workflow", {})
+            if not isinstance(workflow_value, dict):
+                raise ValueError("项目工作流状态必须是对象")
+            workflow_value.setdefault("source_color_interpretation", None)
+            workflow_value.setdefault(
+                "matte_refinement",
+                {
+                    "enabled": True,
+                    "edge_offset": -1.0,
+                    "feather_radius": 1.0,
+                    "decontaminate_strength": 0.0,
+                    "decontaminate_radius": 3.0,
+                },
+            )
+            workflow_value.setdefault("effect_chain", [])
+            workflow_value.setdefault("effect_chain_revision", 0)
+            workflow_value.setdefault(
+                "export_settings",
+                {
+                    "codec": "h264",
+                    "rate_control": "constant_quality",
+                    "quality": 70,
+                    "target_bitrate_mbps": 12.0,
+                    "compression_preset": "balanced",
+                },
+            )
+            stages = data.setdefault("stages", {})
+            if not isinstance(stages, dict):
+                raise ValueError("项目阶段状态必须是对象")
+            composite = stages.get("composite")
+            if isinstance(composite, dict):
+                composite["status"] = "stale"
+                composite["cache_key"] = None
+                composite["error_code"] = None
+                composite["run_id"] = None
+                composite["input_generation"] = int(
+                    composite.get("input_generation", 0)
+                ) + 1
+            stages["post_process"] = {
+                "status": "pending",
+                "cache_key": None,
+                "output_paths": [],
+                "error_code": None,
+                "artifacts": {},
+                "input_generation": 0,
+                "run_id": None,
+            }
+            export = stages.get("export")
+            if isinstance(export, dict):
+                export["status"] = "stale"
+                export["cache_key"] = None
+                export["error_code"] = None
+                export["run_id"] = None
+                export["input_generation"] = int(export.get("input_generation", 0)) + 1
+            workflow_value["export_result"] = None
+            data["schema_version"] = 9
+            version = 9
         else:
             raise ValueError(f"不支持的项目版本: {version}")
 

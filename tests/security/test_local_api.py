@@ -109,13 +109,13 @@ def composite_stage(project: Project, cache_key: str) -> StageState:
         project_id=project.project_id,
         category=ArtifactCategory.PREVIEWS,
         cache_key=cache_key,
-        member="composite-preview.mp4",
+        member="post-process-preview.mp4",
     )
     return StageState(
         status=StageStatus.SUCCEEDED,
         cache_key=cache_key,
         output_paths=[reference],
-        artifacts={ArtifactRole.COMPOSITE_PREVIEW: reference},
+        artifacts={ArtifactRole.POST_PROCESS_PREVIEW: reference},
     )
 
 
@@ -152,14 +152,14 @@ def test_composite_preview_blob_revalidates_current_stage_authority(
 ) -> None:  # type: ignore[no-untyped-def]
     client, root = client_and_root
     cache_key = hashlib.sha256(b"composite-security-key").hexdigest()
-    relative = f"previews/{cache_key}/composite-preview.mp4"
+    relative = f"previews/{cache_key}/post-process-preview.mp4"
     preview = root / relative
     preview.parent.mkdir(parents=True)
     preview.write_bytes(b"composite-preview")
     repository = client.app.state.services.project_repository
     repository.update(
         lambda project: project.stages.__setitem__(
-            StageName.COMPOSITE,
+            StageName.POST_PROCESS,
             composite_stage(project, cache_key),
         )
     )
@@ -173,17 +173,17 @@ def test_composite_preview_blob_revalidates_current_stage_authority(
 
     monkeypatch.setattr(client.app.state, "export_inspector", Inspector())
     descriptor = client.get(
-        "/api/v1/projects/current/composite-preview", headers=auth_headers()
+        "/api/v1/projects/current/post-process-preview", headers=auth_headers()
     )
     assert descriptor.status_code == 200
     repository.update(
         lambda project: setattr(
-            project.stages[StageName.COMPOSITE], "status", StageStatus.STALE
+            project.stages[StageName.POST_PROCESS], "status", StageStatus.STALE
         )
     )
 
     stale = client.get(
-        "/api/v1/artifacts/composite-previews/"
+        "/api/v1/artifacts/post-process-previews/"
         f"{descriptor.json()['artifact_id']}",
         headers=auth_headers(),
     )
@@ -199,14 +199,14 @@ def test_composite_preview_rejects_unsafe_registered_files(
 ) -> None:  # type: ignore[no-untyped-def]
     client, root = client_and_root
     cache_key = hashlib.sha256(f"composite-{mutation}".encode()).hexdigest()
-    relative = f"previews/{cache_key}/composite-preview.mp4"
+    relative = f"previews/{cache_key}/post-process-preview.mp4"
     preview = root / relative
     preview.parent.mkdir(parents=True)
     preview.write_bytes(b"composite-preview")
     repository = client.app.state.services.project_repository
     repository.update(
         lambda project: project.stages.__setitem__(
-            StageName.COMPOSITE,
+            StageName.POST_PROCESS,
             composite_stage(project, cache_key),
         )
     )
@@ -236,7 +236,7 @@ def test_composite_preview_rejects_unsafe_registered_files(
 
     monkeypatch.setattr(client.app.state, "export_inspector", Inspector())
     response = client.get(
-        "/api/v1/projects/current/composite-preview", headers=auth_headers()
+        "/api/v1/projects/current/post-process-preview", headers=auth_headers()
     )
 
     assert_stable_error(response, status_code=409, code="composite_preview_changed")
@@ -248,7 +248,7 @@ def test_composite_preview_rejects_cache_registered_path_outside_previews_root()
             project_id="00000000-0000-4000-8000-000000000000",
             category=ArtifactCategory.PREVIEWS,
             cache_key="../escaped-preview",
-            member="composite-preview.mp4",
+            member="post-process-preview.mp4",
         )
     with pytest.raises(ValidationError):
         ArtifactRef(
@@ -265,14 +265,14 @@ def test_composite_preview_descriptor_revalidates_authority_after_probe(
 ) -> None:  # type: ignore[no-untyped-def]
     client, root = client_and_root
     cache_key = hashlib.sha256(b"composite-race").hexdigest()
-    relative = f"previews/{cache_key}/composite-preview.mp4"
+    relative = f"previews/{cache_key}/post-process-preview.mp4"
     preview = root / relative
     preview.parent.mkdir(parents=True)
     preview.write_bytes(b"composite-preview")
     repository = client.app.state.services.project_repository
     repository.update(
         lambda project: project.stages.__setitem__(
-            StageName.COMPOSITE,
+            StageName.POST_PROCESS,
             composite_stage(project, cache_key),
         )
     )
@@ -290,13 +290,13 @@ def test_composite_preview_descriptor_revalidates_authority_after_probe(
     with ThreadPoolExecutor(max_workers=1) as executor:
         request = executor.submit(
             client.get,
-            "/api/v1/projects/current/composite-preview",
+            "/api/v1/projects/current/post-process-preview",
             headers=auth_headers(),
         )
         assert probe_started.wait(1)
         repository.update(
             lambda project: setattr(
-                project.stages[StageName.COMPOSITE], "status", StageStatus.STALE
+                project.stages[StageName.POST_PROCESS], "status", StageStatus.STALE
             )
         )
         release_probe.set()

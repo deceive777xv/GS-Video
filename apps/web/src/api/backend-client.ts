@@ -9,6 +9,7 @@ import type {
   PreviewFrameDto,
   LivePreviewRequest,
   DraftCompositePreviewRequest,
+  DraftPostProcessPreviewRequest,
   PreviewRequest,
   StageName,
   TaskDto,
@@ -48,7 +49,7 @@ export interface BackendClient {
   activateProject(id: string): Promise<ProjectDto>
   renameProject(id: string, name: string): Promise<ProjectSummaryDto>
   deleteProject(id: string): Promise<void>
-  listAssets(kind: 'video' | 'ply'): Promise<AssetListItemDto[]>
+  listAssets(kind: 'video' | 'ply' | 'lut'): Promise<AssetListItemDto[]>
   deleteAsset(id: string): Promise<void>
   selectProjectAsset(kind: AssetKind, assetId: string | null, expectedProjectId: string): Promise<ProjectDto>
   importLocalPath(kind: AssetKind, path: string, assignToCurrent?: boolean): Promise<AssetDto>
@@ -73,6 +74,11 @@ export interface BackendClient {
     input: DraftCompositePreviewRequest,
     signal?: AbortSignal,
   ): Promise<Blob>
+  renderDraftPostProcessPreview(
+    input: DraftPostProcessPreviewRequest,
+    signal?: AbortSignal,
+  ): Promise<Blob>
+  closePostProcessPreview(): Promise<void>
   closeLivePreview(): Promise<void>
   fetchPreviewArtifact(id: string, signal?: AbortSignal): Promise<Blob>
   fitTargetGround(input: TargetGroundCandidateInput): Promise<ProjectDto>

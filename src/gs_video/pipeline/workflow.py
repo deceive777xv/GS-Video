@@ -22,7 +22,8 @@ DEPENDENCIES: dict[StageName, tuple[StageName, ...]] = {
     StageName.MAP_TRAJECTORY: (StageName.SOLVE_CAMERA,),
     StageName.RENDER: (StageName.MAP_TRAJECTORY,),
     StageName.COMPOSITE: (StageName.SEGMENT, StageName.RENDER),
-    StageName.EXPORT: (StageName.COMPOSITE,),
+    StageName.POST_PROCESS: (StageName.COMPOSITE,),
+    StageName.EXPORT: (StageName.POST_PROCESS,),
 }
 
 
@@ -33,6 +34,7 @@ class ChangeKind(StrEnum):
     GS_ALIGNMENT = "gs_alignment"
     OUTPUT_CROP = "output_crop"
     EDGE_SETTINGS = "edge_settings"
+    POST_PROCESS_SETTINGS = "post_process_settings"
     EXPORT_SETTINGS = "export_settings"
 
 
@@ -94,6 +96,10 @@ class CompositeStage(_DelegatingStage):
     name: StageName = StageName.COMPOSITE
 
 
+class PostProcessStage(_DelegatingStage):
+    name: StageName = StageName.POST_PROCESS
+
+
 class ExportStage(_DelegatingStage):
     name: StageName = StageName.EXPORT
 
@@ -126,6 +132,7 @@ class WorkflowServices:
     trajectory_mapper: WorkflowStageService
     renderer: WorkflowRenderService
     compositor: WorkflowStageService
+    post_processor: WorkflowStageService
     exporter: WorkflowStageService
 
 
@@ -148,6 +155,7 @@ def build_mvp_workflow(
         StageName.MAP_TRAJECTORY: MapTrajectoryStage(services.trajectory_mapper),
         StageName.RENDER: RenderStage(services.renderer, RenderCacheNamespace.FINAL),
         StageName.COMPOSITE: CompositeStage(services.compositor),
+        StageName.POST_PROCESS: PostProcessStage(services.post_processor),
         StageName.EXPORT: ExportStage(services.exporter),
     }
     return PipelineRunner(
@@ -169,6 +177,7 @@ INVALIDATION_ROOT: dict[ChangeKind, tuple[StageName, ...]] = {
     ChangeKind.GS_ALIGNMENT: (StageName.MAP_TRAJECTORY,),
     ChangeKind.OUTPUT_CROP: (StageName.RENDER,),
     ChangeKind.EDGE_SETTINGS: (StageName.COMPOSITE,),
+    ChangeKind.POST_PROCESS_SETTINGS: (StageName.POST_PROCESS,),
     ChangeKind.EXPORT_SETTINGS: (StageName.EXPORT,),
 }
 

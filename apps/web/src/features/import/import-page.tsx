@@ -291,6 +291,21 @@ export function ImportPage({
   const repairButtonLabel = repair?.state === 'cancelled' || repair?.state === 'failed'
     ? '继续修复环境'
     : '修复环境'
+  const needsColorConfirmation = video !== null
+    && project.workflow.source_color_interpretation === null
+
+  const confirmRec709 = async (): Promise<void> => {
+    try {
+      const next = await backend.updateProject({
+        expected_project_id: project.project_id,
+        source_color_interpretation: 'assumed_rec709',
+      })
+      onProjectChange(next)
+      setStatus('已确认：该源视频按 SDR Rec.709 解释。')
+    } catch (error) {
+      onError(error)
+    }
+  }
   return (
     <section aria-labelledby="import-title" className="page-grid">
       <div className="page-heading">
@@ -330,6 +345,17 @@ export function ImportPage({
           </div>
         </article>
       </div>
+      {needsColorConfirmation ? (
+        <aside className="color-confirmation">
+          <div><strong>需要确认源色彩</strong><p>文件没有完整的 BT.709 色彩标记。首版仅支持 SDR Rec.709；确认后会按 Rec.709 解释，不会自动转换 HDR。</p></div>
+          <button disabled={busy || importing} onClick={() => void confirmRec709()} type="button">确认按 Rec.709 解释</button>
+        </aside>
+      ) : video !== null ? (
+        <aside className="color-confirmation is-confirmed">
+          <strong>SDR Rec.709</strong>
+          <span>{project.workflow.source_color_interpretation === 'rec709_metadata' ? '已由文件元数据确认' : '已由你确认解释方式'}</span>
+        </aside>
+      ) : null}
       <aside className={`environment-card ${environment.ready ? 'is-ready' : 'has-issues'}`}>
         <div className="environment-heading">
           <span><span className="status-dot" /><strong>{environment.ready ? '本机环境可用' : '环境需要修复'}</strong></span>

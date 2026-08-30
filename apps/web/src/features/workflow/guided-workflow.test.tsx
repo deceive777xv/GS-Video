@@ -54,6 +54,7 @@ function project(): ProjectDto {
       map_trajectory: stage(),
       render: stage(),
       composite: stage(),
+      post_process: stage(),
       export: stage(),
     },
     workflow: {
@@ -68,6 +69,16 @@ function project(): ProjectDto {
       scene_azimuth: 0,
       output_crop: null,
       preview_height: 540,
+      source_color_interpretation: 'assumed_rec709',
+      matte_refinement: {
+        enabled: true, edge_offset: -1, feather_radius: 1,
+        decontaminate_strength: 0, decontaminate_radius: 3,
+      },
+      effect_chain: [], effect_chain_revision: 0,
+      export_settings: {
+        codec: 'h264', rate_control: 'constant_quality', quality: 75,
+        target_bitrate_mbps: 12, compression_preset: 'balanced',
+      },
       active_task_id: null,
       preview: null,
       export_result: null,
@@ -174,7 +185,7 @@ function createHarness(initial = project()) {
     activateProject: vi.fn(),
     renameProject: vi.fn(),
     deleteProject: vi.fn(),
-    listAssets: vi.fn(),
+    listAssets: vi.fn(async () => []),
     deleteAsset: vi.fn(),
     selectProjectAsset: vi.fn(async (kind, assetId) => {
       if (kind === 'source_video') {
@@ -230,6 +241,13 @@ function createHarness(initial = project()) {
     updateProject: vi.fn(async (patch) => {
       if (patch.subject_prompt !== undefined) current.workflow.subject_prompt = patch.subject_prompt
       if (patch.preview_height !== undefined) current.workflow.preview_height = patch.preview_height
+      if (patch.source_color_interpretation !== undefined) current.workflow.source_color_interpretation = patch.source_color_interpretation
+      if (patch.matte_refinement !== undefined) current.workflow.matte_refinement = patch.matte_refinement
+      if (patch.effect_chain !== undefined) {
+        current.workflow.effect_chain = structuredClone(patch.effect_chain)
+        current.workflow.effect_chain_revision += 1
+      }
+      if (patch.export_settings !== undefined) current.workflow.export_settings = patch.export_settings
       return structuredClone(current)
     }),
     renderPreview: vi.fn(async (input) => {
@@ -261,6 +279,8 @@ function createHarness(initial = project()) {
     }),
     renderLivePreview: vi.fn().mockResolvedValue(new Blob()),
     renderDraftCompositePreview: vi.fn().mockResolvedValue(new Blob()),
+    renderDraftPostProcessPreview: vi.fn().mockResolvedValue(new Blob()),
+    closePostProcessPreview: vi.fn().mockResolvedValue(undefined),
     closeLivePreview: vi.fn().mockResolvedValue(undefined),
     fetchPreviewArtifact: vi.fn(async () => new Blob(['preview'], { type: 'image/png' })),
     fitTargetGround: vi.fn(async () => structuredClone(current)),
@@ -272,7 +292,7 @@ function createHarness(initial = project()) {
     })),
     fetchExportArtifact: vi.fn(async () => new Blob(['mp4'], { type: 'video/mp4' })),
     getCompositePreview: vi.fn(async () => ({
-      artifact_id: 'composite-1', filename: 'composite-preview.mp4' as const, size: 12,
+      artifact_id: 'composite-1', filename: 'post-process-preview.mp4' as const, size: 12,
       sha256: 'c'.repeat(64), duration_seconds: 2, fps: '24/1', frame_count: 48,
     })),
     fetchCompositePreviewArtifact: vi.fn(async () => new Blob(['composite'], { type: 'video/mp4' })),
@@ -1150,6 +1170,7 @@ describe('guided workflow', () => {
     ready.stages.segment = stage('succeeded')
     ready.stages.solve_camera = stage('succeeded')
     ready.stages.composite = stage('succeeded')
+    ready.stages.post_process = stage('succeeded')
     ready.workflow.target_camera = { target: [0, 0, 0], distance: 4, yaw: 0, pitch: 0, fov_y_degrees: 50, revision: 1 }
     ready.workflow.preview = { artifact_id: 'preview-1', artifact_size: 1, artifact_sha256: 'p', generation: 1, width: 960, height: 540, camera_revision: 1, pick_buffer_revision: 1 }
     authorizeTargetGround(ready)

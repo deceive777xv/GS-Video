@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import cv2
 from PIL import Image
 import pytest
 
@@ -48,6 +49,8 @@ from gs_video.pipeline.services import (
     CompositeWorkflowService,
     ExportWorkflowService,
     MediaIngestService,
+    NumpyPostProcessBackend,
+    PostProcessWorkflowService,
     RendererWorkflowService,
     SegmentWorkflowService,
     TrajectoryMapWorkflowService,
@@ -968,7 +971,9 @@ def test_custom_exporters_require_explicit_identity(tmp_path: Path) -> None:
     exporter = RecordingExporter()
 
     with pytest.raises(ValueError, match="identity"):
-        CompositeWorkflowService(WorkflowPaths(tmp_path), exporter=exporter)
+        PostProcessWorkflowService(
+            WorkflowPaths(tmp_path), NumpyPostProcessBackend(), exporter=exporter
+        )
     with pytest.raises(ValueError, match="identity"):
         ExportWorkflowService(WorkflowPaths(tmp_path), exporter=exporter)
 
@@ -1000,59 +1005,84 @@ def completed_render_project(root: Path) -> Project:
             )
         },
     )
+    project.workflow.source_color_interpretation = "assumed_rec709"
     return project
 
 
-def test_compositor_uses_source_dimensions_and_registers_preview(
+def completed_composite_project(root: Path) -> Project:
+    project = completed_render_project(root)
+    result = CompositeWorkflowService(WorkflowPaths(root)).run(
+        project, CancellationToken(), discard_progress
+    )
+    project.stages[StageName.COMPOSITE] = StageState(
+        status=StageStatus.SUCCEEDED,
+        cache_key=result.cache_key,
+        artifacts=dict(result.artifacts),
+    )
+    return project
+
+
+def completed_postprocess_project(
+    root: Path,
+    *,
+    exporter: RecordingExporter | None = None,
+    prober: RecordingProber | None = None,
+) -> Project:
+    project = completed_composite_project(root)
+    result = PostProcessWorkflowService(
+        WorkflowPaths(root),
+        NumpyPostProcessBackend(),
+        exporter=exporter or RecordingExporter(),
+        exporter_identity="recording-preview-exporter-v1",
+        prober=prober or RecordingProber(3),
+    ).run(project, CancellationToken(), discard_progress)
+    project.stages[StageName.POST_PROCESS] = StageState(
+        status=StageStatus.SUCCEEDED,
+        cache_key=result.cache_key,
+        artifacts=dict(result.artifacts),
+    )
+    return project
+
+
+def test_compositor_uses_source_dimensions_and_registers_rgb16_frames(
     tmp_path: Path,
 ) -> None:
     project = completed_render_project(tmp_path)
-    exporter = RecordingExporter()
-    prober = RecordingProber(2)
-    service = CompositeWorkflowService(
-        WorkflowPaths(tmp_path),
-        preview_frame_limit=2,
-        exporter=exporter,
-        exporter_identity="recording-exporter-v1",
-        prober=prober,
-    )
+    service = CompositeWorkflowService(WorkflowPaths(tmp_path))
 
     result = service.run(project, CancellationToken(), discard_progress)
 
     assert result.artifacts[ArtifactRole.COMPOSITE_FRAMES] == artifact_ref(
         project, ArtifactCategory.COMPOSITES, result.cache_key
     )
-    assert result.artifacts[ArtifactRole.COMPOSITE_PREVIEW] == artifact_ref(
-        project,
-        ArtifactCategory.PREVIEWS,
-        result.cache_key,
-        "composite-preview.mp4",
+    frame_directory = artifact_path(
+        tmp_path, result.artifacts[ArtifactRole.COMPOSITE_FRAMES]
     )
-    with Image.open(
-        artifact_path(tmp_path, result.artifacts[ArtifactRole.COMPOSITE_FRAMES])
-        / "000001.png"
-    ) as image:
-        assert image.mode == "RGB"
-        assert image.size == (8, 6)
-    assert len(exporter.calls) == 1
-    assert exporter.calls[0][3] == 2
-    assert exporter.calls[0][5] == (8, 6)
-    assert len(prober.calls) == 1
+    image = cv2.imread(str(frame_directory / "000001.png"), cv2.IMREAD_UNCHANGED)
+    assert image is not None
+    assert image.dtype == np.uint16
+    assert image.shape == (6, 8, 3)
+    manifest = json.loads(
+        (frame_directory / "frames-manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["bit_depth"] == 16
+    assert manifest["transfer"] == "BT.709"
 
 
-def test_composite_preview_cache_hit_rejects_content_tampering(tmp_path: Path) -> None:
-    project = completed_render_project(tmp_path)
+def test_postprocess_preview_cache_hit_rejects_content_tampering(tmp_path: Path) -> None:
+    project = completed_composite_project(tmp_path)
     exporter = RecordingExporter()
     prober = RecordingProber(3)
-    service = CompositeWorkflowService(
+    service = PostProcessWorkflowService(
         WorkflowPaths(tmp_path),
+        NumpyPostProcessBackend(),
         exporter=exporter,
         exporter_identity="recording-exporter-v1",
         prober=prober,
     )
     first = service.run(project, CancellationToken(), discard_progress)
     preview = artifact_path(
-        tmp_path, first.artifacts[ArtifactRole.COMPOSITE_PREVIEW]
+        tmp_path, first.artifacts[ArtifactRole.POST_PROCESS_PREVIEW]
     )
     preview.write_bytes(b"tampered preview")
 
@@ -1062,19 +1092,20 @@ def test_composite_preview_cache_hit_rejects_content_tampering(tmp_path: Path) -
     assert len(exporter.calls) == 1
 
 
-def test_composite_preview_cache_hit_rejects_manifest_type_tampering(
+def test_postprocess_preview_cache_hit_rejects_manifest_type_tampering(
     tmp_path: Path,
 ) -> None:
-    project = completed_render_project(tmp_path)
-    service = CompositeWorkflowService(
+    project = completed_composite_project(tmp_path)
+    service = PostProcessWorkflowService(
         WorkflowPaths(tmp_path),
+        NumpyPostProcessBackend(),
         exporter=RecordingExporter(),
         exporter_identity="recording-exporter-v1",
         prober=RecordingProber(3),
     )
     first = service.run(project, CancellationToken(), discard_progress)
     preview = artifact_path(
-        tmp_path, first.artifacts[ArtifactRole.COMPOSITE_PREVIEW]
+        tmp_path, first.artifacts[ArtifactRole.POST_PROCESS_PREVIEW]
     )
     manifest = preview.parent / "manifest.json"
     document = json.loads(manifest.read_text(encoding="utf-8"))
@@ -1088,7 +1119,7 @@ def test_composite_preview_cache_hit_rejects_manifest_type_tampering(
 def test_preview_exporter_metadata_is_validated_before_publication(
     tmp_path: Path,
 ) -> None:
-    project = completed_render_project(tmp_path)
+    project = completed_composite_project(tmp_path)
 
     class WrongMetadataExporter(RecordingExporter):
         def __call__(
@@ -1118,8 +1149,9 @@ def test_preview_exporter_metadata_is_validated_before_publication(
             )
 
     with pytest.raises(RepairableError, match="metadata|元数据|帧数"):
-        CompositeWorkflowService(
+        PostProcessWorkflowService(
             WorkflowPaths(tmp_path),
+            NumpyPostProcessBackend(),
             exporter=WrongMetadataExporter(),
             exporter_identity="wrong-metadata-exporter-v1",
             prober=RecordingProber(3),
@@ -1138,10 +1170,7 @@ def test_compositor_rejects_nonconsecutive_render_inventory(tmp_path: Path) -> N
 
     with pytest.raises(RepairableError, match="连续|inventory|帧"):
         CompositeWorkflowService(
-            WorkflowPaths(tmp_path),
-            exporter=RecordingExporter(),
-            exporter_identity="recording-exporter-v1",
-            prober=RecordingProber(3),
+            WorkflowPaths(tmp_path)
         ).run(project, CancellationToken(), discard_progress)
 
 
@@ -1155,10 +1184,7 @@ def test_compositor_rejects_masks_that_are_not_proxy_resolution(tmp_path: Path) 
 
     with pytest.raises(RepairableError, match="尺寸|代理"):
         CompositeWorkflowService(
-            WorkflowPaths(tmp_path),
-            exporter=RecordingExporter(),
-            exporter_identity="recording-exporter-v1",
-            prober=RecordingProber(3),
+            WorkflowPaths(tmp_path)
         ).run(project, CancellationToken(), discard_progress)
 
 
@@ -1170,50 +1196,39 @@ def test_compositor_rejects_upstream_replacement_before_publication(
         tmp_path,
         project.stages[StageName.INGEST].artifacts[ArtifactRole.SOURCE_FRAMES],
     )
-    original_composite = workflow_services.composite_frame
+    original_composite = workflow_services.composite_frame_16bit
     replaced = False
 
     def replacing_composite(
         foreground: np.ndarray,
         background: np.ndarray,
         alpha: np.ndarray,
-        *,
-        edge_px: int = 1,
+        settings: object,
     ) -> np.ndarray:
         nonlocal replaced
         if not replaced:
             replace_rgb_with_same_size(source_directory / "000002.png", 200)
             replaced = True
-        return original_composite(
-            foreground, background, alpha, edge_px=edge_px
-        )
+        return original_composite(foreground, background, alpha, settings)
 
-    monkeypatch.setattr(workflow_services, "composite_frame", replacing_composite)
+    monkeypatch.setattr(
+        workflow_services, "composite_frame_16bit", replacing_composite
+    )
 
     with pytest.raises(RepairableError, match="源|authority|变化|fingerprint"):
         CompositeWorkflowService(
-            WorkflowPaths(tmp_path),
-            exporter=RecordingExporter(),
-            exporter_identity="recording-exporter-v1",
-            prober=RecordingProber(3),
+            WorkflowPaths(tmp_path)
         ).run(project, CancellationToken(), discard_progress)
 
     assert not any((tmp_path / "composites").glob("?" * 64))
 
 
-def test_export_registers_full_composite_video(tmp_path: Path) -> None:
-    project = completed_render_project(tmp_path)
+def test_export_registers_full_postprocessed_video(tmp_path: Path) -> None:
     preview_exporter = RecordingExporter()
-    composite = CompositeWorkflowService(
-        WorkflowPaths(tmp_path),
+    project = completed_postprocess_project(
+        tmp_path,
         exporter=preview_exporter,
-        exporter_identity="recording-preview-exporter-v1",
         prober=RecordingProber(3),
-    ).run(project, CancellationToken(), discard_progress)
-    project.stages[StageName.COMPOSITE] = StageState(
-        status=StageStatus.SUCCEEDED,
-        cache_key=composite.cache_key,
-        artifacts=dict(composite.artifacts),
     )
     final_exporter = RecordingExporter()
     final_prober = RecordingProber(3)
@@ -1235,18 +1250,7 @@ def test_export_registers_full_composite_video(tmp_path: Path) -> None:
 
 
 def test_final_export_cache_hit_rejects_content_tampering(tmp_path: Path) -> None:
-    project = completed_render_project(tmp_path)
-    composite = CompositeWorkflowService(
-        WorkflowPaths(tmp_path),
-        exporter=RecordingExporter(),
-        exporter_identity="recording-preview-exporter-v1",
-        prober=RecordingProber(3),
-    ).run(project, CancellationToken(), discard_progress)
-    project.stages[StageName.COMPOSITE] = StageState(
-        status=StageStatus.SUCCEEDED,
-        cache_key=composite.cache_key,
-        artifacts=dict(composite.artifacts),
-    )
+    project = completed_postprocess_project(tmp_path)
     exporter = RecordingExporter()
     service = ExportWorkflowService(
         WorkflowPaths(tmp_path),
@@ -1268,18 +1272,7 @@ def test_final_export_cache_hit_rejects_content_tampering(tmp_path: Path) -> Non
 def test_final_export_rejects_upstream_replacement_before_publication(
     tmp_path: Path, mutate_source: bool
 ) -> None:
-    project = completed_render_project(tmp_path)
-    composite = CompositeWorkflowService(
-        WorkflowPaths(tmp_path),
-        exporter=RecordingExporter(),
-        exporter_identity="recording-preview-exporter-v1",
-        prober=RecordingProber(3),
-    ).run(project, CancellationToken(), discard_progress)
-    project.stages[StageName.COMPOSITE] = StageState(
-        status=StageStatus.SUCCEEDED,
-        cache_key=composite.cache_key,
-        artifacts=dict(composite.artifacts),
-    )
+    project = completed_postprocess_project(tmp_path)
 
     class ReplacingExporter(RecordingExporter):
         def __call__(
@@ -1306,7 +1299,7 @@ def test_final_export_rejects_upstream_replacement_before_publication(
             )
 
     with pytest.raises(
-        RepairableError, match="合成|源视频|authority|变化|fingerprint|摘要"
+        RepairableError, match="处理后|源视频|authority|变化|fingerprint|摘要"
     ):
         ExportWorkflowService(
             WorkflowPaths(tmp_path),

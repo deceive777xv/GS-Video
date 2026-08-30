@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from math import isfinite
 from pathlib import PurePosixPath
-from typing import Self
+from typing import Annotated, Literal, Self
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -16,6 +16,7 @@ class StageName(StrEnum):
     MAP_TRAJECTORY = "map_trajectory"
     RENDER = "render"
     COMPOSITE = "composite"
+    POST_PROCESS = "post_process"
     EXPORT = "export"
 
 
@@ -38,6 +39,8 @@ class ArtifactRole(StrEnum):
     RENDER_FRAMES = "render_frames"
     COMPOSITE_FRAMES = "composite_frames"
     COMPOSITE_PREVIEW = "composite_preview"
+    POST_PROCESS_FRAMES = "post_process_frames"
+    POST_PROCESS_PREVIEW = "post_process_preview"
     EXPORT_VIDEO = "export_video"
 
 
@@ -49,6 +52,7 @@ class ArtifactCategory(StrEnum):
     TRAJECTORIES = "trajectories"
     RENDERS = "renders"
     COMPOSITES = "composites"
+    POST_PROCESSES = "post_processes"
     PREVIEWS = "previews"
     EXPORTS = "exports"
 
@@ -144,6 +148,10 @@ class VideoSummary(BaseModel):
     fps: str
     has_audio: bool
     frame_count: int | None = Field(default=None, gt=0)
+    color_primaries: str | None = None
+    color_transfer: str | None = None
+    color_matrix: str | None = None
+    color_range: str | None = None
 
 
 class SceneSummary(BaseModel):
@@ -154,6 +162,29 @@ class SceneSummary(BaseModel):
     sha256: str
     gaussian_count: int = Field(gt=0)
     estimated_vram_mb: int = Field(gt=0)
+
+
+class LutSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    filename: str
+    size: int = Field(gt=0, le=8 * 1024 * 1024)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    lut_size: int = Field(ge=2, le=65)
+    domain_min: tuple[float, float, float]
+    domain_max: tuple[float, float, float]
+
+    @model_validator(mode="after")
+    def validate_domain(self) -> Self:
+        if (
+            not all(isfinite(value) for value in (*self.domain_min, *self.domain_max))
+            or any(
+                high <= low
+                for low, high in zip(self.domain_min, self.domain_max, strict=True)
+            )
+        ):
+            raise ValueError("LUT domain must contain finite increasing bounds")
+        return self
 
 
 class SubjectPromptState(BaseModel):
@@ -329,6 +360,167 @@ class OutputCropState(BaseModel):
     height: int = Field(ge=2, le=2160, multiple_of=2)
 
 
+class SourceColorInterpretation(StrEnum):
+    REC709_METADATA = "rec709_metadata"
+    ASSUMED_REC709 = "assumed_rec709"
+
+
+class MatteRefinementSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    edge_offset: float = Field(default=-1.0, ge=-20, le=20, allow_inf_nan=False)
+    feather_radius: float = Field(default=1.0, ge=0, le=20, allow_inf_nan=False)
+    decontaminate_strength: float = Field(
+        default=0.0, ge=0, le=100, allow_inf_nan=False
+    )
+    decontaminate_radius: float = Field(
+        default=3.0, ge=1, le=20, allow_inf_nan=False
+    )
+
+
+class EffectType(StrEnum):
+    PRIMARY_CORRECTION = "primary_correction"
+    LUT_3D = "lut_3d"
+    BLOOM = "bloom"
+    VIGNETTE = "vignette"
+    SHARPEN = "sharpen"
+
+
+class PrimaryCorrectionParameters(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    exposure: float = Field(default=0.0, ge=-5, le=5, allow_inf_nan=False)
+    contrast: float = Field(default=0.0, ge=-100, le=100, allow_inf_nan=False)
+    highlights: float = Field(default=0.0, ge=-100, le=100, allow_inf_nan=False)
+    shadows: float = Field(default=0.0, ge=-100, le=100, allow_inf_nan=False)
+    temperature: float = Field(default=0.0, ge=-100, le=100, allow_inf_nan=False)
+    tint: float = Field(default=0.0, ge=-100, le=100, allow_inf_nan=False)
+    saturation: float = Field(default=100.0, ge=0, le=200, allow_inf_nan=False)
+    vibrance: float = Field(default=0.0, ge=-100, le=100, allow_inf_nan=False)
+
+
+class Lut3DParameters(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    asset_id: str = Field(min_length=1, max_length=128)
+
+
+class BloomParameters(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    threshold: float = Field(default=80.0, ge=0, le=200, allow_inf_nan=False)
+    soft_knee: float = Field(default=50.0, ge=0, le=100, allow_inf_nan=False)
+    radius: float = Field(default=32.0, ge=1, le=256, allow_inf_nan=False)
+    intensity: float = Field(default=25.0, ge=0, le=400, allow_inf_nan=False)
+    tint: tuple[
+        Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)],
+        Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)],
+        Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)],
+    ] = (1.0, 1.0, 1.0)
+
+
+class VignetteParameters(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    amount: float = Field(default=20.0, ge=0, le=100, allow_inf_nan=False)
+    midpoint: float = Field(default=50.0, ge=0, le=100, allow_inf_nan=False)
+    feather: float = Field(default=50.0, ge=0, le=100, allow_inf_nan=False)
+    roundness: float = Field(default=0.0, ge=-100, le=100, allow_inf_nan=False)
+    center_x: float = Field(default=0.0, ge=-100, le=100, allow_inf_nan=False)
+    center_y: float = Field(default=0.0, ge=-100, le=100, allow_inf_nan=False)
+
+
+class SharpenParameters(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    amount: float = Field(default=50.0, ge=0, le=300, allow_inf_nan=False)
+    radius: float = Field(default=1.0, ge=0.1, le=10, allow_inf_nan=False)
+    threshold: float = Field(default=1.0, ge=0, le=10, allow_inf_nan=False)
+
+
+class EffectInstanceBase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    instance_id: str = Field(default_factory=lambda: str(uuid4()))
+    params_version: Literal[1] = 1
+    display_name: str | None = Field(default=None, min_length=1, max_length=100)
+    enabled: bool = True
+    mix: float = Field(default=100.0, ge=0, le=100, allow_inf_nan=False)
+
+    @field_validator("instance_id")
+    @classmethod
+    def validate_instance_id(cls, value: str) -> str:
+        try:
+            parsed = UUID(value)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("effect instance_id must be a canonical UUID") from exc
+        if str(parsed) != value:
+            raise ValueError("effect instance_id must be a canonical UUID")
+        return value
+
+
+class PrimaryCorrectionEffect(EffectInstanceBase):
+    type: Literal[EffectType.PRIMARY_CORRECTION] = EffectType.PRIMARY_CORRECTION
+    parameters: PrimaryCorrectionParameters = Field(
+        default_factory=PrimaryCorrectionParameters
+    )
+
+
+class Lut3DEffect(EffectInstanceBase):
+    type: Literal[EffectType.LUT_3D] = EffectType.LUT_3D
+    parameters: Lut3DParameters
+
+
+class BloomEffect(EffectInstanceBase):
+    type: Literal[EffectType.BLOOM] = EffectType.BLOOM
+    parameters: BloomParameters = Field(default_factory=BloomParameters)
+
+
+class VignetteEffect(EffectInstanceBase):
+    type: Literal[EffectType.VIGNETTE] = EffectType.VIGNETTE
+    parameters: VignetteParameters = Field(default_factory=VignetteParameters)
+
+
+class SharpenEffect(EffectInstanceBase):
+    type: Literal[EffectType.SHARPEN] = EffectType.SHARPEN
+    parameters: SharpenParameters = Field(default_factory=SharpenParameters)
+
+
+EffectInstance = Annotated[
+    PrimaryCorrectionEffect | Lut3DEffect | BloomEffect | VignetteEffect | SharpenEffect,
+    Field(discriminator="type"),
+]
+
+
+class VideoCodec(StrEnum):
+    H264 = "h264"
+    H265 = "h265"
+
+
+class RateControlMode(StrEnum):
+    CONSTANT_QUALITY = "constant_quality"
+    TWO_PASS_VBR = "two_pass_vbr"
+
+
+class CompressionPreset(StrEnum):
+    FAST = "fast"
+    BALANCED = "balanced"
+    HIGH_COMPRESSION = "high_compression"
+
+
+class ExportEncodingSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    codec: VideoCodec = VideoCodec.H264
+    rate_control: RateControlMode = RateControlMode.CONSTANT_QUALITY
+    quality: int = Field(default=70, ge=1, le=100)
+    target_bitrate_mbps: float = Field(
+        default=12.0, ge=0.5, le=200, allow_inf_nan=False
+    )
+    compression_preset: CompressionPreset = CompressionPreset.BALANCED
+
+
 class WorkflowState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -344,6 +536,15 @@ class WorkflowState(BaseModel):
     scene_azimuth: float = Field(default=0.0, ge=-180, le=180, allow_inf_nan=False)
     output_crop: OutputCropState | None = None
     preview_height: int = Field(default=540, ge=180, le=540)
+    source_color_interpretation: SourceColorInterpretation | None = None
+    matte_refinement: MatteRefinementSettings = Field(
+        default_factory=MatteRefinementSettings
+    )
+    effect_chain: list[EffectInstance] = Field(default_factory=list, max_length=32)
+    effect_chain_revision: int = Field(default=0, ge=0)
+    export_settings: ExportEncodingSettings = Field(
+        default_factory=ExportEncodingSettings
+    )
     active_task_id: str | None = None
     preview: PreviewState | None = None
     export_result: ExportResultState | None = None
@@ -354,13 +555,16 @@ class WorkflowState(BaseModel):
             self.target_ground_generation,
             0 if self.target_ground is None else self.target_ground.revision,
         )
+        instance_ids = [effect.instance_id for effect in self.effect_chain]
+        if len(instance_ids) != len(set(instance_ids)):
+            raise ValueError("effect instance IDs must be unique within a chain")
         return self
 
 
 class Project(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 8
+    schema_version: int = 9
     project_id: str = Field(default_factory=lambda: str(uuid4()))
     name: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

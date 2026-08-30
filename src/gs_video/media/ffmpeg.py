@@ -19,6 +19,10 @@ class VideoMetadata:
     fps: Fraction
     has_audio: bool
     frame_count: int | None
+    color_primaries: str | None
+    color_transfer: str | None
+    color_matrix: str | None
+    color_range: str | None
 
     def __init__(
         self,
@@ -28,6 +32,10 @@ class VideoMetadata:
         fps: Fraction | str,
         has_audio: bool = False,
         frame_count: int | None = None,
+        color_primaries: str | None = None,
+        color_transfer: str | None = None,
+        color_matrix: str | None = None,
+        color_range: str | None = None,
     ) -> None:
         object.__setattr__(self, "width", width)
         object.__setattr__(self, "height", height)
@@ -35,6 +43,10 @@ class VideoMetadata:
         object.__setattr__(self, "fps", Fraction(fps))
         object.__setattr__(self, "has_audio", has_audio)
         object.__setattr__(self, "frame_count", frame_count)
+        object.__setattr__(self, "color_primaries", color_primaries)
+        object.__setattr__(self, "color_transfer", color_transfer)
+        object.__setattr__(self, "color_matrix", color_matrix)
+        object.__setattr__(self, "color_range", color_range)
 
 
 def _positive_int(value: object, field: str) -> int:
@@ -102,6 +114,10 @@ def parse_probe(payload: Mapping[str, Any]) -> VideoMetadata:
             for stream in streams
         ),
         frame_count=frame_count,
+        color_primaries=video_stream.get("color_primaries"),
+        color_transfer=video_stream.get("color_transfer"),
+        color_matrix=video_stream.get("color_space"),
+        color_range=video_stream.get("color_range"),
     )
 
 
@@ -118,6 +134,28 @@ def validate_source(metadata: VideoMetadata) -> None:
         raise UnsupportedMaterialError("视频分辨率不能超过 3840×2160")
     if metadata.fps <= 0:
         raise UnsupportedMaterialError("视频帧率无效")
+    values = {
+        "primaries": metadata.color_primaries,
+        "transfer": metadata.color_transfer,
+        "matrix": metadata.color_matrix,
+    }
+    unsupported = {
+        "primaries": {"bt2020"},
+        "transfer": {"smpte2084", "arib-std-b67", "smpte428"},
+        "matrix": {"bt2020nc", "bt2020c", "ictcp"},
+    }
+    if any(
+        value is not None and value.lower() in unsupported[field]
+        for field, value in values.items()
+    ):
+        raise UnsupportedMaterialError("首版只支持 SDR Rec.709，不能导入 HDR/BT.2020 视频")
+    unspecified = {None, "", "unknown", "unspecified", "reserved"}
+    for field, value in values.items():
+        normalized = None if value is None else value.lower()
+        if normalized not in unspecified and normalized != "bt709":
+            raise UnsupportedMaterialError(
+                f"首版不支持源视频的 {field} 色彩标记: {value}"
+            )
 
 
 def probe_video(path: Path) -> VideoMetadata:

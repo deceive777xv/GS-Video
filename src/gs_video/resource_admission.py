@@ -55,7 +55,8 @@ def _raw_stage_cache_bytes(video: VideoSummary, stage: StageName) -> int:
         StageName.SOLVE_CAMERA: 0,
         StageName.MAP_TRAJECTORY: 0,
         StageName.RENDER: full_resolution_frame_bytes * 3,
-        StageName.COMPOSITE: full_resolution_frame_bytes * 3,
+        StageName.COMPOSITE: full_resolution_frame_bytes * 6,
+        StageName.POST_PROCESS: full_resolution_frame_bytes * 6 + video.size,
         StageName.EXPORT: video.size * 2,
     }
     return estimates[stage]

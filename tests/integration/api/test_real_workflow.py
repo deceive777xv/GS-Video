@@ -28,6 +28,7 @@ from gs_video.domain.models import (
     ArtifactRole,
     Project,
     SceneSummary,
+    SourceColorInterpretation,
     StageName,
     StageStatus,
     TargetGroundState,
@@ -43,6 +44,8 @@ from gs_video.pipeline.services import (
     CompositeWorkflowService,
     ExportWorkflowService,
     MediaIngestService,
+    NumpyPostProcessBackend,
+    PostProcessWorkflowService,
     RendererWorkflowService,
     SegmentWorkflowService,
     TrajectoryMapWorkflowService,
@@ -365,10 +368,12 @@ class ProductionHarness:
                 paths,
                 CpuFakeRendererWorker(),
             ),
-            compositor=CompositeWorkflowService(
+            compositor=CompositeWorkflowService(paths),
+            post_processor=PostProcessWorkflowService(
                 paths,
+                NumpyPostProcessBackend(),
                 exporter=FakeExporter(),
-                exporter_identity="fake-composite-exporter-v1",
+                exporter_identity="fake-post-process-exporter-v1",
                 prober=probe,
             ),
             exporter=ExportWorkflowService(
@@ -507,6 +512,9 @@ class ProductionHarness:
                     revision=1,
                     confirmed=True,
                 )
+                current.workflow.source_color_interpretation = (
+                    SourceColorInterpretation.ASSUMED_REC709
+                )
 
             repository.update(confirm_test_ground)
 
@@ -521,12 +529,12 @@ class ProductionHarness:
             ] == "succeeded"
 
             composite = client.get(
-                "/api/v1/projects/current/composite-preview",
+                "/api/v1/projects/current/post-process-preview",
                 headers=headers,
             )
             assert composite.status_code == 200
             composite_video = client.get(
-                "/api/v1/artifacts/composite-previews/"
+                "/api/v1/artifacts/post-process-previews/"
                 f"{composite.json()['artifact_id']}",
                 headers=headers,
             )
@@ -565,8 +573,8 @@ def test_assembled_workflow_produces_preview_and_verified_export(
     project = production_harness.run_with_fake_workers()
 
     assert project.stages[StageName.EXPORT].status is StageStatus.SUCCEEDED
-    assert project.stages[StageName.COMPOSITE].artifacts[
-        ArtifactRole.COMPOSITE_PREVIEW
-    ].member == "composite-preview.mp4"
+    assert project.stages[StageName.POST_PROCESS].artifacts[
+        ArtifactRole.POST_PROCESS_PREVIEW
+    ].member == "post-process-preview.mp4"
     assert project.workflow.export_result is not None
     assert project.workflow.export_result.verified is True

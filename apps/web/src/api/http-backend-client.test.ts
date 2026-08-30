@@ -53,6 +53,8 @@ const fakeBackendClient = (currentTask = task()): BackendClient => ({
   renderPreview: vi.fn(),
   renderLivePreview: vi.fn().mockResolvedValue(new Blob()),
   renderDraftCompositePreview: vi.fn().mockResolvedValue(new Blob()),
+  renderDraftPostProcessPreview: vi.fn().mockResolvedValue(new Blob()),
+  closePostProcessPreview: vi.fn().mockResolvedValue(undefined),
   closeLivePreview: vi.fn().mockResolvedValue(undefined),
   fetchPreviewArtifact: vi.fn(),
   fitTargetGround: vi.fn(),
@@ -530,6 +532,10 @@ describe('HttpBackendClient', () => {
       gs_scale: 1.25,
       scene_azimuth: 12,
       output_crop: { x: -20, y: 12, width: 640, height: 360 },
+      matte_refinement: {
+        enabled: true, edge_offset: -1, feather_radius: 1,
+        decontaminate_strength: 0, decontaminate_radius: 3,
+      },
     })
 
     expect(frame.type).toBe('image/png')
@@ -544,6 +550,10 @@ describe('HttpBackendClient', () => {
       gs_scale: 1.25,
       scene_azimuth: 12,
       output_crop: { x: -20, y: 12, width: 640, height: 360 },
+      matte_refinement: {
+        enabled: true, edge_offset: -1, feather_radius: 1,
+        decontaminate_strength: 0, decontaminate_radius: 3,
+      },
     }))
   })
 
@@ -637,7 +647,7 @@ describe('HttpBackendClient', () => {
     expect(fetchImpl).toHaveBeenNthCalledWith(
       2,
       expect.stringContaining(
-        `/artifacts/composite-previews/${descriptor.artifact_id}`,
+        `/artifacts/post-process-previews/${descriptor.artifact_id}`,
       ),
       expect.objectContaining({ headers: expect.any(Headers) }),
     )

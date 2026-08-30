@@ -15,9 +15,10 @@ from gs_video.api.schemas import (
 from gs_video.api.workflow import resolve_subject_media
 from gs_video.camera.mapping import map_ground_aligned_trajectory
 from gs_video.camera.serialization import read_camera_solution
-from gs_video.composite.alpha import composite_frame
+from gs_video.composite.alpha import composite_frame_16bit
 from gs_video.domain.models import (
     ArtifactRole,
+    MatteRefinementSettings,
     Project,
     StageName,
     StageStatus,
@@ -36,6 +37,7 @@ class DraftCompositePlan:
     crop_box: tuple[int, int, int, int]
     foreground: bytes
     alpha: bytes
+    matte_refinement: MatteRefinementSettings
 
 
 def draft_authority(project: Project) -> tuple[object, ...]:
@@ -207,6 +209,7 @@ def prepare_draft_composite(
         crop_box=(crop.x, crop.y, crop.x + crop.width, crop.y + crop.height),
         foreground=foreground.payload,
         alpha=alpha.payload,
+        matte_refinement=request.matte_refinement.model_copy(deep=True),
     )
 
 
@@ -240,8 +243,17 @@ def composite_draft(plan: DraftCompositePlan, background_payload: bytes) -> byte
             message="The representative preview media changed while it was decoded.",
             retryable=True,
         ) from error
+    spatial_scale = plan.width / max(plan.crop_box[2] - plan.crop_box[0], 1)
+    pixels16 = composite_frame_16bit(
+        foreground,
+        background,
+        alpha,
+        plan.matte_refinement,
+        spatial_scale=spatial_scale,
+    )
+    pixels8 = np.asarray(np.rint(pixels16.astype(np.float32) / 257.0), dtype=np.uint8)
     output = BytesIO()
-    Image.fromarray(composite_frame(foreground, background, alpha, edge_px=1)).save(
+    Image.fromarray(pixels8).save(
         output, format="PNG"
     )
     return output.getvalue()

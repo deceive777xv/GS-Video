@@ -58,7 +58,8 @@ def normalize_project_name(value: str) -> str:
 
 def _workflow_step(project: Project) -> str:
     ordered: tuple[tuple[str, tuple[StageName, ...]], ...] = (
-        ("export", (StageName.COMPOSITE,)),
+        ("export", (StageName.POST_PROCESS,)),
+        ("postprocess", (StageName.COMPOSITE,)),
         ("preview", (StageName.MAP_TRAJECTORY,)),
         ("camera", (StageName.SEGMENT,)),
         ("subject", (StageName.INGEST,)),
@@ -224,11 +225,17 @@ class ProjectCatalog:
             return tuple(
                 project_summary(project)
                 for project in projects
-                if asset_id
-                in {
-                    project.source_video_asset_id,
-                    project.scene_ply_asset_id,
-                }
+                if (
+                    asset_id
+                    in {
+                        project.source_video_asset_id,
+                        project.scene_ply_asset_id,
+                    }
+                    or any(
+                        getattr(effect.parameters, "asset_id", None) == asset_id
+                        for effect in project.workflow.effect_chain
+                    )
+                )
             )
 
     def repository(self, project_id: str) -> ProjectRepository:

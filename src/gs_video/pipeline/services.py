@@ -26,7 +26,7 @@ from gs_video.camera.serialization import (
     write_camera_solution,
     write_mapped_trajectory,
 )
-from gs_video.composite.alpha import composite_frame
+from gs_video.composite.alpha import composite_frame_16bit
 from gs_video.domain.contracts import (
     MaskSequence,
     Prompt,
@@ -44,6 +44,9 @@ from gs_video.domain.models import (
     ArtifactCategory,
     ArtifactRef,
     ArtifactRole,
+    EffectInstance,
+    ExportEncodingSettings,
+    Lut3DEffect,
     OutputCropState,
     Project,
     SceneSummary,
@@ -57,6 +60,12 @@ from gs_video.media.ingest import extract_proxy_frames, extract_source_frames
 from gs_video.pipeline.artifacts import validate_cache_key
 from gs_video.pipeline.cancellation import CancellationToken
 from gs_video.pipeline.events import ProgressEmitter
+from gs_video.postprocess.engine import (
+    apply_effect_chain,
+    float_to_uint16,
+    uint16_to_float,
+)
+from gs_video.postprocess.lut import CubeLut, parse_cube
 from gs_video.project.cache import cache_key
 from gs_video.resource_admission import cache_has_capacity, fits_vram_budget
 from gs_video.scene.worker_client import RendererWorkerIdentity
@@ -70,9 +79,11 @@ SEGMENT_IMPLEMENTATION_VERSION = "segment-adapter-v1"
 CAMERA_IMPLEMENTATION_VERSION = "vipe-camera-adapter-v1"
 TRAJECTORY_IMPLEMENTATION_VERSION = "ground-aligned-trajectory-v1"
 COMPOSITE_IMPLEMENTATION_VERSION = "full-resolution-composite-v1"
+POST_PROCESS_IMPLEMENTATION_VERSION = "cuda-post-process-v1"
 EXPORT_IMPLEMENTATION_VERSION = "verified-export-v1"
 RENDER_IMPLEMENTATION_VERSION = "renderer-worker-adapter-v1"
 _FRAME_NAME = re.compile(r"^(\d{6})\.(png|jpg)$")
+_FRAME_MANIFEST_NAME = "frames-manifest.json"
 
 
 ProjectMutation = Callable[[Project], None]
@@ -89,6 +100,7 @@ class ExportCallable(Protocol):
         frame_count: int,
         output: Path,
         *,
+        settings: ExportEncodingSettings | None = None,
         cancellation_check: Callable[[], None] | None = None,
     ) -> ExportResult: ...
 
@@ -100,6 +112,57 @@ class Mp4Prober(Protocol):
         *,
         cancellation_check: Callable[[], None] | None = None,
     ) -> ExportResult: ...
+
+
+class PostProcessBackend(Protocol):
+    identity: str
+
+    def process_sequence(
+        self,
+        frame_paths: tuple[Path, ...],
+        output_dir: Path,
+        effects: list[EffectInstance],
+        lut_paths: dict[str, Path],
+        *,
+        spatial_scale: float,
+        emit: ProgressEmitter,
+        token: CancellationToken,
+    ) -> None: ...
+
+
+@dataclass(frozen=True)
+class NumpyPostProcessBackend:
+    """Deterministic reference backend for tests; production wires the CUDA worker."""
+
+    identity: str = "numpy-reference-v1"
+
+    def process_sequence(
+        self,
+        frame_paths: tuple[Path, ...],
+        output_dir: Path,
+        effects: list[EffectInstance],
+        lut_paths: dict[str, Path],
+        *,
+        spatial_scale: float,
+        emit: ProgressEmitter,
+        token: CancellationToken,
+    ) -> None:
+        luts: dict[str, CubeLut] = {}
+        for asset_id, path in lut_paths.items():
+            luts[asset_id] = parse_cube(path.read_text(encoding="utf-8-sig"))
+        for index, frame_path in enumerate(frame_paths, start=1):
+            token.raise_if_cancelled()
+            source = uint16_to_float(_read_rgb16_png(frame_path))
+            processed = apply_effect_chain(
+                source,
+                effects,
+                resolve_lut=luts.__getitem__,
+                spatial_scale=spatial_scale,
+            )
+            _write_rgb16_png(
+                output_dir / f"{index:06d}.png", float_to_uint16(processed)
+            )
+            emit(index, len(frame_paths), f"处理全分辨率帧 {index}/{len(frame_paths)}")
 
 
 class MediaIngestBackend(Protocol):
@@ -443,6 +506,7 @@ def _frame_inventory(
     expected_count: int | None = None,
     expected_size: tuple[int, int] | None = None,
     expected_sizes: tuple[tuple[int, int], ...] | None = None,
+    allowed_members: frozenset[str] = frozenset(),
     token: CancellationToken,
 ) -> _FrameInventory:
     token.raise_if_cancelled()
@@ -456,7 +520,10 @@ def _frame_inventory(
         raise RepairableError(f"{label}帧目录不是普通目录")
     if not entries:
         raise RepairableError(f"{label}帧目录为空")
-    ordered = tuple(sorted(entries))
+    unexpected = tuple(entry.name for entry in entries if entry.name in allowed_members)
+    if len(unexpected) != len(set(unexpected)):
+        raise RepairableError(f"{label}帧目录包含重复保留成员")
+    ordered = tuple(sorted(entry for entry in entries if entry.name not in allowed_members))
     names = tuple(path.name for path in ordered)
     expected_names = tuple(
         f"{index:06d}.{suffix}" for index in range(1, len(ordered) + 1)
@@ -542,6 +609,7 @@ def _assert_frame_snapshot(
     mode: str,
     label: str,
     token: CancellationToken,
+    allowed_members: frozenset[str] = frozenset(),
 ) -> None:
     actual = _frame_inventory(
         directory,
@@ -551,6 +619,7 @@ def _assert_frame_snapshot(
         label=label,
         expected_count=expected.count,
         expected_sizes=expected.sizes,
+        allowed_members=allowed_members,
         token=token,
     )
     if actual != expected:
@@ -1512,6 +1581,60 @@ def _resolved_output_crop(project: Project, summary: VideoSummary) -> OutputCrop
     )
 
 
+def _write_rgb16_png(path: Path, image: NDArray[np.uint16]) -> None:
+    if image.dtype != np.uint16 or image.ndim != 3 or image.shape[-1] != 3:
+        raise RepairableError("16-bit RGB 帧格式无效")
+    if not cv2.imwrite(str(path), cv2.cvtColor(image, cv2.COLOR_RGB2BGR)):
+        raise RepairableError("无法写入 16-bit RGB PNG")
+
+
+def _read_rgb16_png(path: Path) -> NDArray[np.uint16]:
+    raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if raw is None or raw.dtype != np.uint16 or raw.ndim != 3 or raw.shape[-1] != 3:
+        raise RepairableError("处理帧必须是 16-bit RGB PNG")
+    return cast(NDArray[np.uint16], cv2.cvtColor(raw, cv2.COLOR_BGR2RGB))
+
+
+def _write_frame_manifest(
+    directory: Path,
+    *,
+    cache_key_value: str,
+    width: int,
+    height: int,
+    frame_count: int,
+    implementation_version: str,
+) -> None:
+    payload = {
+        "version": 1,
+        "cache_key": cache_key_value,
+        "bit_depth": 16,
+        "channels": "RGB",
+        "transfer": "BT.709",
+        "primaries": "BT.709",
+        "matrix": "RGB",
+        "width": width,
+        "height": height,
+        "frame_count": frame_count,
+        "implementation_version": implementation_version,
+    }
+    (directory / _FRAME_MANIFEST_NAME).write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+
+def _validate_rgb16_inventory(inventory: _FrameInventory, token: CancellationToken) -> None:
+    for path in inventory.paths:
+        token.raise_if_cancelled()
+        _read_rgb16_png(path)
+
+
 def _place_source_in_output(
     foreground: NDArray[np.uint8],
     alpha: NDArray[np.uint8],
@@ -1544,37 +1667,19 @@ class CompositeWorkflowService:
         self,
         paths: WorkflowPaths,
         *,
-        preview_frame_limit: int = 150,
-        edge_px: int = 1,
+        preview_frame_limit: int | None = None,
+        edge_px: int | None = None,
         exporter: ExportCallable | None = None,
         exporter_identity: str | None = None,
         prober: Mp4Prober | None = None,
     ) -> None:
-        if type(preview_frame_limit) is not int or preview_frame_limit <= 0:
-            raise ValueError("preview_frame_limit must be a positive integer")
-        if type(edge_px) is not int or not 0 <= edge_px <= 3:
-            raise ValueError("edge_px must be an integer between 0 and 3")
         self.paths = paths
-        self.preview_frame_limit = preview_frame_limit
-        self.edge_px = edge_px
-        self.exporter: ExportCallable
-        self.prober: Mp4Prober
-        if exporter is None:
-            self.exporter = export_mp4
-            self.exporter_identity = exporter_identity or "ffmpeg-export-v1"
-            if prober is not None:
-                raise ValueError("default exporter must use the trusted ffprobe adapter")
-            self.prober = probe_mp4
-        else:
-            if not exporter_identity:
-                raise ValueError(
-                    "custom preview exporter requires an explicit nonempty identity"
-                )
-            self.exporter = exporter
-            self.exporter_identity = exporter_identity
-            if prober is None:
-                raise ValueError("custom preview exporter requires an explicit prober")
-            self.prober = prober
+        # Retained as rejected compatibility arguments so old bootstrap code fails
+        # loudly instead of silently overriding project authority.
+        if preview_frame_limit is not None or edge_px is not None:
+            raise ValueError("composite preview and edge settings are project-level")
+        if exporter is not None or exporter_identity is not None or prober is not None:
+            raise ValueError("composite no longer performs video encoding")
 
     def run(
         self,
@@ -1641,6 +1746,16 @@ class CompositeWorkflowService:
             expected_size=(output_crop.width, output_crop.height),
             token=token,
         )
+        color_interpretation = project.workflow.source_color_interpretation
+        metadata_is_rec709 = (
+            summary.color_primaries in {"bt709", "BT.709"}
+            and summary.color_transfer in {"bt709", "BT.709"}
+            and summary.color_matrix in {"bt709", "BT.709"}
+        )
+        if color_interpretation is None and not metadata_is_rec709:
+            raise RepairableError(
+                "源视频缺少受支持的色彩元数据，请先确认按 SDR Rec.709 解释"
+            )
         result_key = cache_key(
             StageName.COMPOSITE.value,
             {
@@ -1651,11 +1766,13 @@ class CompositeWorkflowService:
                 "render_inventory": renders.fingerprint,
             },
             {
-                "edge_px": self.edge_px,
+                "matte_refinement": project.workflow.matte_refinement.model_dump(
+                    mode="json"
+                ),
+                "source_color_interpretation": (
+                    None if metadata_is_rec709 else color_interpretation
+                ),
                 "output_crop": output_crop.model_dump(),
-                "preview_height": project.workflow.preview_height,
-                "preview_frame_limit": self.preview_frame_limit,
-                "exporter_identity": self.exporter_identity,
             },
             COMPOSITE_IMPLEMENTATION_VERSION,
         )
@@ -1686,10 +1803,13 @@ class CompositeWorkflowService:
                 foreground, alpha = _place_source_in_output(
                     foreground, alpha, output_crop
                 )
-                composite = composite_frame(
-                    foreground, background, alpha, edge_px=self.edge_px
+                composite = composite_frame_16bit(
+                    foreground,
+                    background,
+                    alpha,
+                    project.workflow.matte_refinement,
                 )
-                Image.fromarray(composite).save(staging / f"{index:06d}.png")
+                _write_rgb16_png(staging / f"{index:06d}.png", composite)
                 emit(index, sources.count, f"合成全分辨率帧 {index}/{sources.count}")
             _assert_frame_snapshot(
                 source_directory,
@@ -1727,6 +1847,14 @@ class CompositeWorkflowService:
                 label="渲染",
                 token=token,
             )
+            _write_frame_manifest(
+                staging,
+                cache_key_value=result_key,
+                width=output_crop.width,
+                height=output_crop.height,
+                frame_count=sources.count,
+                implementation_version=COMPOSITE_IMPLEMENTATION_VERSION,
+            )
             token.raise_if_cancelled()
 
         composite_ref, composite_directory = self.paths.publish(
@@ -1740,123 +1868,90 @@ class CompositeWorkflowService:
             label="合成",
             expected_count=sources.count,
             expected_size=(output_crop.width, output_crop.height),
+            allowed_members=frozenset({_FRAME_MANIFEST_NAME}),
             token=token,
         )
-        preview_count = min(composites.count, self.preview_frame_limit)
-        preview_size = _preview_size(
-            (output_crop.width, output_crop.height), project.workflow.preview_height
-        )
-
-        def build_preview(staging: Path) -> None:
-            token.raise_if_cancelled()
-            preview_frames = staging / "frames"
-            preview_frames.mkdir()
-            for index, source_path in enumerate(
-                composites.paths[:preview_count], start=1
-            ):
-                token.raise_if_cancelled()
-                with Image.open(source_path) as image:
-                    resized = image.resize(preview_size, Image.Resampling.LANCZOS)
-                    resized.save(preview_frames / f"{index:06d}.png")
-            output = staging / "composite-preview.mp4"
-            exported = self.exporter(
-                preview_frames,
-                source_video,
-                Fraction(summary.fps),
-                preview_count,
-                output,
-                cancellation_check=token.raise_if_cancelled,
-            )
-            _validate_export_result(
-                exported,
-                output,
-                fps=Fraction(summary.fps),
-                frame_count=preview_count,
-                has_audio=summary.has_audio,
-                label="预览导出器",
-                allow_duration_tolerance=False,
-            )
-            _assert_frame_snapshot(
-                composite_directory,
-                composites,
-                suffix="png",
-                image_format="PNG",
-                mode="RGB",
-                label="合成",
-                token=token,
-            )
-            _assert_file_snapshot(
-                source_video,
-                source_snapshot,
-                "源视频",
-                token,
-            )
-            _write_mp4_manifest(
-                staging,
-                cache_key_value=result_key,
-                filename="composite-preview.mp4",
-                result=exported,
-                token=token,
-            )
-            for path in preview_frames.iterdir():
-                path.unlink()
-            preview_frames.rmdir()
-            token.raise_if_cancelled()
-
-        preview_directory_ref, preview_directory = self.paths.publish(
-            project, ArtifactCategory.PREVIEWS, result_key, build_preview
-        )
-        _validate_published_mp4(
-            preview_directory,
-            cache_key_value=result_key,
-            filename="composite-preview.mp4",
-            fps=Fraction(summary.fps),
-            frame_count=preview_count,
-            has_audio=summary.has_audio,
-            prober=self.prober,
-            token=token,
-        )
-        preview_ref = self.paths.member(
-            preview_directory_ref, "composite-preview.mp4"
-        )
+        _validate_rgb16_inventory(composites, token)
         return StageResult(
-            output_paths=(composite_ref, preview_ref),
+            output_paths=(composite_ref,),
             cache_key=result_key,
             artifacts={
                 ArtifactRole.COMPOSITE_FRAMES: composite_ref,
-                ArtifactRole.COMPOSITE_PREVIEW: preview_ref,
             },
         )
 
 
-class ExportWorkflowService:
+class PostProcessWorkflowService:
     def __init__(
         self,
         paths: WorkflowPaths,
+        processor: PostProcessBackend,
         *,
         exporter: ExportCallable | None = None,
         exporter_identity: str | None = None,
         prober: Mp4Prober | None = None,
     ) -> None:
         self.paths = paths
+        self.processor = processor
         self.exporter: ExportCallable
         self.prober: Mp4Prober
         if exporter is None:
             self.exporter = export_mp4
-            self.exporter_identity = exporter_identity or "ffmpeg-export-v1"
+            self._uses_default_exporter = True
+            self.exporter_identity = exporter_identity or "ffmpeg-fast-preview-v1"
             if prober is not None:
                 raise ValueError("default exporter must use the trusted ffprobe adapter")
             self.prober = probe_mp4
         else:
+            self._uses_default_exporter = False
             if not exporter_identity:
                 raise ValueError(
-                    "custom final exporter requires an explicit nonempty identity"
+                    "custom post-process preview exporter requires an identity"
+                )
+            if prober is None:
+                raise ValueError(
+                    "custom post-process preview exporter requires a prober"
                 )
             self.exporter = exporter
             self.exporter_identity = exporter_identity
-            if prober is None:
-                raise ValueError("custom final exporter requires an explicit prober")
             self.prober = prober
+
+    def _lut_inputs(
+        self, project: Project, token: CancellationToken
+    ) -> tuple[dict[str, Path], dict[str, str], dict[str, _FileSnapshot]]:
+        lut_paths: dict[str, Path] = {}
+        lut_hashes: dict[str, str] = {}
+        lut_snapshots: dict[str, _FileSnapshot] = {}
+        for effect in project.workflow.effect_chain:
+            if not isinstance(effect, Lut3DEffect):
+                continue
+            asset_id = effect.parameters.asset_id
+            if asset_id in lut_paths:
+                continue
+            if self.paths.resolve_asset is None:
+                raise RepairableError("托管 LUT 素材库不可用")
+            try:
+                path = self.paths.resolve_asset(asset_id, "lut").resolve(strict=True)
+            except (KeyError, OSError, ValueError) as error:
+                raise RepairableError("效果链引用的托管 LUT 不可用") from error
+            snapshot = _file_snapshot(path, "LUT", token)
+            try:
+                parse_cube(path.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeError, ValueError) as error:
+                raise RepairableError("效果链引用的托管 LUT 已损坏") from error
+            lut_paths[asset_id] = path
+            lut_hashes[asset_id] = snapshot.sha256
+            lut_snapshots[asset_id] = snapshot
+        return lut_paths, lut_hashes, lut_snapshots
+
+    @staticmethod
+    def _pixel_effects(effects: list[EffectInstance]) -> list[dict[str, object]]:
+        return [
+            effect.model_dump(
+                exclude={"instance_id", "display_name"}, mode="json"
+            )
+            for effect in effects
+        ]
 
     def run(
         self,
@@ -1881,16 +1976,230 @@ class ExportWorkflowService:
             suffix="png",
             image_format="PNG",
             mode="RGB",
-            label="合成",
+            label="基础合成",
             expected_count=summary.frame_count,
             expected_size=(output_crop.width, output_crop.height),
+            allowed_members=frozenset({_FRAME_MANIFEST_NAME}),
             token=token,
         )
+        _validate_rgb16_inventory(frames, token)
+        lut_paths, lut_hashes, lut_snapshots = self._lut_inputs(project, token)
         result_key = cache_key(
-            StageName.EXPORT.value,
+            StageName.POST_PROCESS.value,
             {
                 "composite_cache_key": composite.cache_key,
                 "composite_inventory": frames.fingerprint,
+                "lut_hashes": lut_hashes,
+            },
+            {
+                "effects": self._pixel_effects(project.workflow.effect_chain),
+                "preview_height": project.workflow.preview_height,
+                "processor_identity": self.processor.identity,
+                "preview_exporter_identity": self.exporter_identity,
+                "color_context": "sdr-rec709-v1",
+            },
+            POST_PROCESS_IMPLEMENTATION_VERSION,
+        )
+
+        def build_frames(staging: Path) -> None:
+            self.processor.process_sequence(
+                frames.paths,
+                staging,
+                project.workflow.effect_chain,
+                lut_paths,
+                spatial_scale=1.0,
+                emit=emit,
+                token=token,
+            )
+            _assert_frame_snapshot(
+                composite_directory,
+                frames,
+                suffix="png",
+                image_format="PNG",
+                mode="RGB",
+                label="基础合成",
+                token=token,
+                allowed_members=frozenset({_FRAME_MANIFEST_NAME}),
+            )
+            for asset_id, path in lut_paths.items():
+                _assert_file_snapshot(
+                    path,
+                    lut_snapshots[asset_id],
+                    "LUT",
+                    token,
+                )
+            _write_frame_manifest(
+                staging,
+                cache_key_value=result_key,
+                width=output_crop.width,
+                height=output_crop.height,
+                frame_count=frames.count,
+                implementation_version=POST_PROCESS_IMPLEMENTATION_VERSION,
+            )
+            _assert_file_snapshot(source_video, source_snapshot, "源视频", token)
+            token.raise_if_cancelled()
+
+        processed_ref, processed_directory = self.paths.publish(
+            project, ArtifactCategory.POST_PROCESSES, result_key, build_frames
+        )
+        processed = _frame_inventory(
+            processed_directory,
+            suffix="png",
+            image_format="PNG",
+            mode="RGB",
+            label="处理后",
+            expected_count=frames.count,
+            expected_size=(output_crop.width, output_crop.height),
+            allowed_members=frozenset({_FRAME_MANIFEST_NAME}),
+            token=token,
+        )
+        _validate_rgb16_inventory(processed, token)
+        preview_size = _preview_size(
+            (output_crop.width, output_crop.height), project.workflow.preview_height
+        )
+
+        def build_preview(staging: Path) -> None:
+            preview_frames = staging / "frames"
+            preview_frames.mkdir()
+            for index, source_path in enumerate(processed.paths, start=1):
+                token.raise_if_cancelled()
+                source = _read_rgb16_png(source_path)
+                resized = cv2.resize(source, preview_size, interpolation=cv2.INTER_LANCZOS4)
+                _write_rgb16_png(preview_frames / f"{index:06d}.png", resized)
+            output = staging / "post-process-preview.mp4"
+            if self._uses_default_exporter:
+                exported = self.exporter(
+                    preview_frames,
+                    source_video,
+                    Fraction(summary.fps),
+                    processed.count,
+                    output,
+                    settings=ExportEncodingSettings(
+                        quality=60, compression_preset="fast"
+                    ),
+                    cancellation_check=token.raise_if_cancelled,
+                )
+            else:
+                exported = self.exporter(
+                    preview_frames,
+                    source_video,
+                    Fraction(summary.fps),
+                    processed.count,
+                    output,
+                    cancellation_check=token.raise_if_cancelled,
+                )
+            _validate_export_result(
+                exported,
+                output,
+                fps=Fraction(summary.fps),
+                frame_count=processed.count,
+                has_audio=summary.has_audio,
+                label="处理后预览导出器",
+                allow_duration_tolerance=False,
+            )
+            _write_mp4_manifest(
+                staging,
+                cache_key_value=result_key,
+                filename="post-process-preview.mp4",
+                result=exported,
+                token=token,
+            )
+            for path in preview_frames.iterdir():
+                path.unlink()
+            preview_frames.rmdir()
+
+        preview_directory_ref, preview_directory = self.paths.publish(
+            project, ArtifactCategory.PREVIEWS, result_key, build_preview
+        )
+        _validate_published_mp4(
+            preview_directory,
+            cache_key_value=result_key,
+            filename="post-process-preview.mp4",
+            fps=Fraction(summary.fps),
+            frame_count=processed.count,
+            has_audio=summary.has_audio,
+            prober=self.prober,
+            token=token,
+        )
+        preview_ref = self.paths.member(
+            preview_directory_ref, "post-process-preview.mp4"
+        )
+        return StageResult(
+            output_paths=(processed_ref, preview_ref),
+            cache_key=result_key,
+            artifacts={
+                ArtifactRole.POST_PROCESS_FRAMES: processed_ref,
+                ArtifactRole.POST_PROCESS_PREVIEW: preview_ref,
+            },
+        )
+
+
+class ExportWorkflowService:
+    def __init__(
+        self,
+        paths: WorkflowPaths,
+        *,
+        exporter: ExportCallable | None = None,
+        exporter_identity: str | None = None,
+        prober: Mp4Prober | None = None,
+    ) -> None:
+        self.paths = paths
+        self.exporter: ExportCallable
+        self.prober: Mp4Prober
+        if exporter is None:
+            self.exporter = export_mp4
+            self._uses_default_exporter = True
+            self.exporter_identity = exporter_identity or "ffmpeg-export-v1"
+            if prober is not None:
+                raise ValueError("default exporter must use the trusted ffprobe adapter")
+            self.prober = probe_mp4
+        else:
+            self._uses_default_exporter = False
+            if not exporter_identity:
+                raise ValueError(
+                    "custom final exporter requires an explicit nonempty identity"
+                )
+            self.exporter = exporter
+            self.exporter_identity = exporter_identity
+            if prober is None:
+                raise ValueError("custom final exporter requires an explicit prober")
+            self.prober = prober
+
+    def run(
+        self,
+        project: Project,
+        token: CancellationToken,
+        emit: ProgressEmitter,
+    ) -> StageResult:
+        token.raise_if_cancelled()
+        source_video, summary, source_snapshot = _source_material(
+            self.paths, project, token
+        )
+        post_process = _stage_state(project, StageName.POST_PROCESS)
+        output_crop = _resolved_output_crop(project, summary)
+        processed_directory = _artifact_path(
+            self.paths,
+            post_process,
+            ArtifactRole.POST_PROCESS_FRAMES,
+            ArtifactCategory.POST_PROCESSES,
+        )
+        frames = _frame_inventory(
+            processed_directory,
+            suffix="png",
+            image_format="PNG",
+            mode="RGB",
+            label="处理后",
+            expected_count=summary.frame_count,
+            expected_size=(output_crop.width, output_crop.height),
+            allowed_members=frozenset({_FRAME_MANIFEST_NAME}),
+            token=token,
+        )
+        _validate_rgb16_inventory(frames, token)
+        result_key = cache_key(
+            StageName.EXPORT.value,
+            {
+                "post_process_cache_key": post_process.cache_key,
+                "post_process_inventory": frames.fingerprint,
             },
             {
                 "fps": summary.fps,
@@ -1899,6 +2208,7 @@ class ExportWorkflowService:
                 "source_sha256": summary.sha256,
                 "has_audio": summary.has_audio,
                 "output_crop": output_crop.model_dump(),
+                "encoding": project.workflow.export_settings.model_dump(mode="json"),
                 "exporter_identity": self.exporter_identity,
             },
             EXPORT_IMPLEMENTATION_VERSION,
@@ -1907,14 +2217,25 @@ class ExportWorkflowService:
         def build(staging: Path) -> None:
             token.raise_if_cancelled()
             output = staging / "final.mp4"
-            exported = self.exporter(
-                composite_directory,
-                source_video,
-                Fraction(summary.fps),
-                frames.count,
-                output,
-                cancellation_check=token.raise_if_cancelled,
-            )
+            if self._uses_default_exporter:
+                exported = self.exporter(
+                    processed_directory,
+                    source_video,
+                    Fraction(summary.fps),
+                    frames.count,
+                    output,
+                    settings=project.workflow.export_settings,
+                    cancellation_check=token.raise_if_cancelled,
+                )
+            else:
+                exported = self.exporter(
+                    processed_directory,
+                    source_video,
+                    Fraction(summary.fps),
+                    frames.count,
+                    output,
+                    cancellation_check=token.raise_if_cancelled,
+                )
             _validate_export_result(
                 exported,
                 output,
@@ -1925,12 +2246,13 @@ class ExportWorkflowService:
                 allow_duration_tolerance=False,
             )
             _assert_frame_snapshot(
-                composite_directory,
+                processed_directory,
                 frames,
                 suffix="png",
                 image_format="PNG",
                 mode="RGB",
-                label="合成",
+                label="处理后",
+                allowed_members=frozenset({_FRAME_MANIFEST_NAME}),
                 token=token,
             )
             _assert_file_snapshot(

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 
 import type { BackendClient } from '../../api/backend-client'
-import type { ProjectDto, TaskDto, TaskEvent } from '../../api/types'
+import type { MatteRefinementSettings, ProjectDto, TaskDto, TaskEvent } from '../../api/types'
 
 interface PreviewPageProps {
   backend: BackendClient
@@ -14,6 +14,14 @@ interface PreviewPageProps {
   onStartStage(stage: 'composite'): Promise<unknown>
   onBackToCamera(): void
   onReselectSubject(): void
+}
+
+const DEFAULT_MATTE: MatteRefinementSettings = {
+  enabled: true,
+  edge_offset: -1,
+  feather_radius: 1,
+  decontaminate_strength: 0,
+  decontaminate_radius: 3,
 }
 
 export function PreviewPage({
@@ -41,6 +49,10 @@ export function PreviewPage({
   }))
   const [scaleText, setScaleText] = useState(String(project.workflow.gs_scale))
   const [azimuthText, setAzimuthText] = useState(String(project.workflow.scene_azimuth))
+  const authoritativeMatte = project.workflow.matte_refinement ?? DEFAULT_MATTE
+  const [matte, setMatte] = useState<MatteRefinementSettings>(() => ({
+    ...authoritativeMatte,
+  }))
   const frameObjectUrl = useRef<string | null>(null)
   const draftObjectUrl = useRef<string | null>(null)
   const draftRequest = useRef(0)
@@ -74,10 +86,12 @@ export function PreviewPage({
   const alignmentSaved = alignmentValid
     && scaleDraft === project.workflow.gs_scale
     && azimuthDraft === project.workflow.scene_azimuth
+  const matteSaved = JSON.stringify(matte) === JSON.stringify(authoritativeMatte)
+  const colorReady = project.workflow.source_color_interpretation !== null
   const draftValid = cropValid && alignmentValid && groundConfirmed
     && project.stages.solve_camera?.status === 'succeeded'
     && project.stages.segment?.status === 'succeeded'
-  const draftDirty = draftValid && (!cropSaved || !alignmentSaved)
+  const draftDirty = draftValid && (!cropSaved || !alignmentSaved || !matteSaved)
   const showDraft = compositeAuthority === null || draftDirty
   const draftKey = draftValid ? JSON.stringify([
     project.project_id,
@@ -91,6 +105,7 @@ export function PreviewPage({
     cropDraft.y,
     cropDraft.width,
     cropDraft.height,
+    matte,
   ]) : null
 
   useEffect(() => {
@@ -105,6 +120,16 @@ export function PreviewPage({
     setScaleText(String(project.workflow.gs_scale))
     setAzimuthText(String(project.workflow.scene_azimuth))
   }, [project.workflow.gs_scale, project.workflow.scene_azimuth])
+
+  useEffect(() => {
+    setMatte({ ...authoritativeMatte })
+  }, [
+    authoritativeMatte.enabled,
+    authoritativeMatte.edge_offset,
+    authoritativeMatte.feather_radius,
+    authoritativeMatte.decontaminate_strength,
+    authoritativeMatte.decontaminate_radius,
+  ])
 
   useEffect(() => {
     if (frameObjectUrl.current !== null) {
@@ -147,6 +172,7 @@ export function PreviewPage({
         gs_scale: scaleDraft,
         scene_azimuth: azimuthDraft,
         output_crop: cropDraft,
+        matte_refinement: matte,
       }, controller.signal).then((blob) => {
         if (controller.signal.aborted || draftRequest.current !== request) return
         const nextUrl = URL.createObjectURL(blob)
@@ -237,15 +263,16 @@ export function PreviewPage({
   }, [backend, compositeAuthority, onError])
 
   const generate = async (): Promise<void> => {
-    if (busy || !cropValid || !alignmentValid || !groundConfirmed) return
+    if (busy || !cropValid || !alignmentValid || !groundConfirmed || !colorReady) return
     setRunning(true)
     try {
-      if (!cropSaved || !alignmentSaved) {
+      if (!cropSaved || !alignmentSaved || !matteSaved) {
         onProjectChange(await backend.updateProject({
           expected_project_id: project.project_id,
           gs_scale: scaleDraft,
           scene_azimuth: azimuthDraft,
           output_crop: cropDraft,
+          matte_refinement: matte,
         }))
       }
       await onStartStage('composite')
@@ -263,6 +290,7 @@ export function PreviewPage({
         gs_scale: scaleDraft,
         scene_azimuth: azimuthDraft,
         output_crop: cropDraft,
+        matte_refinement: matte,
       }))
     } catch (error) {
       onError(error instanceof Error ? error : '无法保存轨迹映射与固定输出裁剪。')
@@ -376,10 +404,19 @@ export function PreviewPage({
               }} step={key === 'width' || key === 'height' ? 2 : 1} type="number" value={cropText[key]} /></label>)}
             </div>
           </fieldset>
+          <fieldset className="matte-controls" disabled={busy || running}>
+            <legend>抠像修边（固定合成步骤）</legend>
+            <label className="toggle-row"><input checked={matte.enabled} onChange={(event) => setMatte({ ...matte, enabled: event.target.checked })} type="checkbox" />启用修边</label>
+            <label>边缘偏移 <output>{matte.edge_offset.toFixed(1)} px</output><input disabled={!matte.enabled} max={20} min={-20} onChange={(event) => setMatte({ ...matte, edge_offset: Number(event.target.value) })} step={0.5} type="range" value={matte.edge_offset} /></label>
+            <label>羽化 <output>{matte.feather_radius.toFixed(1)} px</output><input disabled={!matte.enabled} max={20} min={0} onChange={(event) => setMatte({ ...matte, feather_radius: Number(event.target.value) })} step={0.5} type="range" value={matte.feather_radius} /></label>
+            <label>去色边强度 <output>{matte.decontaminate_strength.toFixed(0)}%</output><input disabled={!matte.enabled} max={100} min={0} onChange={(event) => setMatte({ ...matte, decontaminate_strength: Number(event.target.value) })} type="range" value={matte.decontaminate_strength} /></label>
+            <label>去色边半径 <output>{matte.decontaminate_radius.toFixed(1)} px</output><input disabled={!matte.enabled || matte.decontaminate_strength === 0} max={20} min={1} onChange={(event) => setMatte({ ...matte, decontaminate_radius: Number(event.target.value) })} step={0.5} type="range" value={matte.decontaminate_radius} /></label>
+          </fieldset>
+          {!colorReady ? <div className="color-confirmation"><strong>源视频缺少完整 Rec.709 标记</strong><p>首版只处理 SDR Rec.709。请确认将该素材按 Rec.709 解释后再生成合成。</p><button disabled={busy || running} onClick={() => void backend.updateProject({ expected_project_id: project.project_id, source_color_interpretation: 'assumed_rec709' }).then(onProjectChange).catch(onError)} type="button">确认按 Rec.709 解释</button></div> : null}
           <p className="technical-note">X/Y 使用源画面像素坐标，可为负数；裁剪框允许超出源视频范围，外部区域由 GS 背景填充。宽高须为偶数，最大 3840×2160。</p>
           <div className="preview-actions">
-            <button disabled={busy || running || !cropValid || !alignmentValid || (cropSaved && alignmentSaved)} onClick={() => void saveDraft()} type="button">保存参数</button>
-            <button disabled={busy || running || compositeRunning || !groundConfirmed || !cropValid || !alignmentValid} onClick={() => void generate()} type="button">{busy || running || compositeRunning ? '生成中…' : '生成预览'}</button>
+            <button disabled={busy || running || !cropValid || !alignmentValid || (cropSaved && alignmentSaved && matteSaved)} onClick={() => void saveDraft()} type="button">保存参数</button>
+            <button disabled={busy || running || compositeRunning || !groundConfirmed || !cropValid || !alignmentValid || !colorReady} onClick={() => void generate()} type="button">{busy || running || compositeRunning ? '生成中…' : '生成预览'}</button>
           </div>
           <div className="stage-list" aria-label="预览阶段缓存状态">
             {stageRows.map((name) => <div key={name}><span>{name}</span><strong>{project.stages[name]?.status ?? 'pending'}</strong></div>)}

@@ -17,6 +17,12 @@ from typing import Any, Mapping, NoReturn, TextIO
 from PIL import Image, UnidentifiedImageError
 
 from gs_video.domain.errors import GsVideoError, RepairableError
+from gs_video.domain.models import (
+    CompressionPreset,
+    ExportEncodingSettings,
+    RateControlMode,
+    VideoCodec,
+)
 from gs_video.media.toolchain import MediaTools, resolve_media_tools
 from gs_video.segmentation.paths import has_reparse_component
 from gs_video.segmentation.tree_guard import create_process_tree_guard
@@ -226,7 +232,8 @@ def _validate_inventory(
         children = list(directory.iterdir())
     except OSError as exc:
         raise RepairableError("无法读取帧清单") from exc
-    if {child.name for child in children} != expected:
+    actual = {child.name for child in children}
+    if actual != expected and actual != expected | {"frames-manifest.json"}:
         raise RepairableError("帧清单必须从 000001.png 连续且不能包含额外项目")
 
     expected_size: tuple[int, int] | None = None
@@ -801,6 +808,10 @@ def _ffmpeg_command(
     frame_count: int,
     has_audio: bool,
     staging: Path,
+    settings: ExportEncodingSettings,
+    *,
+    pass_number: int | None = None,
+    passlog: Path | None = None,
 ) -> list[str]:
     rate = f"{fps.numerator}/{fps.denominator}"
     duration = _duration_argument(Fraction(frame_count, 1) / fps)
@@ -827,14 +838,44 @@ def _ffmpeg_command(
         "-r",
         rate,
         "-c:v",
-        "libx264",
+        "libx264" if settings.codec is VideoCodec.H264 else "libx265",
+        "-preset",
+        {
+            CompressionPreset.FAST: "fast",
+            CompressionPreset.BALANCED: "medium",
+            CompressionPreset.HIGH_COMPRESSION: "slow",
+        }[settings.compression_preset],
         "-pix_fmt",
         "yuv420p",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+        "-colorspace",
+        "bt709",
+        "-color_range",
+        "tv",
+        "-sws_flags",
+        "lanczos+accurate_rnd+bitexact",
         "-c:a",
         "aac",
+        "-b:a",
+        "192k",
     ]
+    if settings.rate_control is RateControlMode.CONSTANT_QUALITY:
+        high_quality_crf = 17 if settings.codec is VideoCodec.H264 else 20
+        crf = round(51 - (settings.quality - 1) * (51 - high_quality_crf) / 99)
+        command.extend(["-crf", str(crf)])
+    else:
+        command.extend(["-b:v", f"{settings.target_bitrate_mbps:g}M"])
+        if pass_number is None or passlog is None:
+            raise ValueError("two-pass VBR requires pass number and pass log")
+        command.extend(["-pass", str(pass_number), "-passlogfile", str(passlog)])
     if has_audio:
         command.extend(["-af", "apad"])
+    if pass_number == 1:
+        command.extend(["-an", "-f", "null", "NUL" if os.name == "nt" else "/dev/null"])
+        return command
     command.extend(["-t", duration, str(staging)])
     return command
 
@@ -1062,10 +1103,12 @@ def export_mp4(
     frame_count: int,
     output: Path,
     *,
+    settings: ExportEncodingSettings | None = None,
     cancellation_check: CancellationCheck | None = None,
 ) -> ExportResult:
     """Encode and validate a frame-exact MP4 before atomically publishing it."""
     fps, frame_count = _validate_numbers(fps, frame_count)
+    encoding = settings or ExportEncodingSettings()
     frames, size = _validate_inventory(
         Path(frames_dir), frame_count, cancellation_check
     )
@@ -1090,10 +1133,47 @@ def export_mp4(
         # Recheck the inventory after probing and immediately before FFmpeg opens the inputs.
         _validate_inventory(frames, frame_count, cancellation_check)
         staging.verify_directory()
+        passlog = staging.directory / "ffmpeg-passlog"
         try:
+            if encoding.rate_control is RateControlMode.TWO_PASS_VBR:
+                _run_command(
+                    _ffmpeg_command(
+                        tools,
+                        frames,
+                        source,
+                        fps,
+                        frame_count,
+                        has_audio,
+                        staging.file,
+                        encoding,
+                        pass_number=1,
+                        passlog=passlog,
+                    ),
+                    timeout=_EXPORT_TIMEOUT_SECONDS,
+                    label="ffmpeg-pass-1",
+                    log_sink=log_sink,
+                    cancellation_check=cancellation_check,
+                )
             _run_command(
                 _ffmpeg_command(
-                    tools, frames, source, fps, frame_count, has_audio, staging.file
+                    tools,
+                    frames,
+                    source,
+                    fps,
+                    frame_count,
+                    has_audio,
+                    staging.file,
+                    encoding,
+                    pass_number=(
+                        2
+                        if encoding.rate_control is RateControlMode.TWO_PASS_VBR
+                        else None
+                    ),
+                    passlog=(
+                        passlog
+                        if encoding.rate_control is RateControlMode.TWO_PASS_VBR
+                        else None
+                    ),
                 ),
                 timeout=_EXPORT_TIMEOUT_SECONDS,
                 label="ffmpeg",
@@ -1107,6 +1187,19 @@ def export_mp4(
                 except GsVideoError as ownership_error:
                     exc.add_note(f"staging ownership check also failed: {ownership_error}")
             raise
+        finally:
+            for name in (
+                "ffmpeg-passlog-0.log",
+                "ffmpeg-passlog-0.log.mbtree",
+                "ffmpeg-passlog.log",
+                "ffmpeg-passlog.log.mbtree",
+            ):
+                candidate = staging.directory / name
+                try:
+                    if candidate.is_file() and not has_reparse_component(candidate):
+                        candidate.unlink()
+                except OSError:
+                    pass
         staging.record_file(protected | {log_sink.file_identity})
         staging.verify_file()
         probe = _probe_output(staging.file, log_sink, tools, cancellation_check)

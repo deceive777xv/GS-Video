@@ -1,6 +1,6 @@
 import type { ProjectDto, StageName } from '../api/types'
 
-export const WORKFLOW_STEPS = ['import', 'subject', 'camera', 'preview', 'export'] as const
+export const WORKFLOW_STEPS = ['import', 'subject', 'camera', 'preview', 'postprocess', 'export'] as const
 
 export type WorkflowStep = (typeof WORKFLOW_STEPS)[number]
 
@@ -25,6 +25,7 @@ export function workflowStepForProject(project: ProjectDto): WorkflowStep {
     || !workflow.target_ground.confirmed
   ) return 'camera'
   if (!stageSucceeded(project, 'composite')) return 'preview'
+  if (!stageSucceeded(project, 'post_process')) return 'postprocess'
   return 'export'
 }
 
@@ -42,8 +43,10 @@ export function canVisitStep(project: ProjectDto, step: WorkflowStep): boolean {
         && stageSucceeded(project, 'solve_camera')
     case 'preview':
       return workflow.target_ground?.confirmed === true
-    case 'export':
+    case 'postprocess':
       return stageSucceeded(project, 'composite')
+    case 'export':
+      return stageSucceeded(project, 'post_process')
   }
 }
 

@@ -23,7 +23,7 @@ function readyProject(): ProjectDto {
     stages: {
       ingest: stage('succeeded'), segment: stage('pending'), solve_camera: stage('pending'),
       map_trajectory: stage('pending'), render: stage('pending'),
-      composite: stage('pending'), export: stage('pending'),
+      composite: stage('pending'), post_process: stage('pending'), export: stage('pending'),
     },
     workflow: {
       source_summary: {
@@ -38,6 +38,16 @@ function readyProject(): ProjectDto {
       target_ground: null,
       output_crop: null,
       gs_scale: 1, scene_azimuth: 0, preview_height: 540,
+      source_color_interpretation: 'rec709_metadata',
+      matte_refinement: {
+        enabled: true, edge_offset: -1, feather_radius: 1,
+        decontaminate_strength: 0, decontaminate_radius: 3,
+      },
+      effect_chain: [], effect_chain_revision: 0,
+      export_settings: {
+        codec: 'h264', rate_control: 'constant_quality', quality: 75,
+        target_bitrate_mbps: 12, compression_preset: 'balanced',
+      },
       active_task_id: null, preview: null, export_result: null,
     },
   }

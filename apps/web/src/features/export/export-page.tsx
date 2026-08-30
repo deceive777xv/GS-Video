@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import type { BackendClient } from '../../api/backend-client'
-import type { ProjectDto, TaskDto, VerifiedExportDto } from '../../api/types'
+import type { ExportEncodingSettings, ProjectDto, TaskDto, VerifiedExportDto } from '../../api/types'
 import type { PlatformBridge } from '../../platform/platform-bridge'
 
 interface ExportPageProps {
@@ -17,6 +17,7 @@ interface ExportPageProps {
 
 export function ExportPage({ backend, busy, platform, project, activeTask, onError, onProjectChange, onStartStage }: ExportPageProps) {
   const [exporting, setExporting] = useState(false)
+  const [settings, setSettings] = useState<ExportEncodingSettings>(project.workflow.export_settings)
   const [verified, setVerified] = useState<VerifiedExportDto | null>(null)
   const [browserArtifact, setBrowserArtifact] = useState<{
     artifactId: string
@@ -29,6 +30,17 @@ export function ExportPage({ backend, busy, platform, project, activeTask, onErr
     && project.workflow.export_result?.verified === true
     ? project.workflow.export_result.artifact_id
     : null
+  const settingsDirty = JSON.stringify(settings) !== JSON.stringify(project.workflow.export_settings)
+  const recommendedBitrate = useMemo(() => {
+    const source = project.workflow.source_summary
+    if (source === null) return 12
+    const [numerator = '0', denominator = '1'] = source.fps.split('/')
+    const fps = Number(numerator) / Math.max(1, Number(denominator))
+    const codecFactor = settings.codec === 'h264' ? 0.075 : 0.05
+    return Math.min(200, Math.max(0.5, source.width * source.height * fps * codecFactor / 1_000_000))
+  }, [project.workflow.source_summary, settings.codec])
+
+  useEffect(() => setSettings(project.workflow.export_settings), [project.project_id])
 
   const saveVerified = async (descriptor: VerifiedExportDto): Promise<void> => {
     if (platform.kind === 'browser') {
@@ -105,6 +117,12 @@ export function ExportPage({ backend, busy, platform, project, activeTask, onErr
     setExporting(true)
     localExportIntent.current = platform.kind === 'tauri'
     try {
+      if (settingsDirty) {
+        onProjectChange(await backend.updateProject({
+          expected_project_id: project.project_id,
+          export_settings: settings,
+        }))
+      }
       const task = await onStartStage('export')
       if (task.status === 'succeeded' && finalizedTask.current !== task.id) {
         finalizedTask.current = task.id
@@ -126,7 +144,7 @@ export function ExportPage({ backend, busy, platform, project, activeTask, onErr
     } finally { setExporting(false) }
   }
 
-  const authoritativeReady = project.stages.composite?.status === 'succeeded'
+  const authoritativeReady = project.stages.post_process?.status === 'succeeded'
   const exportRunning = activeTask?.target_stage === 'export'
     && ['queued', 'running'].includes(activeTask.status)
   const displayVerified = verified?.artifact_id === authoritativeArtifactId ? verified : null
@@ -136,10 +154,20 @@ export function ExportPage({ backend, busy, platform, project, activeTask, onErr
   return (
     <section aria-labelledby="export-title" className="page-grid export-page">
       <div className="page-heading">
-        <p className="eyebrow">05 · EXPORT</p>
+        <p className="eyebrow">06 · EXPORT</p>
         <h2 id="export-title">导出成片</h2>
-        <p>只有合成阶段成功后才能启动导出；保存前再次读取后端的 ffprobe 验证结果。</p>
+        <p>导出只读取权威处理后帧；修改编码不会重算合成或效果链。</p>
       </div>
+      <article className="export-settings-card">
+        <h3>编码配置</h3>
+        <div className="export-settings-grid">
+          <label>视频编码<select value={settings.codec} onChange={(event) => setSettings({ ...settings, codec: event.target.value as ExportEncodingSettings['codec'] })}><option value="h264">H.264 · 兼容优先</option><option value="h265">H.265 / HEVC · 更小文件</option></select></label>
+          <label>码率模式<select value={settings.rate_control} onChange={(event) => setSettings({ ...settings, rate_control: event.target.value as ExportEncodingSettings['rate_control'] })}><option value="constant_quality">恒定质量</option><option value="two_pass_vbr">双遍 VBR</option></select></label>
+          <label>压缩档位<select value={settings.compression_preset} onChange={(event) => setSettings({ ...settings, compression_preset: event.target.value as ExportEncodingSettings['compression_preset'] })}><option value="fast">快速</option><option value="balanced">均衡</option><option value="high_compression">高压缩</option></select></label>
+          {settings.rate_control === 'constant_quality' ? <label>质量 <output>{settings.quality}</output><input max={100} min={1} onChange={(event) => setSettings({ ...settings, quality: Number(event.target.value) })} type="range" value={settings.quality} /></label> : <label>目标码率 <output>{settings.target_bitrate_mbps.toFixed(1)} Mbps</output><input max={200} min={0.5} onChange={(event) => setSettings({ ...settings, target_bitrate_mbps: Number(event.target.value) })} step={0.5} type="range" value={settings.target_bitrate_mbps} /><small>建议约 {recommendedBitrate.toFixed(1)} Mbps</small></label>}
+        </div>
+        <p>MP4 · 8-bit yuv420p limited-range · BT.709 · AAC 192 kbps</p>
+      </article>
       <article className="export-card">
         <div className="export-orbit" aria-hidden="true"><span /></div>
         <div>

@@ -27,7 +27,8 @@ def test_alpha_blending_is_deterministic_uint8() -> None:
     first = composite_frame(foreground, background, alpha, edge_px=0)
     second = composite_frame(foreground, background, alpha, edge_px=0)
 
-    np.testing.assert_array_equal(first, np.array([[[128, 51, 100]]], np.uint8))
+    # Linear-light alpha avoids the dark fringe produced by blending encoded RGB.
+    np.testing.assert_array_equal(first, np.array([[[180, 67, 139]]], np.uint8))
     np.testing.assert_array_equal(second, first)
 
 

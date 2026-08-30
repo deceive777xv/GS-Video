@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from gs_video.domain.models import SceneSummary, VideoSummary
+from gs_video.domain.models import LutSummary, SceneSummary, VideoSummary
 from gs_video.segmentation.paths import has_reparse_component
 from gs_video.resource_admission import bytes_with_disk_headroom
 
@@ -23,6 +23,7 @@ from gs_video.resource_admission import bytes_with_disk_headroom
 class AssetKind(StrEnum):
     VIDEO = "video"
     PLY = "ply"
+    LUT = "lut"
 
 
 class _StrictModel(BaseModel):
@@ -39,14 +40,30 @@ class AssetRecord(_StrictModel):
     imported_at: datetime
     video_summary: VideoSummary | None = None
     scene_summary: SceneSummary | None = None
+    lut_summary: LutSummary | None = None
 
     @model_validator(mode="after")
     def validate_summary_kind(self) -> AssetRecord:
         if self.kind is AssetKind.VIDEO:
-            if self.video_summary is None or self.scene_summary is not None:
+            if (
+                self.video_summary is None
+                or self.scene_summary is not None
+                or self.lut_summary is not None
+            ):
                 raise ValueError("video assets require only a video summary")
-        elif self.scene_summary is None or self.video_summary is not None:
-            raise ValueError("PLY assets require only a scene summary")
+        elif self.kind is AssetKind.PLY:
+            if (
+                self.scene_summary is None
+                or self.video_summary is not None
+                or self.lut_summary is not None
+            ):
+                raise ValueError("PLY assets require only a scene summary")
+        elif (
+            self.lut_summary is None
+            or self.video_summary is not None
+            or self.scene_summary is not None
+        ):
+            raise ValueError("LUT assets require only a LUT summary")
         return self
 
 
@@ -55,7 +72,7 @@ class AssetIndex(_StrictModel):
     assets: dict[str, AssetRecord] = Field(default_factory=dict)
 
 
-AssetSummary = VideoSummary | SceneSummary
+AssetSummary = VideoSummary | SceneSummary | LutSummary
 AssetInspector = Callable[[Path, int, str], AssetSummary]
 
 
@@ -280,6 +297,8 @@ class AssetLibrary:
                 raise ValueError("video inspector returned the wrong summary type")
             if kind is AssetKind.PLY and not isinstance(summary, SceneSummary):
                 raise ValueError("PLY inspector returned the wrong summary type")
+            if kind is AssetKind.LUT and not isinstance(summary, LutSummary):
+                raise ValueError("LUT inspector returned the wrong summary type")
             with self._lock:
                 index = self._load()
                 existing = next(
@@ -294,7 +313,13 @@ class AssetLibrary:
                 )
                 if existing is not None:
                     return existing.model_copy(deep=True), False
-                suffix = Path(original_filename).suffix.lower() if kind is AssetKind.VIDEO else ".ply"
+                suffix = (
+                    Path(original_filename).suffix.lower()
+                    if kind is AssetKind.VIDEO
+                    else ".ply"
+                    if kind is AssetKind.PLY
+                    else ".cube"
+                )
                 relative = Path(sha256[:2]) / f"{sha256}{suffix}"
                 destination = self.root / kind.value / relative
                 destination.parent.mkdir(exist_ok=True)
@@ -309,6 +334,7 @@ class AssetLibrary:
                     imported_at=datetime.now(timezone.utc),
                     video_summary=summary if isinstance(summary, VideoSummary) else None,
                     scene_summary=summary if isinstance(summary, SceneSummary) else None,
+                    lut_summary=summary if isinstance(summary, LutSummary) else None,
                 )
                 index.assets[record.asset_id] = record
                 try:

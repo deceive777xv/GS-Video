@@ -47,7 +47,7 @@ def test_repository_round_trips_project(tmp_path: Path) -> None:
 
     assert loaded == project
     assert loaded.project_id == project.project_id
-    assert loaded.schema_version == 8
+    assert loaded.schema_version == 9
     assert (tmp_path / "project.json").exists()
 
 
@@ -82,7 +82,7 @@ def test_repository_load_migrates_v2_then_invalidates_unsafe_legacy_camera_autho
     repository.save(loaded)
     round_tripped = repository.load()
 
-    assert round_tripped.schema_version == 8
+    assert round_tripped.schema_version == 9
     assert round_tripped.workflow.preview is None
 
 

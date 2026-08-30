@@ -5,6 +5,7 @@ import pytest
 
 from gs_video.domain.models import SceneSummary, VideoSummary
 from gs_video.project.assets import AssetKind, AssetLibrary
+from gs_video.postprocess.lut import inspect_cube
 import gs_video.project.assets as assets_module
 
 
@@ -56,6 +57,27 @@ def test_asset_library_separates_kinds_and_deduplicates_content(tmp_path) -> Non
     assert [record.asset_id for record in library.list(AssetKind.PLY)] == [
         ply.asset_id
     ]
+
+
+def test_asset_library_imports_and_deduplicates_managed_cube_luts(tmp_path) -> None:
+    library = AssetLibrary(tmp_path / "assets")
+    source = tmp_path / "look.cube"
+    source.write_text(
+        "LUT_3D_SIZE 2\n"
+        "0 0 0\n1 0 0\n0 1 0\n1 1 0\n"
+        "0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+        encoding="utf-8",
+    )
+
+    first, created = library.import_file(AssetKind.LUT, source, inspect_cube)
+    second, duplicated = library.import_file(AssetKind.LUT, source, inspect_cube)
+
+    assert created is True
+    assert duplicated is False
+    assert second.asset_id == first.asset_id
+    assert first.lut_summary is not None
+    assert first.lut_summary.lut_size == 2
+    assert library.resolve(first.asset_id, AssetKind.LUT).read_bytes() == source.read_bytes()
 
 
 def test_asset_library_resolves_only_expected_kind_and_deletes(tmp_path) -> None:

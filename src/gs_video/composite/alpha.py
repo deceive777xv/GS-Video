@@ -6,6 +6,8 @@ from numpy.typing import NDArray
 from typing import cast
 
 from gs_video.domain.errors import RepairableError
+from gs_video.domain.models import MatteRefinementSettings
+from gs_video.postprocess.color import linear_to_rec709, rec709_to_linear
 
 
 def _validate_inputs(
@@ -52,13 +54,35 @@ def composite_frame(
     foreground, background, alpha, edge_px = _validate_inputs(
         foreground, background, alpha, edge_px
     )
+    settings = MatteRefinementSettings(
+        enabled=edge_px > 0,
+        edge_offset=-float(edge_px),
+        feather_radius=float(edge_px),
+    )
+    output = composite_frame_16bit(foreground, background, alpha, settings)
+    return np.asarray(np.rint(output.astype(np.float32) / 257.0), dtype=np.uint8)
+
+
+def refine_matte(
+    alpha: NDArray[np.uint8],
+    settings: MatteRefinementSettings,
+    *,
+    spatial_scale: float = 1.0,
+) -> NDArray[np.float32]:
+    if not np.isfinite(spatial_scale) or spatial_scale <= 0:
+        raise RepairableError("spatial_scale 必须是有限正数")
     matte = alpha.astype(np.float32) / np.float32(255.0)
-    if edge_px:
-        size = edge_px * 2 + 1
+    if not settings.enabled:
+        return matte
+    offset = settings.edge_offset * spatial_scale
+    radius = int(np.ceil(abs(offset)))
+    if radius:
+        size = radius * 2 + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
-        matte = cast(
+        operation = cv2.dilate if offset > 0 else cv2.erode
+        adjusted = cast(
             NDArray[np.float32],
-            cv2.erode(
+            operation(
                 matte,
                 kernel,
                 iterations=1,
@@ -66,27 +90,76 @@ def composite_frame(
                 borderValue=0,
             ),
         )
-        sigma = max(0.5, edge_px / 2)
+        blend = abs(offset) / max(radius, 1)
+        matte = matte * np.float32(1.0 - blend) + adjusted * np.float32(blend)
+    feather = settings.feather_radius * spatial_scale
+    if feather > 0:
         matte = cast(
             NDArray[np.float32],
             cv2.GaussianBlur(
                 matte,
                 (0, 0),
-                sigmaX=sigma,
-                sigmaY=sigma,
+                sigmaX=max(0.25, feather / 2.0),
+                sigmaY=max(0.25, feather / 2.0),
                 borderType=cv2.BORDER_CONSTANT,
             ),
         )
-        matte = cast(NDArray[np.float32], np.clip(matte, 0.0, 1.0))
+    return cast(NDArray[np.float32], np.clip(matte, 0.0, 1.0))
 
-    weight = matte[..., None]
-    blended = (
-        foreground.astype(np.float32) * weight
-        + background.astype(np.float32) * (np.float32(1.0) - weight)
+
+def _decontaminate_foreground(
+    foreground: NDArray[np.float32],
+    matte: NDArray[np.float32],
+    settings: MatteRefinementSettings,
+    spatial_scale: float,
+) -> NDArray[np.float32]:
+    strength = settings.decontaminate_strength / 100.0
+    if strength <= 0:
+        return foreground
+    radius = max(0.25, settings.decontaminate_radius * spatial_scale / 2.0)
+    blurred_alpha = cv2.GaussianBlur(matte, (0, 0), radius, borderType=cv2.BORDER_REPLICATE)
+    premultiplied = foreground * matte[..., None]
+    sampled = cv2.GaussianBlur(
+        premultiplied, (0, 0), radius, borderType=cv2.BORDER_REPLICATE
+    ) / np.maximum(blurred_alpha[..., None], np.float32(1e-5))
+    edge_weight = np.clip(4.0 * matte * (1.0 - matte), 0.0, 1.0)[..., None]
+    return np.asarray(
+        foreground * (1.0 - edge_weight * strength)
+        + sampled * (edge_weight * strength),
+        dtype=np.float32,
     )
-    output = np.asarray(np.rint(np.clip(blended, 0.0, 255.0)), dtype=np.uint8)
-    # Preserve mathematically exact endpoints of the processed matte without consulting the
-    # original alpha (which would undo erosion at originally-opaque boundary pixels).
-    np.copyto(output, background, where=(weight == 0.0))
-    np.copyto(output, foreground, where=(weight == 1.0))
+
+
+def composite_frame_16bit(
+    foreground: np.ndarray,
+    background: np.ndarray,
+    alpha: np.ndarray,
+    settings: MatteRefinementSettings,
+    *,
+    spatial_scale: float = 1.0,
+) -> NDArray[np.uint16]:
+    """Refine the matte and composite SDR Rec.709 sources in linear light."""
+    foreground, background, alpha, _edge_px = _validate_inputs(
+        foreground, background, alpha, 0
+    )
+    matte = refine_matte(alpha, settings, spatial_scale=spatial_scale)
+    foreground_encoded = foreground.astype(np.float32) / np.float32(255.0)
+    foreground_encoded = _decontaminate_foreground(
+        foreground_encoded, matte, settings, spatial_scale
+    )
+    background_encoded = background.astype(np.float32) / np.float32(255.0)
+    foreground_linear = rec709_to_linear(foreground_encoded)
+    background_linear = rec709_to_linear(background_encoded)
+    weight = matte[..., None]
+    blended_linear = (
+        foreground_linear * weight
+        + background_linear * (np.float32(1.0) - weight)
+    )
+    encoded = linear_to_rec709(blended_linear)
+    output = np.asarray(
+        np.rint(np.clip(encoded, 0.0, 1.0) * np.float32(65535.0)),
+        dtype=np.uint16,
+    )
+    np.copyto(output, background.astype(np.uint16) * 257, where=(weight == 0.0))
+    np.copyto(output, foreground.astype(np.uint16) * 257, where=(weight == 1.0))
     return output

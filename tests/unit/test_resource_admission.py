@@ -71,6 +71,9 @@ def test_remaining_cache_estimate_skips_reusable_dependency_outputs() -> None:
     project.stages[StageName.COMPOSITE] = StageState(
         status=StageStatus.SUCCEEDED
     )
+    project.stages[StageName.POST_PROCESS] = StageState(
+        status=StageStatus.SUCCEEDED
+    )
     export_only = estimated_remaining_pipeline_cache_bytes(
         project, StageName.EXPORT
     )
