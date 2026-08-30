@@ -435,23 +435,29 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 .matte-controls input[type="range"] { accent-color: var(--acid); grid-column: 1 / -1; width: 100%; }
 .matte-controls output { color: var(--text); }
 
-.postprocess-page { display: grid; gap: 1rem; min-width: 0; }
+.postprocess-page { container-name: postprocess; container-type: inline-size; display: grid; gap: 1rem; min-width: 0; }
 .postprocess-heading { align-items: end; display: flex; gap: 1rem; justify-content: space-between; }
 .postprocess-toolbar, .postprocess-actions, .effect-card footer, .effect-adders, .lut-adder { display: flex; flex-wrap: wrap; gap: .45rem; }
-.postprocess-workbench { display: grid; gap: 1rem; grid-template-columns: minmax(0, 1fr) minmax(330px, 420px); }
+.postprocess-workbench { display: grid; gap: 1rem; grid-template-columns: minmax(0, 1fr) minmax(270px, 340px); }
 .postprocess-viewer, .effect-stack { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: .8rem; }
 .postprocess-viewer { align-content: start; display: grid; gap: .75rem; min-width: 0; }
-.comparison-frame { aspect-ratio: 16 / 9; background: #050708; border-radius: 8px; overflow: hidden; position: relative; }
+.comparison-frame { aspect-ratio: 16 / 9; background: #050708; border-radius: 8px; outline: 1px solid rgba(255,255,255,.06); outline-offset: -1px; overflow: hidden; position: relative; }
 .comparison-frame img { display: block; height: 100%; object-fit: contain; position: absolute; width: 100%; }
 .comparison-after { inset: 0; overflow: hidden; position: absolute; }
 .comparison-after img { max-width: none; }
-.comparison-divider { background: var(--acid); bottom: 0; box-shadow: 0 0 8px #000; position: absolute; top: 0; width: 2px; }
+.comparison-divider { appearance: none; background: transparent; border: 0; bottom: 0; cursor: col-resize; min-height: 0; padding: 0; position: absolute; top: 0; touch-action: none; transform: translateX(-50%); width: 28px; z-index: 3; }
+.comparison-divider::before { background: var(--acid); bottom: 0; box-shadow: 0 0 0 1px #0008, 0 0 10px rgba(183,246,61,.35); content: ""; left: 50%; position: absolute; top: 0; transform: translateX(-50%); width: 2px; }
+.comparison-divider::after { background: var(--acid); border: 2px solid #111; border-radius: 999px; box-shadow: 0 2px 10px #000a; content: ""; height: 30px; left: 50%; position: absolute; top: 50%; transform: translate(-50%, -50%); width: 10px; }
+.comparison-divider > span { background: rgba(8,12,15,.88); border: 1px solid rgba(183,246,61,.55); border-radius: 999px; color: var(--acid); font: 700 .58rem ui-monospace, monospace; left: 50%; padding: .18rem .35rem; position: absolute; top: 8px; transform: translateX(-50%); white-space: nowrap; z-index: 1; }
+.comparison-divider:focus-visible { outline: none; }
+.comparison-divider:focus-visible::after { box-shadow: 0 0 0 3px rgba(183,246,61,.28), 0 2px 10px #000a; }
 .frame-scrubber { color: var(--muted); display: grid; font-size: .7rem; gap: .3rem; grid-template-columns: auto 1fr auto; }
 .frame-scrubber input { accent-color: var(--acid); min-width: 0; }
 .frame-scrubber output { color: var(--text); }
 .toggle-row { align-items: center; color: var(--muted); display: flex; font-size: .72rem; gap: .45rem; }
-.postprocess-video { background: #050708; border-radius: 8px; width: 100%; }
-.effect-stack { align-content: start; display: grid; gap: .7rem; max-height: calc(100vh - 190px); overflow: auto; }
+.postprocess-video-frame { aspect-ratio: 16 / 9; background: #050708; border-radius: 8px; outline: 1px solid rgba(255,255,255,.06); outline-offset: -1px; overflow: hidden; }
+.postprocess-video { display: block; height: 100%; object-fit: contain; width: 100%; }
+.effect-stack { align-content: start; display: grid; gap: .7rem; max-height: calc(100vh - 190px); min-width: 0; overflow: auto; }
 .effect-adders button, .effect-card footer button { font-size: .66rem; min-height: 30px; padding: .35rem .55rem; }
 .lut-adder { width: 100%; }
 .lut-adder select { flex: 1; min-width: 120px; }
@@ -463,6 +469,7 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 .effect-card > header > input { min-width: 0; width: 100%; }
 .effect-card > header > label { align-items: center; display: flex; font-size: .66rem; gap: .25rem; }
 .drag-handle { color: var(--muted); cursor: grab; }
+.drag-handle:active { cursor: grabbing; }
 .effect-collapse { background: transparent; border: 0; color: var(--muted); min-height: 28px; padding: .2rem; }
 .effect-range { color: var(--muted); display: grid; font-size: .68rem; gap: .3rem; }
 .effect-range > span { display: flex; justify-content: space-between; }
@@ -473,6 +480,17 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 .effect-color input { background: transparent; border: 0; height: 30px; padding: 0; width: 48px; }
 .postprocess-actions { align-items: center; justify-content: flex-end; }
 .postprocess-actions span { color: var(--muted); font-size: .7rem; margin-right: auto; }
+
+@container postprocess (max-width: 980px) {
+  .postprocess-workbench { grid-template-columns: minmax(0, 1fr) minmax(260px, 320px); }
+  .effect-stack, .effect-card { padding: .65rem; }
+}
+
+@container postprocess (max-width: 720px) {
+  .postprocess-heading { align-items: flex-start; flex-direction: column; }
+  .postprocess-workbench { grid-template-columns: minmax(0, 1fr); }
+  .effect-stack { max-height: none; }
+}
 
 .error-banner { max-width: 1120px; margin: 0 auto 1rem; padding: 0.85rem 1rem; display: flex; justify-content: space-between; gap: 1rem; border: 1px solid rgba(255,107,107,0.5); border-radius: 8px; background: rgba(87,27,32,0.65); }
 .error-banner strong { color: #ffd2d2; font-size: 0.8rem; }
@@ -738,6 +756,5 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible, a:focus-vis
 @media (max-width: 900px) {
   .source-calibration-grid, .synthesis-layout { grid-template-columns: 1fr; }
   .camera-subnav { grid-template-columns: 1fr; }
-  .postprocess-workbench, .export-settings-grid { grid-template-columns: 1fr; }
-  .effect-stack { max-height: none; }
+  .export-settings-grid { grid-template-columns: 1fr; }
 }

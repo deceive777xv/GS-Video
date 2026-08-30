@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -68,7 +68,10 @@ function backend(current: ProjectDto, save?: (chain: EffectInstance[]) => Promis
   } as unknown as BackendClient
 }
 
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => {
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+})
 
 describe('PostProcessPage', () => {
   it('keeps edits in a draft and saves them with the expected revision', async () => {
@@ -109,5 +112,94 @@ describe('PostProcessPage', () => {
     await waitFor(() => expect(onError).toHaveBeenCalledWith(failure))
     expect(screen.getByPlaceholderText('锐化')).toBeVisible()
     expect(screen.getByText('有未保存修改')).toBeVisible()
+  })
+
+  it('waits until an effect slider is released before requesting another image', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:preview')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const current = project()
+    current.workflow.effect_chain = [{
+      instance_id: 'sharpen-1',
+      type: 'sharpen',
+      params_version: 1,
+      display_name: null,
+      enabled: true,
+      mix: 100,
+      parameters: { amount: 50, radius: 1, threshold: 1 },
+    }]
+    const client = backend(current)
+
+    render(<PostProcessPage activeTask={null} backend={client} busy={false} onDirtyChange={vi.fn()} onError={vi.fn()} onProjectChange={vi.fn()} onStartStage={vi.fn()} project={current} />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(150) })
+    const renderPreview = vi.mocked(client.renderDraftPostProcessPreview)
+    expect(renderPreview).toHaveBeenCalledTimes(2)
+    renderPreview.mockClear()
+
+    const amount = screen.getByText('强度').closest('label')?.querySelector('input[type="range"]')
+    expect(amount).toBeInstanceOf(HTMLInputElement)
+    fireEvent.pointerDown(amount as HTMLInputElement, { pointerId: 1 })
+    fireEvent.input(amount as HTMLInputElement, { target: { value: '70' } })
+    fireEvent.input(amount as HTMLInputElement, { target: { value: '85' } })
+    expect(screen.getByText('85%')).toBeVisible()
+    expect(screen.getByText('已保存 · revision 0')).toBeVisible()
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    expect(renderPreview).not.toHaveBeenCalled()
+
+    fireEvent.pointerUp(amount as HTMLInputElement, { pointerId: 1 })
+    await act(async () => { await vi.advanceTimersByTimeAsync(150) })
+    expect(renderPreview).toHaveBeenCalledTimes(2)
+    expect(renderPreview).toHaveBeenLastCalledWith(expect.objectContaining({
+      effect_chain: [expect.objectContaining({ parameters: expect.objectContaining({ amount: 85 }) })],
+    }), expect.any(AbortSignal))
+  })
+
+  it('uses the comparison line itself as the before-after control', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:preview')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const current = project()
+    const client = backend(current)
+
+    render(<PostProcessPage activeTask={null} backend={client} busy={false} onDirtyChange={vi.fn()} onError={vi.fn()} onProjectChange={vi.fn()} onStartStage={vi.fn()} project={current} />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(150) })
+    const divider = screen.getByRole('slider', { name: '前后分割线' })
+    expect(divider.tagName).toBe('DIV')
+    const frame = divider.parentElement
+    expect(frame).not.toBeNull()
+    vi.spyOn(frame as HTMLElement, 'getBoundingClientRect').mockReturnValue({
+      bottom: 562.5, height: 562.5, left: 0, right: 1000, top: 0, width: 1000,
+      x: 0, y: 0, toJSON: () => ({}),
+    })
+
+    fireEvent.pointerDown(divider, { button: 0, clientX: 500, pointerId: 7 })
+    fireEvent.pointerMove(divider, { clientX: 760, pointerId: 7 })
+    expect(divider).toHaveAttribute('aria-valuenow', '76')
+    fireEvent.pointerUp(divider, { clientX: 760, pointerId: 7 })
+
+    fireEvent.keyDown(divider, { key: 'ArrowLeft', shiftKey: true })
+    expect(divider).toHaveAttribute('aria-valuenow', '71')
+    expect(screen.queryByRole('slider', { name: /前后分割$/ })).not.toBeInTheDocument()
+  })
+
+  it('limits effect reordering drag behavior to the dedicated handle', () => {
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:preview')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const current = project()
+    current.workflow.effect_chain = [{
+      instance_id: 'sharpen-1',
+      type: 'sharpen',
+      params_version: 1,
+      display_name: null,
+      enabled: true,
+      mix: 100,
+      parameters: { amount: 50, radius: 1, threshold: 1 },
+    }]
+
+    render(<PostProcessPage activeTask={null} backend={backend(current)} busy={false} onDirtyChange={vi.fn()} onError={vi.fn()} onProjectChange={vi.fn()} onStartStage={vi.fn()} project={current} />)
+    const card = screen.getByPlaceholderText('锐化').closest('.effect-card')
+    expect(card).not.toBeNull()
+    expect(card).not.toHaveAttribute('draggable')
+    expect(card?.querySelector('.drag-handle')).toHaveAttribute('draggable', 'true')
   })
 })

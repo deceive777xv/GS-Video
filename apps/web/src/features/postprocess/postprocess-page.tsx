@@ -1,6 +1,7 @@
 import {
   type ChangeEvent,
   type DragEvent,
+  type PointerEvent as ReactPointerEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -79,20 +80,53 @@ interface RangeProps {
 }
 
 function RangeControl({ label, value, min, max, step = 1, suffix = '', onBegin, onChange, onEnd }: RangeProps) {
+  const input = useRef<HTMLInputElement>(null)
+  const output = useRef<HTMLOutputElement>(null)
+  const liveValue = useRef(value)
+  const editing = useRef(false)
+
+  useEffect(() => {
+    liveValue.current = value
+    if (input.current !== null) input.current.value = String(value)
+    if (output.current !== null) output.current.value = `${value}${suffix}`
+  }, [suffix, value])
+
+  const begin = (): void => {
+    if (editing.current) return
+    editing.current = true
+    onBegin()
+  }
+
+  const finish = (): void => {
+    if (!editing.current) return
+    editing.current = false
+    const next = liveValue.current
+    onEnd()
+    if (next !== value) onChange(next)
+  }
+
   return (
     <label className="effect-range">
-      <span>{label}<output>{value}{suffix}</output></span>
+      <span>{label}<output ref={output}>{value}{suffix}</output></span>
       <input
+        defaultValue={value}
         max={max}
         min={min}
-        onBlur={onEnd}
-        onChange={(event) => onChange(Number(event.target.value))}
-        onFocus={onBegin}
-        onPointerDown={onBegin}
-        onPointerUp={onEnd}
+        onBlur={finish}
+        onInput={(event) => {
+          begin()
+          const next = event.currentTarget.valueAsNumber
+          liveValue.current = next
+          if (output.current !== null) output.current.value = `${next}${suffix}`
+        }}
+        onKeyDown={begin}
+        onKeyUp={finish}
+        onPointerDown={begin}
+        onPointerCancel={finish}
+        onPointerUp={finish}
+        ref={input}
         step={step}
         type="range"
-        value={value}
       />
     </label>
   )
@@ -111,6 +145,7 @@ export function PostProcessPage({ activeTask, backend, busy, project, onDirtyCha
   const [baseUrl, setBaseUrl] = useState<string | null>(null)
   const [processedUrl, setProcessedUrl] = useState<string | null>(null)
   const [previewBusy, setPreviewBusy] = useState(false)
+  const [previewSuspended, setPreviewSuspended] = useState(false)
   const [videoUrl, setVideoUrl] = useState<string | null>(null)
   const [luts, setLuts] = useState<LibraryAssetRecordDto[]>([])
   const [selectedLut, setSelectedLut] = useState('')
@@ -121,6 +156,7 @@ export function PostProcessPage({ activeTask, backend, busy, project, onDirtyCha
   const processedObjectUrl = useRef<string | null>(null)
   const videoObjectUrl = useRef<string | null>(null)
   const continuousEdit = useRef<string | null>(null)
+  const splitDrag = useRef<{ pointerId: number; offset: number } | null>(null)
   const finalizedTask = useRef<string | null>(null)
   const dirty = !sameChain(draft, saved)
   const postProcessAuthority = project.stages.post_process?.status === 'succeeded'
@@ -174,9 +210,14 @@ export function PostProcessPage({ activeTask, backend, busy, project, onDirtyCha
   const beginContinuous = (key: string): void => {
     if (continuousEdit.current === key) return
     continuousEdit.current = key
+    setPreviewSuspended(true)
     pushUndo()
   }
-  const endContinuous = (): void => { continuousEdit.current = null }
+  const endContinuous = (): void => {
+    if (continuousEdit.current === null) return
+    continuousEdit.current = null
+    setPreviewSuspended(false)
+  }
 
   const undoOnce = useCallback((): void => {
     setUndo((history) => {
@@ -220,7 +261,50 @@ export function PostProcessPage({ activeTask, backend, busy, project, onDirtyCha
     } as EffectInstance)
   }
 
+  const updateSplitFromClientX = useCallback((control: HTMLDivElement, clientX: number): void => {
+    const frame = control.parentElement
+    if (frame === null) return
+    const bounds = frame.getBoundingClientRect()
+    if (bounds.width <= 0) return
+    const dragOffset = splitDrag.current?.offset ?? 0
+    const next = ((clientX - dragOffset - bounds.left) / bounds.width) * 100
+    setSplit(Math.min(100, Math.max(0, next)))
+  }, [])
+
+  const beginSplitDrag = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (event.button !== 0) return
+    const frame = event.currentTarget.parentElement
+    if (frame === null) return
+    const bounds = frame.getBoundingClientRect()
+    const dividerX = bounds.left + (bounds.width * split / 100)
+    splitDrag.current = { pointerId: event.pointerId, offset: event.clientX - dividerX }
+    event.currentTarget.setPointerCapture?.(event.pointerId)
+  }
+
+  const moveSplitDrag = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (splitDrag.current?.pointerId !== event.pointerId) return
+    updateSplitFromClientX(event.currentTarget, event.clientX)
+  }
+
+  const endSplitDrag = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (splitDrag.current?.pointerId !== event.pointerId) return
+    updateSplitFromClientX(event.currentTarget, event.clientX)
+    splitDrag.current = null
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
+
+  const cancelSplitDrag = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (splitDrag.current?.pointerId !== event.pointerId) return
+    splitDrag.current = null
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
+
   useEffect(() => {
+    if (previewSuspended) return
     const controller = new AbortController()
     const timer = window.setTimeout(() => {
       setPreviewBusy(true)
@@ -264,9 +348,9 @@ export function PostProcessPage({ activeTask, backend, busy, project, onDirtyCha
       }).finally(() => {
         if (!controller.signal.aborted) setPreviewBusy(false)
       })
-    }, 180)
+    }, 120)
     return () => { window.clearTimeout(timer); controller.abort() }
-  }, [backend, bypass, draft, frameIndex, onError, project.project_id])
+  }, [backend, bypass, draft, frameIndex, onError, previewSuspended, project.project_id])
 
   useEffect(() => () => {
     if (baseObjectUrl.current !== null) URL.revokeObjectURL(baseObjectUrl.current)
@@ -402,14 +486,44 @@ export function PostProcessPage({ activeTask, backend, busy, project, onDirtyCha
       <div className="postprocess-workbench">
         <article className="postprocess-viewer">
           <div className="comparison-frame" aria-busy={previewBusy}>
-            {baseUrl === null ? <div className="empty-state">正在准备代表帧…</div> : <img alt="基础合成代表帧" src={baseUrl} />}
-            {processedUrl === null ? null : <div className="comparison-after" style={{ clipPath: `inset(0 ${100 - split}% 0 0)` }}><img alt="处理后代表帧" src={processedUrl} /></div>}
-            <span className="comparison-divider" style={{ left: `${split}%` }} />
+            {baseUrl === null ? <div className="empty-state">正在准备代表帧…</div> : <img alt="基础合成代表帧" draggable={false} src={baseUrl} />}
+            {processedUrl === null ? null : <div className="comparison-after" style={{ clipPath: `inset(0 ${100 - split}% 0 0)` }}><img alt="处理后代表帧" draggable={false} src={processedUrl} /></div>}
+            {processedUrl === null ? null : <div
+              aria-label="前后分割线"
+              aria-orientation="horizontal"
+              aria-valuemax={100}
+              aria-valuemin={0}
+              aria-valuenow={Math.round(split)}
+              aria-valuetext={`${Math.round(split)}%`}
+              className="comparison-divider"
+              onKeyDown={(event) => {
+                const increment = event.shiftKey ? 5 : 1
+                if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') {
+                  event.preventDefault()
+                  setSplit((current) => Math.max(0, current - increment))
+                } else if (event.key === 'ArrowRight' || event.key === 'ArrowUp') {
+                  event.preventDefault()
+                  setSplit((current) => Math.min(100, current + increment))
+                } else if (event.key === 'Home') {
+                  event.preventDefault()
+                  setSplit(0)
+                } else if (event.key === 'End') {
+                  event.preventDefault()
+                  setSplit(100)
+                }
+              }}
+              onPointerCancel={cancelSplitDrag}
+              onPointerDown={beginSplitDrag}
+              onPointerMove={moveSplitDrag}
+              onPointerUp={endSplitDrag}
+              role="slider"
+              style={{ left: `${split}%` }}
+              tabIndex={0}
+            ><span aria-hidden="true">{Math.round(split)}%</span></div>}
           </div>
           <label className="frame-scrubber">代表帧 <input max={Math.max(0, frameCount - 1)} min={0} onChange={(event) => setFrameIndex(Number(event.target.value))} type="range" value={frameIndex} /><output>{frameIndex + 1} / {frameCount} · {fps > 0 ? (frameIndex / fps).toFixed(2) : '0.00'}s</output></label>
-          <label className="frame-scrubber">前后分割 <input max={100} min={0} onChange={(event) => setSplit(Number(event.target.value))} type="range" value={split} /><output>{split}%</output></label>
           <label className="toggle-row"><input checked={bypass} onChange={(event) => setBypass(event.target.checked)} type="checkbox" />临时旁路整条效果链</label>
-          {videoUrl === null ? null : <video className="postprocess-video" controls src={videoUrl} />}
+          {videoUrl === null ? null : <div className="postprocess-video-frame"><video className="postprocess-video" controls src={videoUrl} /></div>}
         </article>
         <aside className="effect-stack" aria-label="效果链">
           <div className="effect-adders">
@@ -418,8 +532,8 @@ export function PostProcessPage({ activeTask, backend, busy, project, onDirtyCha
           </div>
           {draft.length === 0 ? <div className="empty-state"><strong>无效果</strong><p>空链仍会生成权威处理后帧。</p></div> : null}
           {draft.map((effect, index) => (
-            <article className={`effect-card ${effect.enabled ? '' : 'is-disabled'}`} draggable key={effect.instance_id} onDragEnd={() => setDragIndex(null)} onDragOver={(event: DragEvent) => event.preventDefault()} onDragStart={() => setDragIndex(index)} onDrop={() => { if (dragIndex !== null) move(dragIndex, index); setDragIndex(null) }}>
-              <header><span aria-hidden="true" className="drag-handle">⠿</span><button aria-expanded={!collapsed.has(effect.instance_id)} aria-label={`${collapsed.has(effect.instance_id) ? '展开' : '折叠'} ${effect.display_name || EFFECT_NAMES[effect.type]}`} className="effect-collapse" onClick={() => setCollapsed((current) => { const next = new Set(current); if (next.has(effect.instance_id)) next.delete(effect.instance_id); else next.add(effect.instance_id); return next })} type="button">{collapsed.has(effect.instance_id) ? '▸' : '▾'}</button><input aria-label="效果名称" placeholder={EFFECT_NAMES[effect.type]} value={effect.display_name ?? ''} onChange={(event) => setEffect(index, { ...effect, display_name: event.target.value || null })} onFocus={pushUndo} /><label><input checked={effect.enabled} onChange={(event) => { pushUndo(); setEffect(index, { ...effect, enabled: event.target.checked }) }} type="checkbox" />启用</label></header>
+            <article className={`effect-card ${effect.enabled ? '' : 'is-disabled'}`} key={effect.instance_id} onDragOver={(event: DragEvent) => event.preventDefault()} onDrop={() => { if (dragIndex !== null) move(dragIndex, index); setDragIndex(null) }}>
+              <header><span aria-hidden="true" className="drag-handle" draggable onDragEnd={() => setDragIndex(null)} onDragStart={(event) => { event.dataTransfer.effectAllowed = 'move'; setDragIndex(index) }}>⠿</span><button aria-expanded={!collapsed.has(effect.instance_id)} aria-label={`${collapsed.has(effect.instance_id) ? '展开' : '折叠'} ${effect.display_name || EFFECT_NAMES[effect.type]}`} className="effect-collapse" onClick={() => setCollapsed((current) => { const next = new Set(current); if (next.has(effect.instance_id)) next.delete(effect.instance_id); else next.add(effect.instance_id); return next })} type="button">{collapsed.has(effect.instance_id) ? '▸' : '▾'}</button><input aria-label="效果名称" placeholder={EFFECT_NAMES[effect.type]} value={effect.display_name ?? ''} onChange={(event) => setEffect(index, { ...effect, display_name: event.target.value || null })} onFocus={pushUndo} /><label><input checked={effect.enabled} onChange={(event) => { pushUndo(); setEffect(index, { ...effect, enabled: event.target.checked }) }} type="checkbox" />启用</label></header>
               {collapsed.has(effect.instance_id) ? null : <><RangeControl label="Mix" max={100} min={0} onBegin={() => beginContinuous(`${effect.instance_id}:mix`)} onChange={(mix) => setEffect(index, { ...effect, mix })} onEnd={endContinuous} suffix="%" value={effect.mix} />
                 {renderParameters(effect, index)}
                 <footer><button disabled={index === 0} onClick={() => move(index, index - 1)} type="button">上移</button><button disabled={index === draft.length - 1} onClick={() => move(index, index + 1)} type="button">下移</button><button disabled={draft.length >= 32} onClick={() => { const copy = cloneChain([effect])[0]; if (copy !== undefined) apply([...draft.slice(0, index + 1), { ...copy, instance_id: crypto.randomUUID(), display_name: copy.display_name === null ? null : `${copy.display_name} 副本` } as EffectInstance, ...draft.slice(index + 1)]) }} type="button">复制</button><button onClick={() => { const reset = newEffect(effect.type, effect.type === 'lut_3d' ? effect.parameters.asset_id : undefined); apply(draft.map((item, itemIndex) => itemIndex === index ? { ...reset, instance_id: effect.instance_id, display_name: effect.display_name } as EffectInstance : item)) }} type="button">重置</button><button className="button-danger" onClick={() => apply(draft.filter((_, itemIndex) => itemIndex !== index))} type="button">删除</button></footer></>}
