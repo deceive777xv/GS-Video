@@ -154,4 +154,4 @@ tests/                    单元、集成、安全与 GPU 测试
 tools/                    启动、环境准备、修复和基准工具
 ```
 
-更完整的领域术语与不变量见 [`CONTEXT.md`](CONTEXT.md)；架构决策见 [`docs/adr`](docs/adr)，功能设计见 [`docs/superpowers/specs`](docs/superpowers/specs)。
+详细架构、数据模型、算法流程、API、存储与排障说明见 [技术文档](docs/technical-documentation.md)。
